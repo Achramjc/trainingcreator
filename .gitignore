@@ -46,6 +46,8 @@ output/
 training_output/
 training_packages/
 test_output/
+outputs/
+uploads/
 *.zip
 
 # Jupyter Notebook
