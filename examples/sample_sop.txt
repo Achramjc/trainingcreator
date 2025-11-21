@@ -1,0 +1,72 @@
+Standard Operating Procedure: Emergency Shutdown of Production Line
+
+Version: 2.1
+Effective Date: 11/21/2025
+Department: Manufacturing Operations
+
+PURPOSE:
+This Standard Operating Procedure (SOP) establishes the proper protocol for performing an emergency shutdown of the production line to ensure worker safety, protect equipment, and minimize production losses during emergency situations.
+
+SCOPE:
+This procedure applies to all manufacturing personnel, supervisors, and maintenance staff who may need to initiate an emergency shutdown of Production Lines 1, 2, and 3 in Building A. This procedure should be followed during equipment malfunction, safety hazards, power failures, or any situation requiring immediate line stoppage.
+
+DEFINITIONS:
+Emergency Shutdown (E-Stop): An immediate cessation of all production line operations to prevent injury, equipment damage, or product contamination.
+Control Panel: The main electrical control interface for the production line, located at Station 5.
+Line Supervisor: The designated person responsible for overseeing production line operations during each shift.
+Lockout/Tagout (LOTO): A safety procedure ensuring dangerous machines are properly shut off and cannot be restarted prior to maintenance or repair work.
+
+RESPONSIBILITIES:
+- Line Operators: Initiate emergency shutdown when hazards are identified
+- Line Supervisors: Verify shutdown procedures, coordinate restart operations
+- Maintenance Team: Inspect equipment post-shutdown, clear system for restart
+- Safety Officer: Investigate incident, approve restart authorization
+
+SAFETY WARNINGS:
+WARNING: Never attempt to restart equipment until a complete safety inspection has been performed and documented.
+WARNING: All personnel must evacuate the immediate production area during emergency shutdown.
+CAUTION: Flying debris may occur during sudden equipment stoppage. Maintain safe distance.
+WARNING: Equipment may remain energized even after shutdown. Follow LOTO procedures before any contact.
+
+PROCEDURE:
+
+Step 1: Identify Emergency Situation
+Assess the nature and severity of the emergency. Determine if immediate evacuation is required. Alert nearby personnel of the emergency situation using the emergency communication system.
+
+Step 2: Activate Emergency Stop
+Press the red emergency stop button located at your nearest workstation. The button is clearly marked with "E-STOP" and is positioned at intervals of 50 feet along the production line.
+a. The emergency stop will cut power to all moving equipment
+b. Audible alarms and flashing lights will activate
+c. All line operations will cease within 5 seconds
+
+Step 3: Notify Supervision
+Immediately contact the Line Supervisor using the emergency radio channel (Channel 3). Provide clear information about: location of emergency, type of emergency, injuries (if any), and current status of the line.
+
+Step 4: Secure the Area
+Ensure all personnel have moved to a safe location at least 20 feet from the production line. Post personnel at access points to prevent unauthorized entry. Do not allow anyone to approach equipment until clearance is given.
+
+Step 5: Document the Incident
+The Line Supervisor must complete an Emergency Shutdown Report (Form MS-101) within 30 minutes of the event. Record the time of shutdown, location, personnel involved, reason for shutdown, and initial observations.
+
+Step 6: Equipment Inspection
+The Maintenance Team must perform a complete inspection of all affected equipment. Check for mechanical damage, electrical issues, hydraulic leaks, and any safety hazards. Document all findings on the Post-Shutdown Inspection Checklist (Form MS-102).
+
+Step 7: Safety Review
+The Safety Officer must review the incident and inspection reports. Determine root cause of emergency. Identify any corrective actions needed before restart. Provide written authorization before proceeding to restart.
+
+Step 8: Restart Authorization
+Restart may only occur after: completed inspections with no safety issues identified, Safety Officer written approval, all personnel notified of pending restart, and area is clear of all personnel except essential operations staff.
+
+Step 9: Controlled Restart
+Follow the Standard Restart Procedure (SOP-PROD-009). Perform equipment function tests at reduced speed. Verify all safety systems are operational. Gradually return to normal production speed under supervisor observation.
+
+REFERENCES:
+- SOP-PROD-009: Standard Production Line Restart Procedure
+- OSHA 29 CFR 1910.147: The Control of Hazardous Energy (Lockout/Tagout)
+- Company Safety Manual Section 4.2: Emergency Response Protocols
+- Equipment Manufacturer's Emergency Procedures Manual
+
+REVISION HISTORY:
+Version 2.1 (11/21/2025): Updated communication procedures, added Step 9 requirements
+Version 2.0 (06/15/2025): Major revision incorporating OSHA compliance updates
+Version 1.0 (01/10/2024): Initial release

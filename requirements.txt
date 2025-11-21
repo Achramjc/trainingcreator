@@ -1,0 +1,18 @@
+# Core dependencies
+python-docx>=0.8.11
+PyPDF2>=3.0.0
+pdfplumber>=0.10.0
+markdown>=3.4.0
+jinja2>=3.1.2
+
+# SCORM and packaging
+lxml>=4.9.0
+
+# CLI and utilities
+click>=8.1.0
+pyyaml>=6.0.0
+python-magic>=0.4.27
+
+# Optional: AI-powered content generation
+# openai>=1.0.0
+# anthropic>=0.7.0
