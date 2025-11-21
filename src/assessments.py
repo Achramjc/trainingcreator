@@ -251,10 +251,11 @@ class AssessmentGenerator:
                 "Safety checks can be skipped if in a hurry"
             ]
 
-            options = sop_content.safety_warnings[:3] + [random.choice(fake_warnings)]
+            selected_fake = random.choice(fake_warnings)
+            options = sop_content.safety_warnings[:3] + [selected_fake]
             random.shuffle(options)
 
-            correct_idx = options.index(random.choice(fake_warnings))
+            correct_idx = options.index(selected_fake)
 
             question = Question(
                 question_id=f"q{q_id}",

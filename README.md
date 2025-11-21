@@ -2,8 +2,11 @@
 
 A powerful tool to convert Standard Operating Procedures (SOPs) and work instructions into interactive training materials with assessments, ready for upload to any Learning Management System (LMS).
 
+**Available as both a user-friendly web interface and command-line tool!**
+
 ## Features
 
+- **🌐 Web Interface**: No coding required! Beautiful drag-and-drop interface
 - **Multi-format Input Support**: Parse SOPs from PDF, DOCX, TXT, and Markdown files
 - **Intelligent Content Analysis**: Automatically extracts procedures, steps, and key information
 - **Training Content Generation**: Creates structured training modules with learning objectives
@@ -13,7 +16,24 @@ A powerful tool to convert Standard Operating Procedures (SOPs) and work instruc
 
 ## Quick Start
 
-### Installation
+### Web Interface (Recommended for Non-Technical Users)
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Start the web application
+python app.py
+
+# Open your browser to:
+# http://localhost:5000
+```
+
+Simply drag and drop your SOP file, configure your preferences, and download your training package!
+
+### Command Line Interface
+
+#### Installation
 
 ```bash
 pip install -r requirements.txt
