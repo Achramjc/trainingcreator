@@ -296,3 +296,86 @@ class AssessmentGenerator:
             q_id += 1
 
         return questions
+
+
+class MedicalDeviceAssessmentGenerator(AssessmentGenerator):
+    """Assessment generator specifically for medical device training"""
+
+    def __init__(self):
+        super().__init__()
+        self.min_passing = 80
+
+    def generate(self, sop_content, num_questions=5, passing_score=80):
+        """
+        Generate assessment with medical device specific questions
+
+        Args:
+            sop_content: Parsed SOP content
+            num_questions: Total number of questions (includes 2 required medical device questions)
+            passing_score: Minimum passing score (will be raised to 80 if lower)
+
+        Returns:
+            Assessment object with medical device compliance questions
+        """
+
+        # Get base assessment (request fewer to make room for required questions)
+        assessment = super().generate(sop_content, max(1, num_questions - 2), passing_score)
+
+        # Add required medical device questions
+        assessment.questions.extend(self._add_required_medical_questions())
+
+        # Ensure minimum passing score for medical device training
+        if assessment.passing_score < 80:
+            assessment.passing_score = 80
+
+        # Update description to indicate medical device compliance
+        assessment.description = "Complete this assessment to verify your understanding of the procedure. " + \
+                               "This assessment includes compliance questions required for medical device manufacturing."
+
+        return assessment
+
+    def _add_required_medical_questions(self):
+        """
+        Add questions that FDA expects to see in all medical device training
+
+        These questions ensure that trainees understand:
+        1. Proper deviation handling per 21 CFR 820.70
+        2. Impact awareness per 21 CFR 820.25
+
+        Returns:
+            List of required Question objects
+        """
+        required = []
+
+        # Deviation handling question (21 CFR 820.70 - Production and Process Controls)
+        q1 = Question(
+            question_id="md_req_1",
+            question_type="multiple_choice",
+            question_text="What should you do if you cannot follow this procedure as written?",
+            options=[
+                "Stop work and notify supervisor/QA for deviation approval",
+                "Continue with best judgment and document later",
+                "Skip the step if it seems unnecessary",
+                "Ask a coworker what they would do"
+            ],
+            correct_answer=0,
+            explanation="All deviations must be approved and documented per 21 CFR 820.70. "
+                       "Unauthorized deviations can compromise product quality and patient safety.",
+            points=2
+        )
+        required.append(q1)
+
+        # Quality impact question (21 CFR 820.25 - Personnel requirements)
+        q2 = Question(
+            question_id="md_req_2",
+            question_type="true_false",
+            question_text="Deviations from this procedure could potentially impact product quality or patient safety.",
+            options=["True", "False"],
+            correct_answer=0,
+            explanation="All procedures in a Quality Management System can impact product quality. "
+                       "Per 21 CFR 820.25, personnel must be trained to understand how their work affects quality.",
+            points=2
+        )
+        required.append(q2)
+
+        return required

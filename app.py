@@ -13,8 +13,10 @@ from datetime import datetime
 
 from src.parser import SOPParser
 from src.generator import TrainingGenerator
-from src.assessments import AssessmentGenerator
+from src.assessments import AssessmentGenerator, MedicalDeviceAssessmentGenerator
 from src.scorm_exporter import SCORMExporter
+from src.transparency_report import generate_transparency_report, create_html_report, create_json_report
+from src.medical_device_config import MEDICAL_DEVICE_CONFIG
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
@@ -105,8 +107,8 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
         generator = TrainingGenerator()
         training_module = generator.generate(sop_content)
 
-        # Step 3: Generate assessment
-        assessment_gen = AssessmentGenerator()
+        # Step 3: Generate assessment (using medical device generator for compliance)
+        assessment_gen = MedicalDeviceAssessmentGenerator()
         assessment = assessment_gen.generate(
             sop_content,
             num_questions=num_questions,
@@ -116,6 +118,18 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
         # Create output directory for this job
         output_dir = Path(app.config['OUTPUT_FOLDER']) / job_id
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate transparency report for medical device compliance
+        transparency_report = generate_transparency_report(
+            sop_content,
+            training_module,
+            assessment,
+            file_path
+        )
+
+        # Save transparency report as HTML and JSON
+        create_html_report(transparency_report, str(output_dir / 'transparency_report.html'))
+        create_json_report(transparency_report, str(output_dir / 'transparency_report.json'))
 
         # Step 4: Export based on format
         if output_format == 'scorm':
@@ -159,6 +173,7 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
             'success': True,
             'job_id': job_id,
             'download_url': f'/api/download/{job_id}/{download_filename}',
+            'transparency_report_url': f'/api/download/{job_id}/transparency_report.html',
             'metadata': {
                 'title': sop_content.title,
                 'version': sop_content.version,
@@ -167,7 +182,10 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
                 'num_questions': len(assessment.questions),
                 'passing_score': passing_score,
                 'estimated_duration': training_module.estimated_duration,
-                'learning_objectives': len(training_module.learning_objectives)
+                'learning_objectives': len(training_module.learning_objectives),
+                'medical_device_mode': True,
+                'compliance_questions_included': True,
+                'draft_watermarks_added': True
             }
         }
 

@@ -406,7 +406,35 @@
                 </div>
             </div>
 
-            <button class="btn" id="generateBtn" disabled>Generate Training Material</button>
+            <!-- Medical Device Compliance Section -->
+            <div style="background: #e3f2fd; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #2196f3;">
+                <h3 style="color: #1565c0; margin-top: 0;">🏥 Medical Device Compliance Features</h3>
+                <p style="color: #1976d2; margin: 10px 0;"><strong>ISO 13485 / 21 CFR 820 Training Development</strong></p>
+
+                <ul style="color: #333; line-height: 1.8; margin: 10px 0;">
+                    <li>✓ FDA-expected compliance questions included automatically</li>
+                    <li>✓ DRAFT watermarks on all content (requires SME review)</li>
+                    <li>✓ Transparency reports for auditor review</li>
+                    <li>✓ Minimum 80% passing score for medical device training</li>
+                    <li>✓ Metadata for traceability and validation</li>
+                </ul>
+
+                <div style="background: #fff3cd; padding: 15px; margin-top: 15px; border-radius: 5px; border-left: 3px solid #ff9800;">
+                    <p style="margin: 0; color: #f57c00;"><strong>⚠️ Important:</strong> This is a <strong>training development tool</strong> that generates <strong>DRAFT content</strong> requiring review by SME, QA, and Training Manager before use. Your validated LMS will maintain all training records per 21 CFR 820.25.</p>
+                </div>
+
+                <div style="margin-top: 15px; padding: 10px; background: white; border-radius: 4px;">
+                    <p style="margin: 5px 0; font-size: 0.95em;"><strong>What's Included:</strong></p>
+                    <ul style="margin: 5px 0; font-size: 0.9em; color: #555;">
+                        <li>Training package with DRAFT watermarks</li>
+                        <li>Transparency report (HTML + JSON)</li>
+                        <li>Metadata.json for audit trail</li>
+                        <li>Compliance questions per FDA expectations</li>
+                    </ul>
+                </div>
+            </div>
+
+            <button class="btn" id="generateBtn" disabled>Generate Training Material (Medical Device Mode)</button>
 
             <div class="progress-container" id="progressContainer">
                 <div class="progress-bar">
@@ -418,8 +446,12 @@
 
             <div class="results" id="results">
                 <h3 style="margin-bottom: 20px; color: #333;">Training Package Ready! 🎉</h3>
+                <div style="background: #e8f5e9; padding: 15px; margin-bottom: 20px; border-radius: 5px; border-left: 3px solid #4caf50;">
+                    <p style="margin: 0; color: #2e7d32;"><strong>✓ DRAFT Training Generated</strong> - Includes compliance questions, watermarks, and transparency report for review.</p>
+                </div>
                 <div class="results-grid" id="resultsGrid"></div>
                 <button class="btn download-btn" id="downloadBtn">Download Training Package</button>
+                <button class="btn" id="transparencyBtn" style="background: linear-gradient(135deg, #2196f3 0%, #1976d2 100%); margin-top: 10px;">View Transparency Report</button>
             </div>
         </div>
 
@@ -431,6 +463,7 @@
     <script>
         let selectedFile = null;
         let downloadUrl = null;
+        let transparencyReportUrl = null;
 
         const uploadZone = document.getElementById('uploadZone');
         const fileInput = document.getElementById('fileInput');
@@ -444,6 +477,7 @@
         const results = document.getElementById('results');
         const resultsGrid = document.getElementById('resultsGrid');
         const downloadBtn = document.getElementById('downloadBtn');
+        const transparencyBtn = document.getElementById('transparencyBtn');
 
         // Upload zone click
         uploadZone.addEventListener('click', () => fileInput.click());
@@ -490,6 +524,13 @@
         downloadBtn.addEventListener('click', () => {
             if (downloadUrl) {
                 window.location.href = downloadUrl;
+            }
+        });
+
+        // Transparency report button
+        transparencyBtn.addEventListener('click', () => {
+            if (transparencyReportUrl) {
+                window.open(transparencyReportUrl, '_blank');
             }
         });
 
@@ -559,6 +600,7 @@
                 // Show results
                 displayResults(data);
                 downloadUrl = data.download_url;
+                transparencyReportUrl = data.transparency_report_url;
 
                 showStatus('success', '✓ Training package generated successfully!');
 

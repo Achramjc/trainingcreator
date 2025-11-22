@@ -61,6 +61,9 @@ class SCORMExporter:
         self._create_content_files(package_dir, training_module, assessment)
         self._create_api_files(package_dir)
 
+        # Create metadata file for transparency
+        self._create_metadata_file(package_dir, training_module, assessment, package_name)
+
         # Create ZIP package
         zip_path = output_path / f"{package_name}.zip"
         self._create_zip(package_dir, zip_path)
@@ -273,6 +276,9 @@ class SCORMExporter:
 
     def _create_content_html(self, section: dict, title: str, page_num: int) -> str:
         """Create HTML for a content section"""
+        # Add watermark to content
+        content_with_watermark = self._add_draft_watermark(section.get('content', ''))
+
         html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -298,7 +304,7 @@ class SCORMExporter:
 <body>
     <div class="container">
         <h1>{title}</h1>
-        {section.get('content', '')}
+        {content_with_watermark}
 
         <div class="navigation">
             <button class="btn" onclick="markComplete()">Mark as Complete</button>
@@ -310,6 +316,9 @@ class SCORMExporter:
 
     def _create_assessment_html(self, assessment: Assessment, title: str) -> str:
         """Create HTML for assessment"""
+        # Add watermark
+        watermark = self._add_draft_watermark("")
+
         questions_html = ""
         for q in assessment.questions:
             questions_html += f"""
@@ -379,6 +388,8 @@ class SCORMExporter:
     <div class="container">
         <h1>{assessment.title}</h1>
         <p>{assessment.description}</p>
+
+        {watermark}
 
         {questions_html}
 
@@ -489,3 +500,92 @@ class SCORMExporter:
         for char in invalid_chars:
             filename = filename.replace(char, '_')
         return filename.strip()
+
+    def _add_draft_watermark(self, html_content: str) -> str:
+        """
+        Add draft watermark to all training content
+
+        This watermark makes it clear that the content is auto-generated
+        and requires review before use in production training.
+
+        Args:
+            html_content: Original HTML content
+
+        Returns:
+            HTML content with watermark prepended
+        """
+        watermark = """
+    <div style="border: 3px solid #ff9800; background: #fff3cd; padding: 15px; margin: 10px 0; border-radius: 5px;">
+        <h3 style="color: #ff6f00; margin: 0 0 10px 0;">⚠️ DRAFT TRAINING - REVIEW REQUIRED</h3>
+        <p style="margin: 5px 0;"><strong>This training content was auto-generated and requires review by:</strong></p>
+        <ul style="margin: 5px 0;">
+            <li>Subject Matter Expert - Technical accuracy</li>
+            <li>Quality Assurance - Compliance verification</li>
+            <li>Training Manager - Learning effectiveness</li>
+        </ul>
+        <p style="margin: 10px 0 0 0; font-size: 0.9em;">
+            Generated: {date} | Tool: Training Creator (Non-Validated) |
+            <strong>Your validated LMS will maintain all training records</strong>
+        </p>
+    </div>
+    """.format(date=datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        return watermark + html_content
+
+    def _create_metadata_file(self, package_dir: Path, training_module: TrainingModule,
+                             assessment: Assessment, source_info: str = "Unknown"):
+        """
+        Create metadata.json for full transparency
+
+        This file provides complete transparency about how the training
+        was generated, supporting ISO 13485 and FDA audit requirements.
+
+        Args:
+            package_dir: Directory where SCORM package is being created
+            training_module: Generated training module
+            assessment: Generated assessment
+            source_info: Information about source document
+        """
+        try:
+            from .medical_device_config import MEDICAL_DEVICE_CONFIG
+
+            metadata = {
+                "generation_info": MEDICAL_DEVICE_CONFIG['transparency_metadata'],
+                "source_file": source_info,
+                "content_created": {
+                    "training_sections": len(training_module.sections),
+                    "assessment_questions": len(assessment.questions),
+                    "passing_score": assessment.passing_score,
+                    "estimated_duration_minutes": training_module.estimated_duration
+                },
+                "review_status": "DRAFT - Requires SME Review",
+                "lms_notes": "Import to validated LMS for training record management per 21 CFR 820.25",
+                "generated_timestamp": datetime.now().isoformat(),
+                "compliance_context": {
+                    "iso_13485": "Training development tool for ISO 13485:2016 section 6.2",
+                    "cfr_820_25": "Personnel training content generator - LMS maintains records",
+                    "validation_status": "Non-validated content generation tool"
+                }
+            }
+
+            with open(package_dir / 'metadata.json', 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        except ImportError:
+            # If medical_device_config not available, create basic metadata
+            metadata = {
+                "generation_info": {
+                    "tool_name": "Training Creator",
+                    "validation_status": "Non-validated system"
+                },
+                "source_file": source_info,
+                "content_created": {
+                    "training_sections": len(training_module.sections),
+                    "assessment_questions": len(assessment.questions)
+                },
+                "review_status": "DRAFT",
+                "generated_timestamp": datetime.now().isoformat()
+            }
+
+            with open(package_dir / 'metadata.json', 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2, ensure_ascii=False)
