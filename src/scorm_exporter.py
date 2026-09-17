@@ -5,6 +5,7 @@ SCORM Exporter - Export training content to SCORM-compliant packages
 import html
 import json
 import os
+import re
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,38 @@ NS_XSI = "http://www.w3.org/2001/XMLSchema-instance"
 #: The exact <schemaversion> token each SCORM version requires.  "2004" on its
 #: own is not a value the specification defines.
 SCHEMA_VERSION_TOKEN = {"1.2": "1.2", "2004": "2004 4th Edition"}
+
+# ---------------------------------------------------------------------------
+# Control characters and XML
+#
+# XML 1.0 cannot represent C0 control characters other than tab, newline and
+# carriage return, and lxml refuses them outright rather than emitting something
+# an LMS would reject.  Document text reaches the manifest (the module title, a
+# section title), and a document title carrying an ANSI escape - `\x1b[2K` - used
+# to raise ValueError from `etree` and take the whole export down: a one-character
+# denial of service against SCORM export, found by the adversarial fixture
+# `examples/adversarial/markup_and_ansi.txt` (see docs/SECURITY.md).
+#
+# So every document-derived string entering XML goes through `_xml_text`, and the
+# generated HTML pages get the same treatment on the way to disk - not because a
+# browser would execute an escape sequence (it would not) but because an operator
+# who opens a page in a terminal or a log viewer should see the characters, not
+# obey them.
+# ---------------------------------------------------------------------------
+_CONTROL_CHAR_RE = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ufffe\uffff]")
+
+
+def _xml_text(value) -> str:
+    """``value`` as text safe to put in an XML element or attribute.
+
+    Strips C0/C1 control characters (keeping tab, newline and carriage return)
+    and the two permanently-invalid code points U+FFFE / U+FFFF.  Nothing else is
+    changed: escaping is lxml's job, and the text a reviewer approved must still
+    read the same.
+    """
+    return _CONTROL_CHAR_RE.sub("", "" if value is None else str(value))
+
 
 #: Files every page in the package loads.  They have to be declared as
 #: <file> elements on every resource that needs them, or a CAM-conformant LMS
@@ -259,7 +292,7 @@ class SCORMExporter:
         """(item id, resource id, page href, title) for every content page."""
         for idx, section in enumerate(training_module.sections, 1):
             yield (f"ITEM-{idx}", f"RES-{idx}", f"content_{idx}.html",
-                   section.get('title', f"Section {idx}"))
+                   _xml_text(section.get('title', f"Section {idx}")))
 
     @staticmethod
     def _declare_files(resource, primary: str):
@@ -293,14 +326,14 @@ class SCORMExporter:
         organizations.set("default", "ORG-01")
         organization = etree.SubElement(organizations, "organization")
         organization.set("identifier", "ORG-01")
-        etree.SubElement(organization, "title").text = training_module.title
+        etree.SubElement(organization, "title").text = _xml_text(training_module.title)
 
         for item_id, res_id, _href, title in self._section_pages(training_module):
             item = etree.SubElement(organization, "item")
             item.set("identifier", item_id)
             item.set("identifierref", res_id)
             item.set("isvisible", "true")
-            etree.SubElement(item, "title").text = title
+            etree.SubElement(item, "title").text = _xml_text(title)
 
         item = etree.SubElement(organization, "item")
         item.set("identifier", "ITEM-ASSESSMENT")
@@ -368,14 +401,14 @@ class SCORMExporter:
         organizations.set("default", "ORG-01")
         organization = etree.SubElement(organizations, "organization")
         organization.set("identifier", "ORG-01")
-        etree.SubElement(organization, "title").text = training_module.title
+        etree.SubElement(organization, "title").text = _xml_text(training_module.title)
 
         for item_id, res_id, _href, title in self._section_pages(training_module):
             item = etree.SubElement(organization, "item")
             item.set("identifier", item_id)
             item.set("identifierref", res_id)
             item.set("isvisible", "true")
-            etree.SubElement(item, "title").text = title
+            etree.SubElement(item, "title").text = _xml_text(title)
 
         item = etree.SubElement(organization, "item")
         item.set("identifier", "ITEM-ASSESSMENT")
@@ -438,12 +471,17 @@ class SCORMExporter:
         for idx, section in enumerate(training_module.sections, 1):
             html_content = self._create_content_html(section, training_module.title, idx,
                                                        approval=approval)
-            (package_dir / f"content_{idx}.html").write_text(html_content, encoding='utf-8')
+            (package_dir / f"content_{idx}.html").write_text(
+                _xml_text(html_content), encoding='utf-8')
 
         # Create assessment page
         assessment_html = self._create_assessment_html(assessment, training_module.title,
                                                          approval=approval)
-        (package_dir / "assessment.html").write_text(assessment_html, encoding='utf-8')
+        # Same stripping as the manifest: document text reaches these pages, and
+        # an ANSI escape that survives into a file an operator may `cat` is a
+        # terminal-rewriting trick with no legitimate use in training content.
+        (package_dir / "assessment.html").write_text(
+            _xml_text(assessment_html), encoding='utf-8')
 
     def _create_css_file(self, package_dir: Path):
         """Create stylesheet for content"""

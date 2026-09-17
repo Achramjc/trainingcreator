@@ -12,10 +12,23 @@ GOAL.md criterion 1 ("every generated sentence linked to a source line").
 """
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
-from html import escape as _escape
+from html import escape as _html_escape
 import hashlib
+
+#: C0/C1 control characters other than tab, newline and carriage return. A
+#: document title carrying an ANSI escape must not put that escape into a report
+#: an auditor may `cat`, so every escaped value is stripped of them first -
+#: escaping makes text safe for a browser, stripping makes it safe for a
+#: terminal. See src/injection_scan.py and docs/SECURITY.md.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+
+
+def _escape(value, quote=True):
+    """``html.escape`` with control characters removed first."""
+    return _html_escape(_CONTROL_CHAR_RE.sub("", str(value)), quote)
 
 from .audit import AuditLog, verify_job
 
