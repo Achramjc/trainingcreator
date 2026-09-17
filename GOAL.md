@@ -141,9 +141,11 @@ fake LMS in Chromium on both API surfaces. That harness found the "SCORM 2004" o
 API-discovery loop that never terminated inside frames without an LMS, a re-launch that
 overwrote a pass with "incomplete", and a missing `LMSFinish`. All fixed; each defect is pinned by
 a negative test. Criterion 4 is now *partly* met: schema-valid and runtime-verified against a
-fake LMS, not against a real one or ADL's test suite. The remaining gap that matters to the
-regulated buyer: the package reports a score and a status, not per-question evidence
-(`cmi.interactions`) — see `docs/SCORM_CONFORMANCE.md`.
+fake LMS, not against a real one or ADL's test suite. Per-question evidence is now written as
+`cmi.interactions` in both bindings, with `correct_responses` deliberately omitted so the answer
+key never travels through the learner's browser (an auditor sees what was answered and whether it
+was right, not the key); the remaining gaps are a real LMS import and server-verified scoring
+(M2) — see `docs/SCORM_CONFORMANCE.md`.
 
 Carried into M1/M2 from this pass: server-side scoring (the only real fix for the static-package
 limit); the SME JSON export legitimately contains the key and sits on disk for the retention
