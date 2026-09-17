@@ -1,0 +1,68 @@
+[
+  {
+    "id": "md_device_history_record",
+    "title": "Device History Record Compilation and Lot Release Review",
+    "regime": "Medical Device",
+    "standard": "ISO 13485 / 21 CFR 820",
+    "format": "txt",
+    "path": "examples/gallery/md_device_history_record.txt",
+    "description": "Compiling and independently reviewing a Device History Record before a finished-goods lot is released to inventory.",
+    "steps_expected": 8,
+    "warnings_expected": 3
+  },
+  {
+    "id": "pharma_cleaning_validation",
+    "title": "Equipment Cleaning and Swab Sampling Between Product Changeovers",
+    "regime": "Pharmaceutical",
+    "standard": "GMP (21 CFR 211)",
+    "format": "txt",
+    "path": "examples/gallery/pharma_cleaning_validation.txt",
+    "description": "Cleaning shared solid-dose equipment and verifying residue is below the carryover limit before the next product runs.",
+    "steps_expected": 9,
+    "warnings_expected": 4
+  },
+  {
+    "id": "food_allergen_changeover",
+    "title": "Allergen Changeover on Packaging Line 7",
+    "regime": "Food Safety",
+    "standard": "HACCP",
+    "format": "md",
+    "path": "examples/gallery/food_allergen_changeover.md",
+    "description": "Clearing tree-nut allergen from a packaging line and verifying the line before the next, allergen-free product runs.",
+    "steps_expected": 10,
+    "warnings_expected": 3
+  },
+  {
+    "id": "aero_torque_procedure",
+    "title": "Calibrated Torque Application and Witness Stamping",
+    "regime": "Aerospace",
+    "standard": "AS9100",
+    "format": "txt",
+    "path": "examples/gallery/aero_torque_procedure.txt",
+    "description": "Applying and independently witnessing calibrated torque on safety-of-flight primary structure fasteners.",
+    "steps_expected": 8,
+    "warnings_expected": 4
+  },
+  {
+    "id": "lab_sample_receipt",
+    "title": "Clinical Sample Receipt, Accessioning, and Rejection Criteria",
+    "regime": "Clinical Laboratory",
+    "standard": "CLIA / CAP",
+    "format": "txt",
+    "path": "examples/gallery/lab_sample_receipt.txt",
+    "description": "Inspecting, accessioning, or rejecting incoming patient specimens before they enter the testing workflow.",
+    "steps_expected": 10,
+    "warnings_expected": 4
+  },
+  {
+    "id": "warehouse_loto_forklift",
+    "title": "Lockout/Tagout for Electric Forklift Battery Service",
+    "regime": "General Manufacturing",
+    "standard": "OSHA 1910.147 / 1910.178",
+    "format": "txt",
+    "path": "examples/gallery/warehouse_loto_forklift.txt",
+    "description": "Isolating stored energy and following battery-service precautions on a Class I electric forklift.",
+    "steps_expected": 9,
+    "warnings_expected": 4
+  }
+]

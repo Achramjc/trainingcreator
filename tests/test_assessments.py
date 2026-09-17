@@ -47,10 +47,18 @@ from src.assessments import (
     step_sort_key,
 )
 from src.parser import SOPContent, SOPParser
+from src.samples import list_samples as _list_gallery_samples
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_SOP = REPO_ROOT / "examples" / "sample_sop.txt"
 NUMBERED_SOP = REPO_ROOT / "examples" / "sample_sop_numbered.txt"
+
+#: The sample-SOP gallery (examples/gallery/), keyed by id -> resolved path.
+#: Folded into DOCUMENTS below so the whole naive-learner / coverage /
+#: determinism sweep runs against realistic documents from several
+#: regulatory regimes, not just the two original fixtures and the synthetic
+#: ones above.
+GALLERY_SAMPLES = {entry["id"]: entry["resolved_path"] for entry in _list_gallery_samples()}
 
 #: Every question count the blueprint has to cope with, from the enforced
 #: minimum up.  Requests below MIN_ASSESSMENT_QUESTIONS are clamped (see
@@ -209,10 +217,14 @@ def get_document(name):
         numbers = ["4.{0}".format(i) for i in range(1, 12)]
         return make_sop("Numbered Convention SOP", "5.1", 11, 4, 3,
                         step_numbers=numbers)
+    if name in GALLERY_SAMPLES:
+        # Real, realistic SOPs from six regulatory regimes (examples/gallery/),
+        # parsed through the real parser -- not hand-built like make_sop().
+        return SOPParser().parse(str(GALLERY_SAMPLES[name]))
     raise KeyError(name)
 
 
-DOCUMENTS = ("sample", "numbered", "rich", "sparse", "headings_only")
+DOCUMENTS = ("sample", "numbered", "rich", "sparse", "headings_only") + tuple(GALLERY_SAMPLES)
 GENERATORS = ("base", "medical_device")
 
 

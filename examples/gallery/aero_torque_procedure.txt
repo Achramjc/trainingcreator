@@ -1,0 +1,97 @@
+Standard Operating Procedure: Calibrated Torque Application and Witness Stamping on Primary Structure Fasteners
+
+Document Number: SOP-QC-303
+Version: 2.1
+Effective Date: 04/14/2026
+Department: Final Assembly
+
+1.0 PURPOSE
+This procedure defines the requirements for applying calibrated torque to primary
+structure fasteners and for witness stamping the completed torque application, so that
+every safety-of-flight fastener has objective, traceable evidence of correct installation
+in accordance with the AS9100 quality management system and the applicable engineering
+drawing.
+
+2.0 SCOPE
+This procedure applies to all primary structure fastener installations identified as
+Class 1 on the engineering drawing, and to all Assembly Mechanics, Torque Technicians, and
+Quality Inspectors performing or witnessing torque application on the wing spar and
+fuselage frame assemblies. Non-structural fasteners follow SOP-QC-118.
+
+3.0 DEFINITIONS
+Class 1 Fastener: A fastener identified on the engineering drawing as safety-of-flight critical, requiring calibrated torque and independent witness verification.
+Torque Wrench Calibration Interval: The maximum 90-day period a torque wrench may be used before recalibration is required.
+Witness Stamp: The unique inspector stamp applied next to a torque application to record independent verification that the specified torque was achieved.
+Torque Sequence: The engineering-specified order in which multiple fasteners in a joint must be tightened to achieve even clamp-up.
+
+4.0 RESPONSIBILITIES
+- Assembly Mechanics: Install fasteners and apply torque per the drawing callout
+- Torque Technicians: Verify torque wrench calibration status before each use
+- Quality Inspectors: Independently witness and stamp each Class 1 torque application
+- Tool Crib: Maintain the torque wrench calibration schedule and pull wrenches from service when due
+
+SAFETY WARNINGS
+WARNING: Never use a torque wrench that is past its calibration due date. Verify the calibration sticker date before every torque application session.
+CAUTION: Over-torquing a Class 1 fastener beyond 110 percent of the specified value requires fastener removal and replacement; do not attempt to back off and re-torque.
+WARNING: Do not apply torque to a fastener in a joint with any adjacent fastener still loose, as this can induce uneven clamp-up and hidden structural damage.
+DANGER: Do not work beneath a suspended wing spar assembly during torque application unless the overhead crane is locked out per SOP-EHS-011.
+
+5.0 PROCEDURE
+5.1 Verify Torque Wrench Calibration
+Check the calibration sticker on the torque wrench and confirm the current date falls
+within the 90-day calibration interval. Record the wrench serial number and calibration
+due date on the traveler before use.
+
+5.2 Verify Fastener and Joint Condition
+Inspect the fastener, washer, and mating surfaces for damage, corrosion, or foreign object
+debris. Confirm the correct fastener part number against the engineering drawing before
+installation.
+a. Confirm fastener grip length matches the joint thickness within drawing tolerance
+b. Confirm the joint surfaces are free of sealant intrusion at the faying surface
+
+5.3 Install Fasteners Finger-Tight in Sequence
+Install all fasteners in the joint finger-tight, following the torque sequence diagram on
+the drawing, before applying final torque to any single fastener.
+
+5.4 Apply Calibrated Torque in Sequence
+Apply torque to each fastener in the specified sequence to the drawing-called value of
+28 Newton-meters, using a smooth continuous pull rather than a jerking motion. Do not skip
+ahead in the sequence.
+a. Apply the first pass at 50 percent of final torque across the full sequence
+b. Apply the final pass at 100 percent of final torque across the full sequence
+
+5.5 Verify Torque with a Check Wrench
+Using a separate, independently calibrated check wrench, verify a sample of 20 percent of
+the fasteners in the joint reach the specified 28 Newton-meter value without additional
+rotation. Any fastener that rotates further under the check wrench fails and must be
+re-torqued and re-verified.
+
+5.6 Apply the Witness Stamp
+The Quality Inspector independently observes torque application on any fastener not
+covered by the check-wrench sample, then applies the individual witness stamp adjacent to
+each completed fastener location on the traveler.
+
+5.7 Record Torque Values on the Traveler
+Record the achieved torque value, the torque wrench serial number, and the inspector
+stamp number for each fastener location on the assembly traveler. Illegible or missing
+entries require the torque application to be re-verified before the joint may be closed
+out.
+
+5.8 Apply Torque Stripe and Close Out the Joint
+Apply the yellow torque stripe across each fastener head and the adjacent structure once
+witness stamping is complete, providing a visual indicator that the fastener has not been
+disturbed since verification. Close out the joint entry on the traveler.
+
+REFERENCES:
+- SOP-EHS-011: Overhead Crane Lockout Procedure
+- SOP-QC-118: Non-Structural Fastener Torque Procedure
+- Engineering Drawing 220-1004, Wing Spar Fastener Callouts
+- AS9100D Section 8.5.1: Control of Production
+
+RECORDS:
+- Assembly Traveler with witness stamps, retained for the life of the airframe
+
+REVISION HISTORY:
+Version 2.1 (04/14/2026): Added check-wrench independent verification requirement
+Version 2.0 (10/02/2025): Reduced calibration interval from 180 to 90 days
+Version 1.0 (03/11/2023): Initial release
