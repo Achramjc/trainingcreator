@@ -26,7 +26,20 @@ from src.assessments import (
     MIN_ASSESSMENT_QUESTIONS,
     AssessmentGenerator,
     MedicalDeviceAssessmentGenerator,
+    naive_strategies,
+    strategy_pick,
+    # `_assign_answer_positions` is deliberately a private helper of
+    # src/assessments.py, imported here rather than reimplemented. Which
+    # option is "correct" is SME content; *where* that option sits in the
+    # option list is layout the server owns (CLAUDE.md invariant #1: "a
+    # naive learner must fail"). This is the one place that invariant is
+    # enforced at generation time, so re-running it on an SME edit - rather
+    # than duplicating its logic - is the only way to guarantee an edited
+    # assessment stays byte-for-byte inside the same guarantee a freshly
+    # generated one is held to, with no risk of drifting out of sync with it.
+    _assign_answer_positions,
 )
+from src.answer_key import document_key
 from src.scorm_exporter import SCORMExporter
 from src.transparency_report import generate_transparency_report, create_html_report, create_json_report
 from src.medical_device_config import MEDICAL_DEVICE_CONFIG
@@ -358,6 +371,137 @@ def _validate_assessment_dict(data):
         explanation = q.get('explanation', '')
         if not isinstance(explanation, str):
             raise ValueError(f'{label}.explanation must be a string')
+
+
+def _relayout_assessment_answers(assessment, sop_content):
+    """Re-run the generator's own deterministic answer-position layout on an
+    edited assessment, in place.
+
+    An SME editing the review page chooses which option is *correct* - that's
+    content, and legitimately theirs to change. Where that correct option
+    *sits* in the option list is layout, and CLAUDE.md invariant #1 ("a naive
+    learner must fail") depends entirely on the server controlling it. Without
+    this, an SME setting every `correct_answer` to 0 while editing would
+    silently reopen Defect 1 through the review UI.
+
+    `_assign_answer_positions` (see src/assessments.py) expects each affected
+    question's `options[0]` to already hold the correct text before it
+    shuffles the rest and re-assigns `correct_answer` - exactly the
+    "canonical form" `_Candidate.materialize` puts freshly generated
+    questions in. So every non-true_false question is normalised into that
+    form first: its SME-chosen correct option is moved to index 0 (the other
+    options keep their relative order; the helper reshuffles them anyway with
+    its own seeded RNG). True/false questions are left untouched -
+    `_assign_answer_positions` already skips them, since their integrity
+    comes from truth-value balancing at generation time, not position; if the
+    SME flipped True/False, that's their call.
+    """
+    for q in assessment.questions:
+        if q.type == 'true_false':
+            continue
+        if isinstance(q.correct_answer, bool) or not isinstance(q.correct_answer, int):
+            continue
+        if not (0 <= q.correct_answer < len(q.options)):
+            continue
+        correct_text = q.options[q.correct_answer]
+        rest = [opt for i, opt in enumerate(q.options) if i != q.correct_answer]
+        q.options = [correct_text] + rest
+        q.correct_answer = 0
+
+    doc_key = document_key(sop_content.title, sop_content.version)
+    _assign_answer_positions(assessment.questions, doc_key)
+
+
+def _naive_strategy_failures(assessment):
+    """Score every fixed answering strategy a learner could execute without
+    reading the SOP against this exact assessment (already laid out).
+
+    Mirrors CLAUDE.md invariant #1 - "always option N", "always last",
+    "always True", "always the longest/shortest option" - all must fall
+    short of the assessment's own passing score. The position-based
+    strategies reuse `naive_strategies`/`strategy_pick` from
+    src/assessments.py (the same ones `_assign_answer_positions` optimises
+    against); "longest"/"shortest"/"True" are layout-independent text
+    strategies that position optimisation cannot fix, so they are modelled
+    here directly, the same way tests/test_assessments.py does.
+
+    Returns a list of (name, score_percent, question_numbers) for every
+    strategy meeting or beating the passing score, worst (highest-scoring)
+    first. `question_numbers` are the 1-based questions that strategy
+    answers correctly, for a targeted fix suggestion.
+    """
+    questions = assessment.questions
+    if not questions:
+        return []
+    total_points = sum(q.points for q in questions) or 1
+
+    def score(picker):
+        earned = 0
+        hits = []
+        for number, q in enumerate(questions, 1):
+            if not q.options:
+                continue
+            try:
+                pick = picker(q)
+            except (ValueError, IndexError):
+                pick = -1
+            if pick == q.correct_answer:
+                earned += q.points
+                hits.append(number)
+        return 100.0 * earned / total_points, hits
+
+    strategies = []
+    max_options = max(len(q.options) for q in questions if q.options)
+    for strat in naive_strategies(max_options):
+        kind, aim, _fallback = strat
+        name = ('always choosing the last option' if kind == 'last'
+                else f'always choosing option {aim + 1}')
+        strategies.append((name, (lambda s: lambda q: strategy_pick(s, len(q.options)))(strat)))
+
+    strategies.append((
+        'always choosing the longest option',
+        lambda q: max(range(len(q.options)), key=lambda i: (len(q.options[i]), -i)),
+    ))
+    strategies.append((
+        'always choosing the shortest option',
+        lambda q: min(range(len(q.options)), key=lambda i: (len(q.options[i]), i)),
+    ))
+    strategies.append((
+        'always answering True',
+        lambda q: q.options.index('True') if 'True' in q.options else -1,
+    ))
+
+    failures = []
+    for name, picker in strategies:
+        pct, hits = score(picker)
+        if pct >= assessment.passing_score:
+            failures.append((name, pct, hits))
+
+    failures.sort(key=lambda item: item[1], reverse=True)
+    return failures
+
+
+def _naive_failure_message(failure, passing_score):
+    """Build a precise, actionable error message for one failing strategy."""
+    name, pct, hits = failure
+    where = ', '.join(str(h) for h in hits[:12])
+    if len(hits) > 12:
+        where += ', ...'
+
+    if 'longest' in name:
+        fix = 'shorten the correct option or lengthen a distractor'
+    elif 'shortest' in name:
+        fix = 'lengthen the correct option or shorten a distractor'
+    elif 'True' in name:
+        fix = 'make some of these True statements False instead (or vice versa)'
+    else:
+        fix = "change which option is correct so it isn't always in the same position"
+
+    plural = '' if len(hits) == 1 else 's'
+    return (
+        f'{name} would score {pct:.0f}%, at or above the passing score of '
+        f'{passing_score}%: {fix} in question{plural} {where}.'
+    )
 
 
 @app.route('/')
@@ -732,8 +876,19 @@ def review_submit(job_id):
     training_module = module_from_dict(module_dict)
     assessment = assessment_from_dict(assessment_dict)
 
+    # Answer *position* is server-owned layout, not SME content (see
+    # _relayout_assessment_answers) - re-run it before anything else looks at
+    # `correct_answer`. edits_count above was already computed against the
+    # SME's raw submission, so this re-layout cannot inflate or hide it.
+    _relayout_assessment_answers(assessment, sop_content)
+
+    naive_failures = _naive_strategy_failures(assessment)
+    if naive_failures:
+        return jsonify({'error': _naive_failure_message(
+            naive_failures[0], assessment.passing_score)}), 400
+
     job['training_module'] = module_dict
-    job['assessment'] = assessment_dict
+    job['assessment'] = assessment.to_dict()
     job['status'] = 'edited'
     job['edits_count'] = edits_count
     job['approval'] = None  # content changed - any prior approval no longer applies
@@ -753,6 +908,9 @@ def review_submit(job_id):
         'job_id': job_id,
         'status': job['status'],
         'edits_count': edits_count,
+        # The re-laid-out assessment (server-owned answer positions applied),
+        # so the review page can re-render option order without a reload.
+        'assessment': assessment.to_dict(),
         'download_url': f'/api/download/{job_id}/{download_filename}?t={token}',
         'transparency_report_url': f'/api/download/{job_id}/transparency_report.html?t={token}',
         'review_url': f'/review/{job_id}?t={token}',

@@ -185,6 +185,12 @@
             <input type="number" id="passing-score" min="1" max="100" value="{{ assessment.passing_score }}">
 
             <h3 style="margin-top:18px;">Questions (minimum {{ min_questions }})</h3>
+            <p class="meta-line" id="layout-note" style="display:none;">
+                Saving may re-order options: which option is correct is your call, but where it
+                sits in the list is chosen by the server so the quiz can't be passed by clicking
+                the same position every time.
+            </p>
+            <div id="questions-container">
             {% for q in assessment.questions %}
             <div class="question-block">
                 <div class="meta-line">Question {{ loop.index }} &middot; {{ q.type }}
@@ -215,6 +221,7 @@
                 <textarea class="question-explanation">{{ q.explanation }}</textarea>
             </div>
             {% endfor %}
+            </div>
         </div>
 
         <div class="card">
@@ -350,6 +357,114 @@
         el.textContent = text;
     }
 
+    // Rebuilds the question editor from an Assessment.to_dict()-shaped
+    // object using DOM nodes (never innerHTML with interpolated option
+    // text), so SOP/SME text can never be interpreted as markup here either.
+    // Needed after a save: the server re-lays-out answer positions
+    // server-side (see _relayout_assessment_answers in app.py) - which
+    // option is correct never moves, but *where* it sits in the list can -
+    // so the page must reflect the saved state, not what was last typed.
+    function buildOptionRow(qid, index, text, checked) {
+        var row = document.createElement('div');
+        row.className = 'option-row';
+
+        var radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'correct-' + qid;
+        radio.value = String(index);
+        radio.checked = !!checked;
+        row.appendChild(radio);
+
+        var input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'option-text';
+        input.value = text;
+        row.appendChild(input);
+
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'remove-btn';
+        removeBtn.textContent = 'Remove';
+        removeBtn.addEventListener('click', function () { removeOption(removeBtn); });
+        row.appendChild(removeBtn);
+
+        return row;
+    }
+
+    function buildQuestionBlock(q, index) {
+        var block = document.createElement('div');
+        block.className = 'question-block';
+
+        var meta = document.createElement('div');
+        meta.className = 'meta-line';
+        meta.appendChild(document.createTextNode(
+            'Question ' + (index + 1) + ' · ' + q.type + ' '));
+        if (q.source_ref && q.source_ref.source_lines) {
+            var start = q.source_ref.source_lines[0];
+            var end = q.source_ref.source_lines[1];
+            var link = document.createElement('a');
+            link.href = '#';
+            link.className = 'show-source';
+            link.textContent = 'Show source (lines ' + start + '–' + end + ')';
+            link.addEventListener('click', function (e) {
+                e.preventDefault();
+                scrollAndHighlight(start, end);
+            });
+            meta.appendChild(link);
+        }
+        block.appendChild(meta);
+
+        var textLabel = document.createElement('label');
+        textLabel.className = 'field-label';
+        textLabel.textContent = 'Question text';
+        block.appendChild(textLabel);
+
+        var textInput = document.createElement('input');
+        textInput.type = 'text';
+        textInput.className = 'question-text';
+        textInput.value = q.text;
+        block.appendChild(textInput);
+
+        var optsLabel = document.createElement('label');
+        optsLabel.className = 'field-label';
+        optsLabel.textContent = 'Options (select the correct one)';
+        block.appendChild(optsLabel);
+
+        var optsList = document.createElement('div');
+        optsList.className = 'options-list';
+        (q.options || []).forEach(function (opt, i) {
+            optsList.appendChild(buildOptionRow(q.id, i, opt, i === q.correct_answer));
+        });
+        block.appendChild(optsList);
+
+        var addBtn = document.createElement('button');
+        addBtn.type = 'button';
+        addBtn.className = 'add-btn';
+        addBtn.textContent = '+ Add option';
+        addBtn.addEventListener('click', function () { addOption(addBtn); });
+        block.appendChild(addBtn);
+
+        var explLabel = document.createElement('label');
+        explLabel.className = 'field-label';
+        explLabel.textContent = 'Explanation (SME/audit only - never shown to learners)';
+        block.appendChild(explLabel);
+
+        var expl = document.createElement('textarea');
+        expl.className = 'question-explanation';
+        expl.value = q.explanation || '';
+        block.appendChild(expl);
+
+        return block;
+    }
+
+    function renderQuestions(assessmentData) {
+        var container = document.getElementById('questions-container');
+        container.innerHTML = '';
+        (assessmentData.questions || []).forEach(function (q, idx) {
+            container.appendChild(buildQuestionBlock(q, idx));
+        });
+    }
+
     function submitReview() {
         var btn = document.getElementById('save-btn');
         btn.disabled = true;
@@ -366,7 +481,13 @@
                 return;
             }
             originalModule = collectModule();
-            originalAssessment = collectAssessment();
+            // Use the server's re-laid-out assessment, not what was last
+            // typed: the server may have moved correct options to new
+            // positions (see _relayout_assessment_answers in app.py).
+            originalAssessment = result.data.assessment;
+            renderQuestions(originalAssessment);
+            document.getElementById('passing-score').value = originalAssessment.passing_score;
+            document.getElementById('layout-note').style.display = 'block';
             document.getElementById('status-badge').textContent = result.data.status;
             document.getElementById('status-badge').className = 'badge ' + result.data.status;
             document.getElementById('edits-count-display').textContent = result.data.edits_count;

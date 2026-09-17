@@ -9,8 +9,19 @@ rejection). Uses the Flask test client end to end, same as tests/test_app.py.
 import io
 import json
 import zipfile
+from pathlib import Path
 
 import app as app_module
+from src.assessments import naive_strategies, strategy_pick
+from src.serialization import assessment_from_dict
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+#: Chosen (see tests below) because forcing every correct_answer to 0 on this
+#: fixture, at this question count, does not *also* coincidentally trip a
+#: length-based naive strategy purely from which distractor text happens to
+#: already sit at index 0 before the edit - keeping the position-relayout
+#: tests focused on the one thing they're testing.
+NUMBERED_SOP_PATH = str(REPO_ROOT / "examples" / "sample_sop_numbered.txt")
 
 
 def _upload(client, sample_sop_path, **form_overrides):
@@ -325,3 +336,141 @@ def test_approver_name_is_escaped_in_review_page_and_banner(client, sample_sop_p
     assessment_html = _zip_member_text(download_resp.data, "assessment.html")
     assert "<script>alert(1)</script>" not in assessment_html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in assessment_html
+
+
+# ---------------------------------------------------------------------------
+# Answer position is server-owned layout, not SME content (CLAUDE.md
+# invariant #1: "a naive learner must fail"). An SME edit that sets the
+# correct_answer index in a way a naive learner could exploit must be
+# silently corrected (position), or rejected outright when the exploit is in
+# the option *text* itself (position can't fix that).
+# ---------------------------------------------------------------------------
+def test_review_submit_relayouts_answers_gamed_by_position(client):
+    """Setting every correct_answer to 0 must not survive into the saved
+    assessment as-is: the server re-lays-out positions so "always option 1"
+    (and every other fixed-position strategy) still fails against this
+    assessment's own passing score."""
+    payload, job_id, token = _upload_and_get_job(client, NUMBERED_SOP_PATH)
+    job = app_module._read_job_json(job_id)
+    module = job["training_module"]
+    assessment = job["assessment"]
+
+    for q in assessment["questions"]:
+        if q["type"] != "true_false":
+            q["correct_answer"] = 0
+
+    resp = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    result = resp.get_json()
+
+    mc_positions = [
+        q["correct_answer"] for q in result["assessment"]["questions"]
+        if q["type"] != "true_false"
+    ]
+    assert len(mc_positions) >= 2
+    # Not every correct answer landed back on position 0 - the whole point of
+    # the exploit the SME just (naively or otherwise) tried.
+    assert any(p != 0 for p in mc_positions)
+
+    # Independently re-derive the invariant #1 check (not the app's own
+    # helper) against the *saved* job: no fixed-position strategy reaches the
+    # passing score.
+    saved = app_module._read_job_json(job_id)
+    rebuilt = assessment_from_dict(saved["assessment"])
+    total_points = sum(q.points for q in rebuilt.questions)
+    max_options = max(len(q.options) for q in rebuilt.questions)
+    for strategy in naive_strategies(max_options):
+        earned = sum(
+            q.points for q in rebuilt.questions
+            if strategy_pick(strategy, len(q.options)) == q.correct_answer
+        )
+        pct = 100.0 * earned / total_points
+        assert pct < rebuilt.passing_score, (
+            f"strategy {strategy} scores {pct:.1f}% after the SME's edit was saved"
+        )
+
+
+def test_review_submit_edits_count_not_inflated_by_relayout(client):
+    """edits_count is measured against what the SME actually submitted, not
+    against the server's post-relayout result - so redistributing answer
+    positions must never show up as extra edits."""
+    payload, job_id, token = _upload_and_get_job(client, NUMBERED_SOP_PATH)
+    job = app_module._read_job_json(job_id)
+    module = job["training_module"]
+    assessment = job["assessment"]
+
+    # A single, unrelated content edit - no question touched at all, so any
+    # position changes the server makes are entirely its own doing.
+    module["learning_objectives"][0] = module["learning_objectives"][0] + " (minor tweak)"
+
+    resp = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    assert resp.get_json()["edits_count"] == 1
+
+
+def test_review_submit_rejects_answers_gamed_by_length(client, sample_sop_path):
+    """Position can't fix a text-level exploit: if the SME makes the correct
+    option dramatically longer than its distractors in every multiple-choice
+    question, "always click the longest option" would pass the quiz, and the
+    edit must be rejected outright rather than silently saved."""
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
+    job = app_module._read_job_json(job_id)
+    module = job["training_module"]
+    assessment = job["assessment"]
+
+    padding = " extra padding text to make this option far longer than the others" * 3
+    for q in assessment["questions"]:
+        if q["type"] == "true_false":
+            continue
+        idx = q["correct_answer"]
+        q["options"][idx] = q["options"][idx] + padding
+
+    resp = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert resp.status_code == 400
+    error = resp.get_json()["error"]
+    assert "longest" in error
+    assert "%" in error
+
+    # Nothing was saved: the job is still in its pre-edit state.
+    saved = app_module._read_job_json(job_id)
+    assert saved["status"] == "draft"
+
+
+def test_approve_after_position_gamed_edit_still_hides_answer_key(client):
+    """The naive-learner fix must not reopen Defect 2: even after an SME
+    edit that had to be corrected server-side, the approved package's
+    learner-facing HTML still carries no answer key."""
+    payload, job_id, token = _upload_and_get_job(client, NUMBERED_SOP_PATH)
+    job = app_module._read_job_json(job_id)
+    module = job["training_module"]
+    assessment = job["assessment"]
+    for q in assessment["questions"]:
+        if q["type"] != "true_false":
+            q["correct_answer"] = 0
+
+    edit_resp = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert edit_resp.status_code == 200
+
+    approve_resp = client.post(
+        f"/api/approve/{job_id}?t={token}",
+        json={"approved_by": "Jane Doe", "role": "SME"},
+    )
+    assert approve_resp.status_code == 200
+    result = approve_resp.get_json()
+
+    download_resp = client.get(result["download_url"])
+    assessment_html = _zip_member_text(download_resp.data, "assessment.html")
+    assert "correct_answer" not in assessment_html
+    assert "DRAFT" not in assessment_html

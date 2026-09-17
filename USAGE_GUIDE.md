@@ -210,6 +210,19 @@ the *original, untouched* generation (not from the last save), so it stays a
 meaningful measure of how much the model got wrong even across several
 rounds of edits.
 
+*Which* option is correct is SME content, and free to change; *where* that
+option sits in the option list is layout the server always re-derives itself
+(the same deterministic placement the generator uses - see CLAUDE.md
+invariant #1), so an edit can never reopen "a naive learner can pass by
+always clicking option 1" through the review UI. If the edited option
+*text* itself would let a naive learner pass anyway - e.g. making the
+correct answer dramatically longer than every distractor - saving is
+refused with `400` naming the exploitable strategy, its score, and which
+questions to fix; nothing is saved until it's addressed. The saved (and
+returned) assessment reflects this server-chosen layout, which is why the
+option order on screen can shift after a save even when you didn't touch
+that question.
+
 ### 2. Approve
 
 Once the content is right, an SME (or QA, or Training Manager - whoever your
