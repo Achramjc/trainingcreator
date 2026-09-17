@@ -1,0 +1,37 @@
+Standard Operating Procedure: Widget Calibration
+
+Version: 1.3
+Effective Date: 03/05/2026
+
+1.0 PURPOSE
+This procedure defines the steps required to calibrate the widget press prior to each production run, ensuring dimensional accuracy and operator safety.
+
+2.0 SCOPE
+This procedure applies to all calibration technicians operating widget presses in Building B.
+
+3.0 DEFINITIONS
+Calibration Target (CT): The reference measurement used to validate press alignment.
+Press Operator: The technician assigned to run the calibration sequence.
+
+RESPONSIBILITIES
+* Calibration Technicians: Perform the calibration sequence and record results
+* Shift Supervisors: Verify calibration records prior to production start
+
+SAFETY WARNINGS
+WARNING: Disconnect power before adjusting the press alignment bolts.
+CAUTION: Calibration targets are sharp; handle with gloves.
+
+4.0 PROCEDURE
+4.1 Power Down the Press
+Switch off the main power breaker and confirm zero energy state before beginning calibration.
+
+4.2 Attach Calibration Target
+Mount the calibration target to the press head using the two mounting screws.
+a. Align the target with the reference notch
+b. Tighten both mounting screws evenly
+
+4.3 Record Baseline Reading
+Read the digital gauge and record the baseline value on Form WC-201.
+
+REFERENCES
+- Form WC-201: Calibration Record

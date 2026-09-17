@@ -4,10 +4,68 @@ SOP Parser - Extract content from various document formats
 
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 import markdown
+
+
+# Section headings recognised in SOP documents. Keys are the normalised
+# (lower-cased, numbering- and colon-stripped) heading text; values are the
+# canonical section this document is filed under. Any line that reduces to
+# one of these keys is treated as a section boundary, and section bodies run
+# from just after the heading line to the next recognised heading (of any
+# kind).
+SECTION_ALIASES = {
+    "purpose": "purpose",
+    "objective": "purpose",
+    "objectives": "purpose",
+    "scope": "scope",
+    "definitions": "definitions",
+    "definition": "definitions",
+    "key terms and definitions": "definitions",
+    "responsibilities": "responsibilities",
+    "responsibility": "responsibilities",
+    "safety warnings": "safety",
+    "safety": "safety",
+    "warnings": "safety",
+    "precautions": "safety",
+    "safety precautions": "safety",
+    "procedure": "procedure",
+    "procedures": "procedure",
+    "procedure steps": "procedure",
+    "references": "references",
+    "reference": "references",
+    "documentation": "documentation",
+    "records": "documentation",
+    "revision history": "other",
+}
+
+# A heading may be prefixed with a numbering scheme like "1.0 ", "3. " or
+# "4.1.2 ".
+_NUMBERING_RE = re.compile(r"^(\d+(?:\.\d+)*)[.):]?\s+(.+)$")
+
+# Step headings inside a PROCEDURE section, tried in this order:
+#   "Step 2: Activate Emergency Stop" / "Step 3 -" / "Step 4."
+#   "4.1 Power Down the Press"           (numbered sub-section under a
+#                                          numbered PROCEDURE heading)
+#   "1. Identify Emergency Situation" / "1) ..." / "1: ..."
+_STEP_WORD_RE = re.compile(r"^step\s+(\d+)\s*[:.\-]?\s*(.*)$", re.IGNORECASE)
+_STEP_DECIMAL_RE = re.compile(r"^(\d+\.\d+)\.?\s+(.*)$")
+_STEP_PLAIN_RE = re.compile(r"^(\d+)[.):]\s*(.*)$")
+
+# Lettered sub-steps: "a. ..." / "b) ..."
+_SUBSTEP_RE = re.compile(r"^\s*([a-z])[.)]\s+(.*)$")
+
+_WARNING_MARKER_RE = re.compile(r"^\s*(warning|caution|danger)\s*:\s*(.*)$", re.IGNORECASE)
+_STOP_MARKER_RE = re.compile(r"^\s*(warning|caution|danger|note)\s*:", re.IGNORECASE)
+
+_BULLET_RE = re.compile(r"^[\-\*•‣◦⁃]\s*")
+
+
+def _normalize_ws(text: str) -> str:
+    """Collapse all whitespace (including newlines) into single spaces."""
+    return re.sub(r"\s+", " ", text).strip()
 
 
 class SOPContent:
@@ -127,10 +185,89 @@ class SOPParser:
 
         return self._extract_structure(text)
 
+    # ------------------------------------------------------------------
+    # Heading / section detection
+    # ------------------------------------------------------------------
+
+    def _match_heading(self, line: str) -> Optional[Tuple[str, str]]:
+        """
+        Test whether `line` is a recognised section heading.
+
+        Returns (canonical_key, heading_text) or None. canonical_key is one
+        of the values in SECTION_ALIASES, or 'other' for an unrecognised but
+        heading-shaped ALL-CAPS line (e.g. "REVISION HISTORY:") which still
+        terminates the previous section's body.
+        """
+        stripped = line.strip()
+        if not stripped:
+            return None
+
+        rest = stripped
+        m = _NUMBERING_RE.match(stripped)
+        if m:
+            rest = m.group(2).strip()
+
+        if not rest:
+            return None
+
+        rest_no_colon = rest[:-1].strip() if rest.endswith(':') else rest.strip()
+        if not rest_no_colon:
+            return None
+
+        key = rest_no_colon.lower()
+        if key in SECTION_ALIASES:
+            return SECTION_ALIASES[key], rest_no_colon
+
+        # Generic ALL-CAPS heading fallback (e.g. "REVISION HISTORY").
+        words = rest_no_colon.split()
+        has_alpha = any(c.isalpha() for c in rest_no_colon)
+        if has_alpha and 1 <= len(words) <= 6 and rest_no_colon == rest_no_colon.upper():
+            return "other", rest_no_colon
+
+        return None
+
+    def _find_sections(self, lines: List[str]) -> Tuple[Dict[str, Tuple[int, int]], List[int]]:
+        """
+        Scan all lines for section headings.
+
+        Returns:
+            sections: canonical_key -> (body_start_line_idx, body_end_line_idx)
+                      (first occurrence wins; body_end is exclusive)
+            heading_idxs: sorted list of every heading line index found
+                          (including unrecognised 'other' headings), used as
+                          hard stop boundaries elsewhere (e.g. wrapped
+                          warnings, fallback procedure scanning).
+        """
+        headings = []  # (line_idx, key)
+        for i, line in enumerate(lines):
+            match = self._match_heading(line)
+            if match:
+                key, _text = match
+                headings.append((i, key))
+
+        sections: Dict[str, Tuple[int, int]] = {}
+        for idx, (line_idx, key) in enumerate(headings):
+            body_start = line_idx + 1
+            body_end = headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
+            if key != "other" and key not in sections:
+                sections[key] = (body_start, body_end)
+
+        heading_idxs = [h[0] for h in headings]
+        return sections, heading_idxs
+
+    # ------------------------------------------------------------------
+    # Top-level structure extraction
+    # ------------------------------------------------------------------
+
     def _extract_structure(self, content: str, original_content: str = None) -> SOPContent:
         """
-        Extract structured information from text content
-        Uses pattern matching to identify common SOP sections
+        Extract structured information from text content.
+
+        Extraction is heading-driven: the document is split into sections by
+        recognised headings, and fields are pulled from the matching
+        section's body. A permissive regex-based fallback is used for
+        fields whose heading isn't found, so documents without recognisable
+        headings still get *something*.
         """
         sop = SOPContent()
         sop.raw_content = original_content or content
@@ -154,64 +291,277 @@ class SOPParser:
         if date_match:
             sop.effective_date = date_match.group(1)
 
-        # Extract purpose section
-        purpose_match = re.search(r'(?:purpose|objective)[:\s]+(.*?)(?:\n\n|\n[A-Z])', content, re.IGNORECASE | re.DOTALL)
-        if purpose_match:
-            sop.purpose = purpose_match.group(1).strip()
+        sections, heading_idxs = self._find_sections(lines)
 
-        # Extract scope section
-        scope_match = re.search(r'scope[:\s]+(.*?)(?:\n\n|\n[A-Z])', content, re.IGNORECASE | re.DOTALL)
-        if scope_match:
-            sop.scope = scope_match.group(1).strip()
+        # Purpose
+        if 'purpose' in sections:
+            sop.purpose = self._extract_section_text(lines, sections['purpose'])
+        else:
+            purpose_match = re.search(
+                r'(?:purpose|objective)[:\s]+(.*?)(?:\n\n|\n[A-Z]|\Z)', content, re.IGNORECASE | re.DOTALL
+            )
+            if purpose_match:
+                sop.purpose = _normalize_ws(purpose_match.group(1))
 
-        # Extract procedures (numbered steps)
-        procedures = self._extract_procedures(content)
-        sop.procedures = procedures
+        # Scope
+        if 'scope' in sections:
+            sop.scope = self._extract_section_text(lines, sections['scope'])
+        else:
+            scope_match = re.search(
+                r'scope[:\s]+(.*?)(?:\n\n|\n[A-Z]|\Z)', content, re.IGNORECASE | re.DOTALL
+            )
+            if scope_match:
+                sop.scope = _normalize_ws(scope_match.group(1))
 
-        # Extract safety warnings
-        safety_warnings = re.findall(r'(?:warning|caution|danger)[:\s]+(.*?)(?:\n|$)', content, re.IGNORECASE)
-        sop.safety_warnings = [w.strip() for w in safety_warnings]
+        # Responsibilities
+        if 'responsibilities' in sections:
+            sop.responsibilities = self._extract_responsibilities(lines, sections['responsibilities'])
 
-        # Extract definitions
-        definitions = self._extract_definitions(content)
-        sop.definitions = definitions
+        # Definitions
+        if 'definitions' in sections:
+            sop.definitions = self._extract_definitions(lines, sections['definitions'])
+        else:
+            sop.definitions = self._extract_definitions_fallback(content)
+
+        # Procedures: use the recognised PROCEDURE section body when present,
+        # otherwise fall back to scanning the whole document (still bounded
+        # by any recognised heading, so it won't run past e.g. REFERENCES:).
+        if 'procedure' in sections:
+            start, end = sections['procedure']
+            sop.procedures = self._extract_procedures(lines, start, end, heading_idxs)
+        else:
+            sop.procedures = self._extract_procedures(lines, 0, len(lines), heading_idxs)
+
+        # Safety warnings: found anywhere in the document, not just inside a
+        # SAFETY WARNINGS section.
+        sop.safety_warnings = self._extract_safety_warnings(lines, heading_idxs)
 
         return sop
 
-    def _extract_procedures(self, content: str) -> List[Dict[str, any]]:
-        """Extract numbered procedure steps"""
+    def _extract_section_text(self, lines: List[str], section_range: Tuple[int, int]) -> str:
+        start, end = section_range
+        body_lines = [l for l in lines[start:end] if l.strip()]
+        return _normalize_ws(" ".join(body_lines))
+
+    # ------------------------------------------------------------------
+    # Responsibilities
+    # ------------------------------------------------------------------
+
+    def _extract_responsibilities(self, lines: List[str], section_range: Tuple[int, int]) -> List[str]:
+        start, end = section_range
+        result = []
+        for i in range(start, end):
+            line = lines[i].strip()
+            if not line:
+                continue
+            line = _BULLET_RE.sub('', line).strip()
+            if line:
+                result.append(line)
+        return result
+
+    # ------------------------------------------------------------------
+    # Definitions
+    # ------------------------------------------------------------------
+
+    def _extract_definitions(self, lines: List[str], section_range: Tuple[int, int]) -> Dict[str, str]:
+        """
+        Extract term definitions from a DEFINITIONS section body.
+
+        Terms may contain parentheses, hyphens, slashes and digits (e.g.
+        "Emergency Shutdown (E-Stop)", "Lockout/Tagout (LOTO)"). Each
+        definition is expected on its own line as "Term: definition" (or
+        "Term - definition").
+        """
+        start, end = section_range
+        definitions: Dict[str, str] = {}
+        for i in range(start, end):
+            line = lines[i].strip()
+            if not line:
+                continue
+            term = definition = None
+            if ':' in line:
+                term, _, definition = line.partition(':')
+            elif ' - ' in line:
+                term, _, definition = line.partition(' - ')
+            if term is not None:
+                term = term.strip()
+                definition = definition.strip()
+                if term and definition:
+                    definitions[term] = definition
+        return definitions
+
+    def _extract_definitions_fallback(self, content: str) -> Dict[str, str]:
+        """Best-effort definitions extraction when no DEFINITIONS heading was found."""
+        definitions: Dict[str, str] = {}
+        def_section = re.search(
+            r'definitions?\s*:?\s*\n(.*?)(?:\n[A-Z][A-Za-z /]*:|\Z)', content, re.IGNORECASE | re.DOTALL
+        )
+        if not def_section:
+            return definitions
+
+        for line in def_section.group(1).split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            term = definition = None
+            if ':' in line:
+                term, _, definition = line.partition(':')
+            elif ' - ' in line:
+                term, _, definition = line.partition(' - ')
+            if term is not None:
+                term = term.strip()
+                definition = definition.strip()
+                if term and definition:
+                    definitions[term] = definition
+        return definitions
+
+    # ------------------------------------------------------------------
+    # Safety warnings
+    # ------------------------------------------------------------------
+
+    def _extract_safety_warnings(self, lines: List[str], heading_idxs: List[int]) -> List[str]:
+        """
+        Find WARNING:/CAUTION:/DANGER: markers anywhere in the document
+        (NOTE: is not a warning). A warning that wraps onto following lines
+        is captured whole, up to a blank line, the next marker, or a section
+        heading. Duplicates are removed while preserving first-seen order.
+        """
+        heading_set = set(heading_idxs)
+        warnings: List[str] = []
+        seen = set()
+        n = len(lines)
+        i = 0
+        while i < n:
+            match = _WARNING_MARKER_RE.match(lines[i])
+            if match:
+                text_parts = [match.group(2).strip()]
+                j = i + 1
+                while j < n:
+                    if not lines[j].strip():
+                        break
+                    if _STOP_MARKER_RE.match(lines[j]):
+                        break
+                    if j in heading_set:
+                        break
+                    text_parts.append(lines[j].strip())
+                    j += 1
+                full = _normalize_ws(" ".join(p for p in text_parts if p))
+                if full and full not in seen:
+                    seen.add(full)
+                    warnings.append(full)
+                i = j if j > i else i + 1
+            else:
+                i += 1
+        return warnings
+
+    # ------------------------------------------------------------------
+    # Procedures
+    # ------------------------------------------------------------------
+
+    def _match_step_heading(self, line: str) -> Optional[Tuple[str, str]]:
+        stripped = line.strip()
+        if not stripped:
+            return None
+
+        m = _STEP_WORD_RE.match(stripped)
+        if m:
+            return m.group(1), m.group(2).strip()
+
+        m = _STEP_DECIMAL_RE.match(stripped)
+        if m:
+            return m.group(1), m.group(2).strip()
+
+        m = _STEP_PLAIN_RE.match(stripped)
+        if m:
+            return m.group(1), m.group(2).strip()
+
+        return None
+
+    def _extract_substeps_and_body(self, body_lines: List[str]) -> Tuple[List[str], str]:
+        """
+        Split a step's body lines into (substeps, full_body_text).
+
+        Lettered sub-steps (a./b./c. or a)/b)/c)) are pulled out into
+        `substeps`, one entry per lettered item (continuation lines that
+        follow a sub-step marker, up to the next marker, are folded in).
+        `full_body_text` is the whole body -- narrative paragraph(s) plus
+        sub-step text with the letter markers stripped -- whitespace
+        normalised into a single line, per the parser's output contract.
+        """
+        substeps: List[str] = []
+        current: Optional[str] = None
+        full_parts: List[str] = []
+
+        for line in body_lines:
+            m = _SUBSTEP_RE.match(line)
+            if m:
+                if current is not None:
+                    substeps.append(_normalize_ws(current))
+                current = m.group(2)
+                full_parts.append(m.group(2))
+            else:
+                if current is not None and line.strip():
+                    current += " " + line.strip()
+                full_parts.append(line)
+
+        if current is not None:
+            substeps.append(_normalize_ws(current))
+
+        body_text = _normalize_ws(" ".join(full_parts))
+        return substeps, body_text
+
+    def _extract_procedures(
+        self, lines: List[str], start: int, end: int, heading_idxs: List[int]
+    ) -> List[Dict[str, any]]:
+        """
+        Extract procedure steps from lines[start:end].
+
+        Each step captures its full body -- narrative text and lettered
+        sub-steps -- up to the next step heading or the next section
+        heading (e.g. an ALL-CAPS heading line like "DOCUMENTATION:" or
+        "REFERENCES:"), across blank lines.
+        """
+        step_heads = []  # (line_idx, step_number, title)
+        for i in range(start, end):
+            match = self._match_step_heading(lines[i])
+            if match:
+                step_num, title = match
+                step_heads.append((i, step_num, title))
+
+        if not step_heads:
+            return []
+
+        boundary_set = {h[0] for h in step_heads}
+        boundary_set.update(idx for idx in heading_idxs if start <= idx < end)
+        boundary_set.add(end)
+        boundaries = sorted(boundary_set)
+
         procedures = []
+        for i, step_num, title in step_heads:
+            next_boundary = end
+            for b in boundaries:
+                if b > i:
+                    next_boundary = b
+                    break
 
-        # Match numbered steps like "1.", "1)", "Step 1:", etc.
-        step_pattern = r'(?:^|\n)(?:step\s+)?(\d+)[.):]\s+(.*?)(?=(?:\n(?:step\s+)?\d+[.):]|\n\n|$))'
-        matches = re.finditer(step_pattern, content, re.IGNORECASE | re.DOTALL | re.MULTILINE)
+            body_lines = lines[i + 1:next_boundary]
 
-        for match in matches:
-            step_num = match.group(1)
-            step_content = match.group(2).strip()
+            last_content_idx = i
+            for j in range(next_boundary - 1, i, -1):
+                if lines[j].strip():
+                    last_content_idx = j
+                    break
 
-            # Check for sub-steps
-            substeps = re.findall(r'[a-z][.)][\s]+(.+?)(?=\n[a-z][.):]|\n\n|$)', step_content, re.DOTALL)
+            substeps, body_text = self._extract_substeps_and_body(body_lines)
+            content = f"{title}\n{body_text}".strip() if title else body_text
 
             procedures.append({
                 "step_number": step_num,
-                "content": step_content,
-                "substeps": substeps if substeps else []
+                "title": title,
+                "body": body_text,
+                "content": content,
+                "substeps": substeps,
+                "source_lines": [i + 1, last_content_idx + 1],
             })
 
         return procedures
-
-    def _extract_definitions(self, content: str) -> Dict[str, str]:
-        """Extract term definitions"""
-        definitions = {}
-
-        # Look for definitions section
-        def_section = re.search(r'definitions?[:\s]+(.*?)(?:\n\n[A-Z]|\Z)', content, re.IGNORECASE | re.DOTALL)
-        if def_section:
-            def_text = def_section.group(1)
-            # Match patterns like "Term: definition" or "Term - definition"
-            def_matches = re.findall(r'([A-Za-z\s]+)[\s]*[:-][\s]*(.+?)(?=\n[A-Z]|\n\n|$)', def_text)
-            for term, definition in def_matches:
-                definitions[term.strip()] = definition.strip()
-
-        return definitions
