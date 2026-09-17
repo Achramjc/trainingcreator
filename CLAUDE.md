@@ -27,7 +27,10 @@ src/answer_key.py      salted-hash learner keys + the client-side verifier JS (P
                        normalisers must stay identical — change both or neither)
 src/scorm_exporter.py  two distinct CAM bindings (1.2 / 2004 4th Ed), one API wrapper that finds
                        API or API_1484_11 through frames, content pages, assessment.html, zip
-src/transparency_report.py  SME/auditor report (HTML + JSON): citation coverage, approval record
+src/transparency_report.py  SME/auditor report (HTML + JSON): citation coverage, approval record,
+                       audit trail with verification
+src/audit.py           append-only hash-chained audit.jsonl per job (optional HMAC via AUDIT_HMAC_KEY);
+                       verify_job checks the chain AND that the exported package is the approved content
 src/serialization.py   rebuild model objects from their to_dict() JSON (review round-trips)
 src/llm/               optional grounded LLM layer (config, provider, prompts, grounding, enhance);
                        off by default, fake provider in tests, never raises into the pipeline
@@ -55,6 +58,10 @@ app.py                 Flask API: upload → generate → job.json → signed do
 - **SCORM packages are schema-valid and run against a fake LMS on both API surfaces.**
   `tests/conformance/` (manifests against ADL's vendored XSDs; runtime in Chromium, SCO two frames
   below the API window). No real LMS has been tested — say so.
+- **Every job action is recorded before it counts.** `audit.jsonl` is append-only and hash-chained;
+  approval is appended before `approval.json` is written; the package `metadata.json` carries the
+  approval head hash. Verification fails on any altered entry and on export ≠ approved content.
+  `tests/test_audit.py`, `tests/test_audit_integration.py`.
 - **Don't claim what isn't tested.** README/USAGE_GUIDE/DEPLOYMENT describe only what exists.
 
 ## Working conventions
@@ -76,7 +83,7 @@ app.py                 Flask API: upload → generate → job.json → signed do
 | 2026-09-17 | **M1 — content an SME would sign (machinery)** | **built; pilot exit criterion open** | 615 tests; provenance on every field, 95% citation coverage on fixtures (only the 2 compliance questions uncited by design); Bloom's objectives; SME review/edit/approve with server-owned answer layout; approval in package + report; grounded LLM layer off by default, fails closed. The "<30% SME edits across 20 real SOPs from 3 pilots" exit needs real customers — not measurable here |
 | 2026-09-17 | **Pilot hardening** (owner's call: pilot M1 before M2) | **done** | 1264 tests. `/pilot` metrics with the edit-rate definition; six-regime gallery in the invariant sweep (worst naive strategy 62.5% across 8 documents); SCORM harness found the "2004" package was a 1.2 manifest with a 1.2 runtime, an API-discovery loop that hung inside frames, re-launch overwriting a pass, and no `LMSFinish` — all fixed and pinned by tests. Per-question evidence written as `cmi.interactions` in both bindings (no `correct_responses`). Still open: no real-LMS import |
 | — | M2 — real application (accounts, DB, workers, server-side scoring) | on hold | owner chose to pilot M1 first |
-| 2026-09-17 | **M3 (partial) — audit trail** (owner's call: before M2) | in progress | streams: hash-chained per-job `audit.jsonl` with optional HMAC and semantic verification (package matches approved content); app/CLI integration; audit section in the transparency report and review UI |
+| 2026-09-17 | **M3 (partial) — audit trail** (owner's call: before M2) | **done** | 1369 tests. Per-job hash-chained `audit.jsonl` (optional HMAC), 9-event lifecycle recorded from upload to download, approval recorded before it is written, package anchors the head hash, report/review page/pilot dashboard show verification. Independently verified: one altered character in an approver's name is caught at the right entry; export after an unapproved edit flags "package ≠ approved". Limits: no external anchor (trailing-entry removal undetectable without one), server clock, unauthenticated actors pre-M2, not a Part 11 claim |
 | — | M3 — rest (Part 11 e-signature, revision-delta retraining, validation pack) | not started | |
 | — | M4 — market | not started | |
 

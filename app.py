@@ -50,7 +50,9 @@ from src.assessments import (
 )
 from src.answer_key import document_key
 from src.scorm_exporter import SCORMExporter
-from src.transparency_report import generate_transparency_report, create_html_report, create_json_report
+from src.transparency_report import (
+    generate_transparency_report, create_html_report, create_json_report, audit_block_for_job,
+)
 from src.medical_device_config import MEDICAL_DEVICE_CONFIG
 from src.llm import LLMConfig, enhance_assessment, enhance_module, merge_reports
 from src.llm import build_provider as build_llm_provider
@@ -1005,9 +1007,14 @@ def _export_outputs(output_dir, package_name, sop_content, training_module, asse
     """
     output_dir = Path(output_dir)
 
+    # The report carries the trail as it stands at report generation; the
+    # package.exported event for this very export is appended by the caller
+    # afterwards, so the report's timeline is always one event behind the
+    # trail on disk. The package's metadata.json anchors the approval head.
+    audit = audit_block_for_job(output_dir, output_dir.name, app.config.get('AUDIT_HMAC_KEY'))
     transparency_report = generate_transparency_report(
         sop_content, training_module, assessment, source_filename,
-        approval=approval,
+        approval=approval, audit=audit,
     )
     create_html_report(transparency_report, str(output_dir / 'transparency_report.html'))
     create_json_report(transparency_report, str(output_dir / 'transparency_report.json'))

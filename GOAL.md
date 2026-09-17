@@ -147,6 +147,19 @@ key never travels through the learner's browser (an auditor sees what was answer
 was right, not the key); the remaining gaps are a real LMS import and server-verified scoring
 (M2) — see `docs/SCORM_CONFORMANCE.md`.
 
+**M3 partial — audit trail (2026-09-17).** Every job now has an append-only, hash-chained
+`audit.jsonl` (HMAC-signed when `AUDIT_HMAC_KEY` is set) recording creation, generation, review,
+each edit, approval, each export and each download, with a content hash at every content event.
+Approval is written to the trail *before* `approval.json` exists, so an approval can never
+complete unrecorded; the package's `metadata.json` carries the head hash at approval as an
+anchor. Verification checks the chain and MACs and, more importantly for an auditor, that the
+exported package is the content that was approved and that nothing was edited after approval
+without re-approval. The transparency report, the review page and the pilot dashboard surface the
+verification result. Honest limits, stated in `docs/AUDIT_TRAIL.md`: removal of whole trailing
+entries is undetectable without an external anchor (print or store the head hash elsewhere);
+timestamps trust the server clock; pre-approval actors are unauthenticated until M2; this is not
+a 21 CFR Part 11 claim — e-signature and identity are the remaining M3 work.
+
 Carried into M1/M2 from this pass: server-side scoring (the only real fix for the static-package
 limit); the SME JSON export legitimately contains the key and sits on disk for the retention
 window — it should move behind an ownership check; (the remaining three items in this list — internal exception text in
