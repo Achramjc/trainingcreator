@@ -70,7 +70,8 @@ app.py                 Flask API: upload → generate → job.json → signed do
 | 2026-09-16 | Goal defined | done | `GOAL.md` |
 | 2026-09-17 | **M0 — honest and correct** | **done** | 458 tests; naive worst 60% vs 70/80 pass; no key in package; both browser hash paths verified; CI on 3.10–3.12 |
 | 2026-09-17 | **M1 — content an SME would sign (machinery)** | **built; pilot exit criterion open** | 615 tests; provenance on every field, 95% citation coverage on fixtures (only the 2 compliance questions uncited by design); Bloom's objectives; SME review/edit/approve with server-owned answer layout; approval in package + report; grounded LLM layer off by default, fails closed. The "<30% SME edits across 20 real SOPs from 3 pilots" exit needs real customers — not measurable here |
-| — | M2 — real application (accounts, DB, workers, server-side scoring) | not started | |
+| 2026-09-17 | **Pilot hardening** (owner's call: pilot M1 before M2) | in progress | streams: pilot metrics (`edits_by_category`, edit rate, `/pilot`); six-regime sample-SOP gallery wired into the invariant sweep; SCORM 1.2/2004 conformance harness (manifest rules + fake-LMS runtime in Chromium) |
+| — | M2 — real application (accounts, DB, workers, server-side scoring) | on hold | owner chose to pilot M1 first |
 | — | M3 — compliance-grade (audit trail, Part 11, revision-delta retraining, validation pack) | not started | |
 | — | M4 — market | not started | |
 
