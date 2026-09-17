@@ -83,6 +83,15 @@ class SOPContent:
         self.definitions: Dict[str, str] = {}
         self.references: List[str] = []
         self.raw_content: str = ""
+        #: 1-indexed, inclusive [start, end] line spans into `self.lines` for
+        #: every extracted field that could be traced back to source text.
+        #: Keys are omitted when the corresponding field wasn't found.
+        #: See the module docstring / CLAUDE.md for the exact key set.
+        self.provenance: Dict[str, any] = {}
+        #: The exact line list `self.provenance` spans index into -- the text
+        #: *after* format conversion (e.g. markdown stripped to plain text),
+        #: which is NOT the same as `self.raw_content` for markdown input.
+        self.lines: List[str] = []
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization"""
@@ -98,7 +107,26 @@ class SOPContent:
             "definitions": self.definitions,
             "references": self.references,
             "raw_content": self.raw_content,
+            "provenance": self.provenance,
+            "lines": self.lines,
         }
+
+    def excerpt(self, span, context: int = 0) -> str:
+        """
+        Return the source text a provenance span points at.
+
+        `span` is a 1-indexed, inclusive [start, end] pair as stored in
+        `self.provenance` (or a procedure's `source_lines`). `context` adds
+        that many extra lines on either side (clamped to the document). Used
+        by the transparency report and the SME review UI to show the cited
+        text next to a generated claim.
+        """
+        if not span or len(span) != 2:
+            return ""
+        start, end = span
+        start_idx = max(0, (start - 1) - context)
+        end_idx = min(len(self.lines), end + context)
+        return "\n".join(self.lines[start_idx:end_idx])
 
 
 class SOPParser:
@@ -189,7 +217,7 @@ class SOPParser:
     # Heading / section detection
     # ------------------------------------------------------------------
 
-    def _match_heading(self, line: str) -> Optional[Tuple[str, str]]:
+    def _match_heading(self, line: str, strict: bool = False) -> Optional[Tuple[str, str]]:
         """
         Test whether `line` is a recognised section heading.
 
@@ -197,6 +225,13 @@ class SOPParser:
         of the values in SECTION_ALIASES, or 'other' for an unrecognised but
         heading-shaped ALL-CAPS line (e.g. "REVISION HISTORY:") which still
         terminates the previous section's body.
+
+        When `strict` is True, only a known SECTION_ALIASES entry (with or
+        without numbering/a trailing colon) counts as a heading -- the
+        generic ALL-CAPS fallback is skipped. This is used inside a
+        PROCEDURE section's body so a bare ALL-CAPS line that is really part
+        of a step (an acronym like "LOTO", a shouted instruction like
+        "PRESS THE E-STOP") is not mistaken for a new section.
         """
         stripped = line.strip()
         if not stripped:
@@ -218,6 +253,9 @@ class SOPParser:
         if key in SECTION_ALIASES:
             return SECTION_ALIASES[key], rest_no_colon
 
+        if strict:
+            return None
+
         # Generic ALL-CAPS heading fallback (e.g. "REVISION HISTORY").
         words = rest_no_colon.split()
         has_alpha = any(c.isalpha() for c in rest_no_colon)
@@ -226,7 +264,9 @@ class SOPParser:
 
         return None
 
-    def _find_sections(self, lines: List[str]) -> Tuple[Dict[str, Tuple[int, int]], List[int]]:
+    def _find_sections(
+        self, lines: List[str]
+    ) -> Tuple[Dict[str, Tuple[int, int]], List[int], List[int]]:
         """
         Scan all lines for section headings.
 
@@ -237,13 +277,21 @@ class SOPParser:
                           (including unrecognised 'other' headings), used as
                           hard stop boundaries elsewhere (e.g. wrapped
                           warnings, fallback procedure scanning).
+            strict_heading_idxs: sorted list of only the headings that match a
+                          known SECTION_ALIASES entry (never the generic
+                          ALL-CAPS fallback). Used to bound procedure step
+                          bodies, so a bare ALL-CAPS line inside a step does
+                          not end it.
         """
         headings = []  # (line_idx, key)
+        strict_heading_idxs = []
         for i, line in enumerate(lines):
             match = self._match_heading(line)
             if match:
                 key, _text = match
                 headings.append((i, key))
+            if self._match_heading(line, strict=True):
+                strict_heading_idxs.append(i)
 
         sections: Dict[str, Tuple[int, int]] = {}
         for idx, (line_idx, key) in enumerate(headings):
@@ -253,7 +301,7 @@ class SOPParser:
                 sections[key] = (body_start, body_end)
 
         heading_idxs = [h[0] for h in headings]
-        return sections, heading_idxs
+        return sections, heading_idxs, strict_heading_idxs
 
     # ------------------------------------------------------------------
     # Top-level structure extraction
@@ -273,70 +321,122 @@ class SOPParser:
         sop.raw_content = original_content or content
 
         lines = content.split('\n')
+        sop.lines = lines
 
         # Extract title (usually first non-empty line or line with "SOP" or "Procedure")
-        for line in lines[:10]:
-            line = line.strip()
+        for i, raw_line in enumerate(lines[:10]):
+            line = raw_line.strip()
             if line and (not sop.title or 'sop' in line.lower() or 'procedure' in line.lower()):
                 sop.title = line
+                sop.provenance['title'] = [i + 1, i + 1]
                 break
 
         # Extract version
         version_match = re.search(r'version[:\s]+([0-9.]+)', content, re.IGNORECASE)
         if version_match:
             sop.version = version_match.group(1)
+            sop.provenance['version'] = self._offset_span(content, version_match.start(), version_match.end())
 
         # Extract effective date
         date_match = re.search(r'effective\s+date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})', content, re.IGNORECASE)
         if date_match:
             sop.effective_date = date_match.group(1)
+            sop.provenance['effective_date'] = self._offset_span(content, date_match.start(), date_match.end())
 
-        sections, heading_idxs = self._find_sections(lines)
+        sections, heading_idxs, strict_heading_idxs = self._find_sections(lines)
 
         # Purpose
         if 'purpose' in sections:
             sop.purpose = self._extract_section_text(lines, sections['purpose'])
+            span = self._nonempty_span(lines, *sections['purpose'])
+            if span:
+                sop.provenance['purpose'] = span
         else:
             purpose_match = re.search(
                 r'(?:purpose|objective)[:\s]+(.*?)(?:\n\n|\n[A-Z]|\Z)', content, re.IGNORECASE | re.DOTALL
             )
             if purpose_match:
                 sop.purpose = _normalize_ws(purpose_match.group(1))
+                if purpose_match.group(1).strip():
+                    sop.provenance['purpose'] = self._offset_span(
+                        content, purpose_match.start(1), purpose_match.end(1)
+                    )
 
         # Scope
         if 'scope' in sections:
             sop.scope = self._extract_section_text(lines, sections['scope'])
+            span = self._nonempty_span(lines, *sections['scope'])
+            if span:
+                sop.provenance['scope'] = span
         else:
             scope_match = re.search(
                 r'scope[:\s]+(.*?)(?:\n\n|\n[A-Z]|\Z)', content, re.IGNORECASE | re.DOTALL
             )
             if scope_match:
                 sop.scope = _normalize_ws(scope_match.group(1))
+                if scope_match.group(1).strip():
+                    sop.provenance['scope'] = self._offset_span(
+                        content, scope_match.start(1), scope_match.end(1)
+                    )
 
         # Responsibilities
         if 'responsibilities' in sections:
-            sop.responsibilities = self._extract_responsibilities(lines, sections['responsibilities'])
+            sop.responsibilities, resp_spans = self._extract_responsibilities(lines, sections['responsibilities'])
+            if resp_spans:
+                sop.provenance['responsibilities'] = resp_spans
 
         # Definitions
         if 'definitions' in sections:
-            sop.definitions = self._extract_definitions(lines, sections['definitions'])
+            sop.definitions, def_spans = self._extract_definitions(lines, sections['definitions'])
         else:
-            sop.definitions = self._extract_definitions_fallback(content)
+            sop.definitions, def_spans = self._extract_definitions_fallback(content)
+        if def_spans:
+            sop.provenance['definitions'] = def_spans
 
         # Procedures: use the recognised PROCEDURE section body when present,
         # otherwise fall back to scanning the whole document (still bounded
         # by any recognised heading, so it won't run past e.g. REFERENCES:).
+        # Only *strict* (known-alias) headings terminate a step's body here --
+        # a bare ALL-CAPS line inside a step (an acronym, a shouted
+        # instruction) is not a real section boundary.
         if 'procedure' in sections:
             start, end = sections['procedure']
-            sop.procedures = self._extract_procedures(lines, start, end, heading_idxs)
+            sop.procedures = self._extract_procedures(lines, start, end, strict_heading_idxs)
         else:
-            sop.procedures = self._extract_procedures(lines, 0, len(lines), heading_idxs)
+            sop.procedures = self._extract_procedures(lines, 0, len(lines), strict_heading_idxs)
 
         # Safety warnings: found anywhere in the document, not just inside a
         # SAFETY WARNINGS section.
-        sop.safety_warnings = self._extract_safety_warnings(lines, heading_idxs)
+        sop.safety_warnings, warning_spans = self._extract_safety_warnings(lines, heading_idxs)
+        if warning_spans:
+            sop.provenance['safety_warnings'] = warning_spans
 
         return sop
+
+    # ------------------------------------------------------------------
+    # Provenance helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _offset_to_line(content: str, offset: int) -> int:
+        """0-indexed line number containing `offset`, consistent with content.split('\\n')."""
+        return content.count('\n', 0, offset)
+
+    def _offset_span(self, content: str, start: int, end: int) -> List[int]:
+        """1-indexed inclusive [s, e] line span covering content[start:end]."""
+        start_line = self._offset_to_line(content, start)
+        # `end` may point just past the matched text; back it off by one so a
+        # match ending exactly at a newline doesn't spill onto the next line.
+        end_line = self._offset_to_line(content, max(start, end - 1))
+        return [start_line + 1, end_line + 1]
+
+    @staticmethod
+    def _nonempty_span(lines: List[str], start: int, end: int) -> Optional[List[int]]:
+        """1-indexed inclusive [s, e] span of the first/last non-blank line in lines[start:end], or None."""
+        idxs = [i for i in range(start, end) if lines[i].strip()]
+        if not idxs:
+            return None
+        return [idxs[0] + 1, idxs[-1] + 1]
 
     def _extract_section_text(self, lines: List[str], section_range: Tuple[int, int]) -> str:
         start, end = section_range
@@ -347,9 +447,12 @@ class SOPParser:
     # Responsibilities
     # ------------------------------------------------------------------
 
-    def _extract_responsibilities(self, lines: List[str], section_range: Tuple[int, int]) -> List[str]:
+    def _extract_responsibilities(
+        self, lines: List[str], section_range: Tuple[int, int]
+    ) -> Tuple[List[str], List[List[int]]]:
         start, end = section_range
         result = []
+        spans = []
         for i in range(start, end):
             line = lines[i].strip()
             if not line:
@@ -357,13 +460,16 @@ class SOPParser:
             line = _BULLET_RE.sub('', line).strip()
             if line:
                 result.append(line)
-        return result
+                spans.append([i + 1, i + 1])
+        return result, spans
 
     # ------------------------------------------------------------------
     # Definitions
     # ------------------------------------------------------------------
 
-    def _extract_definitions(self, lines: List[str], section_range: Tuple[int, int]) -> Dict[str, str]:
+    def _extract_definitions(
+        self, lines: List[str], section_range: Tuple[int, int]
+    ) -> Tuple[Dict[str, str], Dict[str, List[int]]]:
         """
         Extract term definitions from a DEFINITIONS section body.
 
@@ -374,6 +480,7 @@ class SOPParser:
         """
         start, end = section_range
         definitions: Dict[str, str] = {}
+        spans: Dict[str, List[int]] = {}
         for i in range(start, end):
             line = lines[i].strip()
             if not line:
@@ -388,18 +495,21 @@ class SOPParser:
                 definition = definition.strip()
                 if term and definition:
                     definitions[term] = definition
-        return definitions
+                    spans[term] = [i + 1, i + 1]
+        return definitions, spans
 
-    def _extract_definitions_fallback(self, content: str) -> Dict[str, str]:
+    def _extract_definitions_fallback(self, content: str) -> Tuple[Dict[str, str], Dict[str, List[int]]]:
         """Best-effort definitions extraction when no DEFINITIONS heading was found."""
         definitions: Dict[str, str] = {}
+        spans: Dict[str, List[int]] = {}
         def_section = re.search(
             r'definitions?\s*:?\s*\n(.*?)(?:\n[A-Z][A-Za-z /]*:|\Z)', content, re.IGNORECASE | re.DOTALL
         )
         if not def_section:
-            return definitions
+            return definitions, spans
 
-        for line in def_section.group(1).split('\n'):
+        group_start_line = self._offset_to_line(content, def_section.start(1))
+        for offset, line in enumerate(def_section.group(1).split('\n')):
             line = line.strip()
             if not line:
                 continue
@@ -413,13 +523,17 @@ class SOPParser:
                 definition = definition.strip()
                 if term and definition:
                     definitions[term] = definition
-        return definitions
+                    line_no = group_start_line + offset + 1
+                    spans[term] = [line_no, line_no]
+        return definitions, spans
 
     # ------------------------------------------------------------------
     # Safety warnings
     # ------------------------------------------------------------------
 
-    def _extract_safety_warnings(self, lines: List[str], heading_idxs: List[int]) -> List[str]:
+    def _extract_safety_warnings(
+        self, lines: List[str], heading_idxs: List[int]
+    ) -> Tuple[List[str], List[List[int]]]:
         """
         Find WARNING:/CAUTION:/DANGER: markers anywhere in the document
         (NOTE: is not a warning). A warning that wraps onto following lines
@@ -428,6 +542,7 @@ class SOPParser:
         """
         heading_set = set(heading_idxs)
         warnings: List[str] = []
+        spans: List[List[int]] = []
         seen = set()
         n = len(lines)
         i = 0
@@ -435,6 +550,7 @@ class SOPParser:
             match = _WARNING_MARKER_RE.match(lines[i])
             if match:
                 text_parts = [match.group(2).strip()]
+                last_idx = i
                 j = i + 1
                 while j < n:
                     if not lines[j].strip():
@@ -444,15 +560,17 @@ class SOPParser:
                     if j in heading_set:
                         break
                     text_parts.append(lines[j].strip())
+                    last_idx = j
                     j += 1
                 full = _normalize_ws(" ".join(p for p in text_parts if p))
                 if full and full not in seen:
                     seen.add(full)
                     warnings.append(full)
+                    spans.append([i + 1, last_idx + 1])
                 i = j if j > i else i + 1
             else:
                 i += 1
-        return warnings
+        return warnings, spans
 
     # ------------------------------------------------------------------
     # Procedures

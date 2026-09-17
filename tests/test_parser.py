@@ -231,6 +231,136 @@ class TestNumberedConventionFixture:
 # Markdown input still works
 # ---------------------------------------------------------------------------
 
+class TestProvenance:
+    """Every extracted field carries a source-line span, and every span
+    resolves to text that actually contains what it claims to."""
+
+    def _assert_valid_span(self, sop, span):
+        s, e = span
+        assert 1 <= s <= e <= len(sop.lines)
+
+    def test_lines_is_the_converted_text(self, sample_sop):
+        with open(SAMPLE_SOP, encoding="utf-8") as f:
+            raw_lines = f.read().split("\n")
+        assert sample_sop.lines == raw_lines
+
+    def test_all_scalar_spans_valid_sample(self, sample_sop):
+        for key in ("title", "version", "effective_date", "purpose", "scope"):
+            assert key in sample_sop.provenance, key
+            self._assert_valid_span(sample_sop, sample_sop.provenance[key])
+
+    def test_all_scalar_spans_valid_numbered(self, numbered_sop):
+        for key in ("title", "version", "effective_date", "purpose", "scope"):
+            assert key in numbered_sop.provenance, key
+            self._assert_valid_span(numbered_sop, numbered_sop.provenance[key])
+
+    def test_purpose_excerpt_contains_expected_text(self, sample_sop):
+        span = sample_sop.provenance["purpose"]
+        assert "establishes the proper protocol" in sample_sop.excerpt(span)
+
+    def test_control_panel_definition_excerpt(self, sample_sop):
+        span = sample_sop.provenance["definitions"]["Control Panel"]
+        assert "Station 5" in sample_sop.excerpt(span)
+
+    def test_every_definition_span_valid_and_matches(self, sample_sop):
+        for term, span in sample_sop.provenance["definitions"].items():
+            self._assert_valid_span(sample_sop, span)
+            assert term in sample_sop.excerpt(span)
+
+    def test_every_definition_span_valid_numbered(self, numbered_sop):
+        for term, span in numbered_sop.provenance["definitions"].items():
+            self._assert_valid_span(numbered_sop, span)
+            assert term in numbered_sop.excerpt(span)
+
+    def test_every_responsibility_span_valid(self, sample_sop):
+        spans = sample_sop.provenance["responsibilities"]
+        assert len(spans) == len(sample_sop.responsibilities)
+        for span, text in zip(spans, sample_sop.responsibilities):
+            self._assert_valid_span(sample_sop, span)
+            # first few words of the responsibility line should appear in the excerpt
+            first_words = " ".join(text.split()[:3])
+            assert first_words in sample_sop.excerpt(span)
+
+    def test_every_warning_span_valid_and_matches_first_words(self, sample_sop):
+        spans = sample_sop.provenance["safety_warnings"]
+        assert len(spans) == len(sample_sop.safety_warnings)
+        for span, warning in zip(spans, sample_sop.safety_warnings):
+            self._assert_valid_span(sample_sop, span)
+            first_five = " ".join(warning.split()[:5])
+            assert first_five in sample_sop.excerpt(span)
+
+    def test_every_warning_span_valid_numbered(self, numbered_sop):
+        spans = numbered_sop.provenance["safety_warnings"]
+        assert len(spans) == len(numbered_sop.safety_warnings)
+        for span, warning in zip(spans, numbered_sop.safety_warnings):
+            self._assert_valid_span(numbered_sop, span)
+            first_five = " ".join(warning.split()[:5])
+            assert first_five in numbered_sop.excerpt(span)
+
+    def test_excerpt_with_context(self, sample_sop):
+        span = sample_sop.provenance["purpose"]
+        no_context = sample_sop.excerpt(span)
+        with_context = sample_sop.excerpt(span, context=1)
+        assert len(with_context) >= len(no_context)
+
+    def test_excerpt_empty_span(self, sample_sop):
+        assert sample_sop.excerpt(None) == ""
+        assert sample_sop.excerpt([]) == ""
+
+    def test_procedure_source_lines_still_valid(self, sample_sop):
+        for proc in sample_sop.procedures:
+            self._assert_valid_span(sample_sop, proc["source_lines"])
+
+    def test_to_dict_includes_provenance_and_lines(self, sample_sop):
+        d = sample_sop.to_dict()
+        assert d["provenance"] == sample_sop.provenance
+        assert d["lines"] == sample_sop.lines
+
+
+# ---------------------------------------------------------------------------
+# Regression: a bare ALL-CAPS line inside a step body must not be mistaken
+# for a section heading (e.g. an acronym like "LOTO" or a shouted
+# instruction like "PRESS THE E-STOP").
+# ---------------------------------------------------------------------------
+
+class TestAllCapsInsideStepBody:
+    def test_all_caps_acronym_line_stays_in_step_body(self):
+        content = (
+            "PROCEDURE:\n\n"
+            "Step 1: Perform Lockout\n"
+            "Apply LOTO before servicing the press.\n"
+            "PRESS THE E-STOP if anything moves unexpectedly.\n"
+            "Continue with the lockout checklist.\n\n"
+            "Step 2: Verify Zero Energy\n"
+            "Confirm the gauge reads zero.\n"
+        )
+        sop = SOPParser()._extract_structure(content)
+        assert len(sop.procedures) == 2
+
+        step1 = sop.procedures[0]
+        assert "Apply LOTO before servicing the press." in step1["body"]
+        assert "PRESS THE E-STOP if anything moves unexpectedly." in step1["body"]
+        assert "Continue with the lockout checklist." in step1["body"]
+
+        step2 = sop.procedures[1]
+        assert step2["body"].strip() == "Confirm the gauge reads zero."
+
+    def test_all_caps_still_ends_section_outside_procedure(self):
+        # A generic ALL-CAPS heading OUTSIDE a procedure body (e.g. closing
+        # out a document with an unrecognised heading) still behaves as a
+        # section boundary.
+        content = (
+            "PURPOSE:\n"
+            "Do the thing.\n\n"
+            "RANDOM NOTES\n"
+            "This should not be part of the purpose.\n"
+        )
+        sop = SOPParser()._extract_structure(content)
+        assert "Do the thing." in sop.purpose
+        assert "RANDOM NOTES" not in sop.purpose
+        assert "should not be part" not in sop.purpose
+
+
 class TestMarkdownParsing:
     def test_markdown_headings(self, tmp_path):
         md_content = (

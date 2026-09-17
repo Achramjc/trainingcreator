@@ -13,6 +13,13 @@ class TrainingModule:
     def __init__(self):
         self.title: str = ""
         self.learning_objectives: List[str] = []
+        #: Structured, Bloom's-aligned objectives. Each entry is
+        #: {"text": str, "bloom_level": str, "verb": str,
+        #:  "source_ref": {"kind": str, "span": [s, e],
+        #:                 "step_number": str|None, "term": str|None}}.
+        #: `learning_objectives` above is kept in sync as
+        #: [o["text"] for o in objectives] for backward compatibility.
+        self.objectives: List[Dict] = []
         self.sections: List[Dict] = []
         self.estimated_duration: int = 0  # in minutes
         self.prerequisites: List[str] = []
@@ -23,6 +30,7 @@ class TrainingModule:
         return {
             "title": self.title,
             "learning_objectives": self.learning_objectives,
+            "objectives": self.objectives,
             "sections": self.sections,
             "estimated_duration": self.estimated_duration,
             "prerequisites": self.prerequisites,
@@ -51,8 +59,11 @@ class TrainingGenerator:
         # Set basic information
         module.title = sop_content.title or "Training Module"
 
-        # Generate learning objectives
-        module.learning_objectives = self._generate_learning_objectives(sop_content)
+        # Generate Bloom's-aligned learning objectives, each traceable back
+        # to a source-line span. `learning_objectives` is kept as the flat
+        # list of texts for backward compatibility.
+        module.objectives = self._generate_objectives(sop_content)
+        module.learning_objectives = [o["text"] for o in module.objectives]
 
         # Create training sections
         module.sections = self._create_sections(sop_content)
@@ -73,47 +84,199 @@ class TrainingGenerator:
         truncated = text[:max_len].rsplit(' ', 1)[0]
         return truncated or text[:max_len]
 
-    def _generate_learning_objectives(self, sop_content: SOPContent) -> List[str]:
-        """Generate learning objectives based on SOP content"""
-        objectives = []
-        safety_objective = "Identify and understand all safety warnings and precautions"
+    #: Bloom's level and verb used for each kind of source material. No LLM
+    #: involved -- purely deterministic templates over parsed, cited content.
+    _BLOOM = {
+        "definition": ("Remember", "Define"),
+        "purpose": ("Understand", "Explain"),
+        "scope": ("Analyze", "Determine"),
+        "safety": ("Evaluate", "Identify"),
+        "step": ("Apply", "Perform"),
+    }
 
-        # Add objective based on purpose
-        if sop_content.purpose:
-            objectives.append(
-                f"Understand the purpose and importance of this procedure: "
-                f"{self._truncate_at_word(sop_content.purpose, 100)}"
+    MAX_OBJECTIVES = 8
+    STEP_GROUPING_THRESHOLD = 6  # more than this many steps triggers grouping
+
+    def _step_label(self, proc: Dict, max_len: int = 60) -> str:
+        title = (proc.get('title') or '').strip()
+        if title:
+            return title
+        body = proc.get('body') or proc.get('content', '')
+        return self._truncate_at_word(body, max_len)
+
+    def _single_step_objective(self, proc: Dict) -> Dict:
+        bloom_level, verb = self._BLOOM["step"]
+        number = proc.get('step_number')
+        title = self._step_label(proc)
+        return {
+            "text": f"{verb} Step {number}: {title}",
+            "bloom_level": bloom_level,
+            "verb": verb,
+            "source_ref": {
+                "kind": "step",
+                "span": proc["source_lines"],
+                "step_number": str(number) if number is not None else None,
+                "term": None,
+            },
+        }
+
+    def _grouped_step_objectives(self, steps: List[Dict], n_groups: int) -> List[Dict]:
+        """Split `steps` into `n_groups` contiguous, near-equal chunks and
+        return one Apply objective per chunk (a chunk of size 1 is rendered
+        exactly like a single-step objective, not as a degenerate range)."""
+        n = len(steps)
+        n_groups = max(1, min(n_groups, n))
+        base, remainder = divmod(n, n_groups)
+
+        bloom_level, verb = self._BLOOM["step"]
+        result = []
+        idx = 0
+        for i in range(n_groups):
+            size = base + (1 if i < remainder else 0)
+            if size <= 0:
+                continue
+            chunk = steps[idx:idx + size]
+            idx += size
+
+            if len(chunk) == 1:
+                result.append(self._single_step_objective(chunk[0]))
+                continue
+
+            first, last = chunk[0], chunk[-1]
+            first_num, last_num = first.get('step_number'), last.get('step_number')
+            span = [first["source_lines"][0], last["source_lines"][1]]
+            text = (
+                f"{verb} Steps {first_num}–{last_num}: "
+                f"{self._step_label(first, 40)} … {self._step_label(last, 40)}"
             )
+            result.append({
+                "text": text,
+                "bloom_level": bloom_level,
+                "verb": verb,
+                "source_ref": {
+                    "kind": "step",
+                    "span": span,
+                    "step_number": f"{first_num}–{last_num}",
+                    "term": None,
+                },
+            })
+        return result
 
-        # Add an objective for each procedure step, phrased as an objective
-        # rather than a truncated slice of the source text.
-        for i, proc in enumerate(sop_content.procedures, 1):
-            step_number = proc.get('step_number', i)
-            title = (proc.get('title') or '').strip()
-            if title:
-                objectives.append(f"Perform Step {step_number}: {title}")
+    def _cap_objectives(self, objectives: List[Dict]) -> List[Dict]:
+        """Last-resort cap at MAX_OBJECTIVES, always keeping a safety
+        objective if one was generated (grouping already keeps this from
+        triggering in the common case)."""
+        if len(objectives) <= self.MAX_OBJECTIVES:
+            return objectives
+        safety = next((o for o in objectives if o["source_ref"]["kind"] == "safety"), None)
+        others = [o for o in objectives if o is not safety]
+        budget = self.MAX_OBJECTIVES - (1 if safety else 0)
+        kept = others[:budget]
+        if safety:
+            kept.append(safety)
+        return kept
+
+    def _generate_objectives(self, sop_content: SOPContent) -> List[Dict]:
+        """Generate Bloom's-aligned learning objectives, each carrying a
+        `source_ref` that resolves to a valid span in `sop_content.lines`."""
+        objectives: List[Dict] = []
+        provenance = sop_content.provenance or {}
+
+        # Definitions -> Remember
+        bloom_level, verb = self._BLOOM["definition"]
+        for term in sop_content.definitions:
+            span = (provenance.get("definitions") or {}).get(term)
+            if not span:
+                continue
+            objectives.append({
+                "text": f"{verb} {term}",
+                "bloom_level": bloom_level,
+                "verb": verb,
+                "source_ref": {"kind": "definition", "span": span, "step_number": None, "term": term},
+            })
+
+        # Purpose -> Understand
+        purpose_span = provenance.get("purpose")
+        if sop_content.purpose and purpose_span:
+            bloom_level, verb = self._BLOOM["purpose"]
+            objectives.append({
+                "text": f"{verb} why this procedure exists: "
+                        f"{self._truncate_at_word(sop_content.purpose, 100)}",
+                "bloom_level": bloom_level,
+                "verb": verb,
+                "source_ref": {"kind": "purpose", "span": purpose_span, "step_number": None, "term": None},
+            })
+
+        # Scope -> Analyze
+        scope_span = provenance.get("scope")
+        if sop_content.scope and scope_span:
+            bloom_level, verb = self._BLOOM["scope"]
+            objectives.append({
+                "text": f"{verb} when this procedure applies and when it does not",
+                "bloom_level": bloom_level,
+                "verb": verb,
+                "source_ref": {"kind": "scope", "span": scope_span, "step_number": None, "term": None},
+            })
+
+        # Safety -> Evaluate (one objective covering every warning)
+        warning_spans = provenance.get("safety_warnings") or []
+        if sop_content.safety_warnings and warning_spans:
+            bloom_level, verb = self._BLOOM["safety"]
+            safety_span = [min(s[0] for s in warning_spans), max(s[1] for s in warning_spans)]
+            objectives.append({
+                "text": f"{verb} each hazard in this procedure and the precaution it requires",
+                "bloom_level": bloom_level,
+                "verb": verb,
+                "source_ref": {"kind": "safety", "span": safety_span, "step_number": None, "term": None},
+            })
+
+        # Steps -> Apply (one per step, grouped when there are more than
+        # STEP_GROUPING_THRESHOLD steps or when the 8-objective cap would
+        # otherwise be exceeded).
+        steps = [p for p in sop_content.procedures if p.get("source_lines")]
+        if steps:
+            non_step_count = len(objectives)
+            budget = max(1, self.MAX_OBJECTIVES - non_step_count)
+            if len(steps) > self.STEP_GROUPING_THRESHOLD or len(steps) > budget:
+                n_groups = max(1, min(budget, self.STEP_GROUPING_THRESHOLD, len(steps)))
+                objectives.extend(self._grouped_step_objectives(steps, n_groups))
             else:
-                body = proc.get('body') or proc.get('content', '')
-                objectives.append(f"Perform Step {step_number}: {self._truncate_at_word(body, 60)}")
+                objectives.extend(self._single_step_objective(p) for p in steps)
 
-        # Add safety objective if warnings exist
-        if sop_content.safety_warnings:
-            objectives.append(safety_objective)
+        return self._cap_objectives(objectives)
 
-        # Add scope-based objective
-        if sop_content.scope:
-            objectives.append(f"Recognize when this procedure applies: {self._truncate_at_word(sop_content.scope, 100)}")
+    @staticmethod
+    def _span_ref(kind: str, span, step_number: str = None, term: str = None) -> Dict:
+        return {"kind": kind, "span": span, "step_number": step_number, "term": term}
 
-        # Cap at 8 objectives, but always keep the safety objective if one exists.
-        max_objectives = 8
-        if len(objectives) > max_objectives:
-            has_safety = safety_objective in objectives
-            trimmed = objectives[:max_objectives]
-            if has_safety and safety_objective not in trimmed:
-                trimmed[-1] = safety_objective
-            objectives = trimmed
+    def _intro_citations(self, sop_content: SOPContent) -> List[Dict]:
+        provenance = sop_content.provenance or {}
+        citations = []
+        for kind in ("title", "version", "effective_date", "purpose", "scope"):
+            span = provenance.get(kind)
+            if span:
+                citations.append(self._span_ref(kind, span))
+        for span in provenance.get("responsibilities") or []:
+            citations.append(self._span_ref("responsibilities", span))
+        return citations
 
-        return objectives
+    def _safety_citations(self, sop_content: SOPContent) -> List[Dict]:
+        return [self._span_ref("safety", span) for span in (sop_content.provenance or {}).get("safety_warnings") or []]
+
+    def _definitions_citations(self, sop_content: SOPContent) -> List[Dict]:
+        spans = (sop_content.provenance or {}).get("definitions") or {}
+        return [self._span_ref("definition", span, term=term) for term, span in spans.items()]
+
+    def _procedures_citations(self, sop_content: SOPContent) -> List[Dict]:
+        return [
+            self._span_ref("step", proc["source_lines"], step_number=str(proc.get("step_number")))
+            for proc in sop_content.procedures
+            if proc.get("source_lines")
+        ]
+
+    def _summary_citations(self, sop_content: SOPContent) -> List[Dict]:
+        span = (sop_content.provenance or {}).get("purpose")
+        return [self._span_ref("purpose", span)] if span else []
 
     def _create_sections(self, sop_content: SOPContent) -> List[Dict]:
         """Create structured training sections"""
@@ -125,7 +288,8 @@ class TrainingGenerator:
             "title": "Introduction",
             "type": "content",
             "content": self._create_introduction(sop_content),
-            "order": 1
+            "order": 1,
+            "citations": self._intro_citations(sop_content),
         }
         sections.append(intro_section)
 
@@ -137,7 +301,8 @@ class TrainingGenerator:
                 "type": "content",
                 "content": self._create_safety_section(sop_content),
                 "order": 2,
-                "critical": True
+                "critical": True,
+                "citations": self._safety_citations(sop_content),
             }
             sections.append(safety_section)
 
@@ -148,7 +313,8 @@ class TrainingGenerator:
                 "title": "Key Terms and Definitions",
                 "type": "content",
                 "content": self._create_definitions_section(sop_content),
-                "order": 3
+                "order": 3,
+                "citations": self._definitions_citations(sop_content),
             }
             sections.append(definitions_section)
 
@@ -158,7 +324,8 @@ class TrainingGenerator:
             "title": "Procedure Steps",
             "type": "content",
             "content": self._create_procedures_section(sop_content),
-            "order": 4
+            "order": 4,
+            "citations": self._procedures_citations(sop_content),
         }
         sections.append(procedures_section)
 
@@ -168,7 +335,8 @@ class TrainingGenerator:
             "title": "Summary and Key Points",
             "type": "content",
             "content": self._create_summary_section(sop_content),
-            "order": 5
+            "order": 5,
+            "citations": self._summary_citations(sop_content),
         }
         sections.append(summary_section)
 
