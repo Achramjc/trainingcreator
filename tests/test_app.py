@@ -11,6 +11,9 @@ processing).
 import io
 import time
 
+import json
+from pathlib import Path
+
 import app as app_module
 
 
@@ -190,3 +193,70 @@ def test_is_safe_path_component_helper():
     assert not app_module._is_safe_path_component("a/b")
     assert not app_module._is_safe_path_component("a\\b")
     assert not app_module._is_safe_path_component("")
+
+
+# ---------------------------------------------------------------------------
+# Optional LLM enhancement wiring (docs/LLM.md) - never touches the network
+# ---------------------------------------------------------------------------
+def _upload_sample(client, sample_sop_path):
+    import io as _io
+    with open(sample_sop_path, 'rb') as f:
+        data = {
+            'num_questions': '6', 'passing_score': '80',
+            'scorm_version': '1.2', 'output_format': 'scorm',
+            'file': (_io.BytesIO(f.read()), 'sample_sop.txt'),
+        }
+        return client.post('/api/upload', data=data, content_type='multipart/form-data')
+
+
+def test_llm_enhancement_is_off_by_default(client, sample_sop_path, monkeypatch):
+    monkeypatch.delenv('TRAINING_CREATOR_LLM', raising=False)
+    resp = _upload_sample(client, sample_sop_path)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    payload = resp.get_json()
+    assert payload['metadata']['llm_enhancement'] == {
+        'enabled': False, 'model': None, 'accepted': 0, 'rejected': 0}
+    job_dir = Path(app_module.app.config['OUTPUT_FOLDER']) / payload['job_id']
+    assert not (job_dir / 'enhancement_report.json').exists()
+
+
+def test_llm_enhancement_runs_with_injected_provider_and_fails_closed(
+        client, sample_sop_path, monkeypatch):
+    """With the layer enabled and a provider that returns nothing usable, the
+    pipeline completes with deterministic content, writes the per-item report,
+    and reports zero accepted items - no crash, no silent enhancement."""
+    from src.llm import FakeProvider
+
+    created = []
+
+    def fake_factory(config):
+        provider = FakeProvider([])  # every call -> explicit 'exhausted' error
+        created.append(provider)
+        return provider
+
+    monkeypatch.setenv('TRAINING_CREATOR_LLM', 'anthropic')
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'test-key-never-used')
+    monkeypatch.setattr(app_module, 'build_llm_provider', fake_factory)
+
+    resp = _upload_sample(client, sample_sop_path)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    payload = resp.get_json()
+    summary = payload['metadata']['llm_enhancement']
+    assert summary['enabled'] is True and summary['accepted'] == 0
+    assert len(created) == 1, 'provider must be built once and shared'
+    assert created[0].calls, 'the enhancement layer must have been invoked'
+
+    job_dir = Path(app_module.app.config['OUTPUT_FOLDER']) / payload['job_id']
+    report = json.loads((job_dir / 'enhancement_report.json').read_text(encoding='utf-8'))
+    assert report['enabled'] is True and report['accepted_count'] == 0
+    assert 'test-key-never-used' not in json.dumps(report)
+
+    job = json.loads((job_dir / 'job.json').read_text(encoding='utf-8'))
+    assert job['llm_enhancement']['enabled'] is True
+    # Deterministic content still present and the learner package still clean.
+    assert job['training_module']['learning_objectives']
+    zip_resp = client.get(payload['download_url'])
+    assert zip_resp.status_code == 200
+    import zipfile as _zipfile, io as _io2
+    html = _zipfile.ZipFile(_io2.BytesIO(zip_resp.data)).read('assessment.html').decode('utf-8')
+    assert 'correct_answer' not in html

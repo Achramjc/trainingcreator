@@ -26,9 +26,13 @@ src/assessments.py     AssessmentGenerator / MedicalDeviceAssessmentGenerator �
 src/answer_key.py      salted-hash learner keys + the client-side verifier JS (Python and JS
                        normalisers must stay identical — change both or neither)
 src/scorm_exporter.py  manifest + content pages + assessment.html (learner payload only) + zip
-src/transparency_report.py  SME/auditor report (HTML + JSON)
+src/transparency_report.py  SME/auditor report (HTML + JSON): citation coverage, approval record
+src/serialization.py   rebuild model objects from their to_dict() JSON (review round-trips)
+src/llm/               optional grounded LLM layer (config, provider, prompts, grounding, enhance);
+                       off by default, fake provider in tests, never raises into the pipeline
 src/medical_device_config.py required compliance questions, integrity disclosure
-app.py                 Flask API (upload → process → signed download); src/cli.py the CLI
+app.py                 Flask API: upload → generate → job.json → signed download / review
+                       (GET /review, POST /api/review, POST /api/approve); src/cli.py the CLI
 ```
 
 ## Non-negotiable invariants (each has a test — keep it that way)
@@ -42,6 +46,11 @@ app.py                 Flask API (upload → process → signed download); src/c
   `random.Random(seed)` instances only; never the `random` module functions.
 - **Document text is untrusted.** `html.escape` everything from the SOP before it enters HTML.
 - **Parser dict contracts are append-only.** Add keys; never rename or remove.
+- **SME edits cannot bypass invariant 1.** `POST /api/review` re-runs the answer-position layout
+  and rejects content a naive strategy would still pass. `tests/test_review.py`.
+- **Every generated sentence cites source lines.** Objectives, sections and questions carry
+  `source_ref`; the transparency report measures coverage. LLM output that fails grounding is
+  dropped in favour of the deterministic original. `tests/test_transparency.py`, `tests/test_llm.py`.
 - **Don't claim what isn't tested.** README/USAGE_GUIDE/DEPLOYMENT describe only what exists.
 
 ## Working conventions
@@ -60,7 +69,7 @@ app.py                 Flask API (upload → process → signed download); src/c
 |---|---|---|---|
 | 2026-09-16 | Goal defined | done | `GOAL.md` |
 | 2026-09-17 | **M0 — honest and correct** | **done** | 458 tests; naive worst 60% vs 70/80 pass; no key in package; both browser hash paths verified; CI on 3.10–3.12 |
-| 2026-09-17 | **M1 — content an SME would sign** | in progress | streams: provenance + Bloom's objectives; grounded LLM layer (optional, `ANTHROPIC_API_KEY`); SME review/approval workflow in the web app |
+| 2026-09-17 | **M1 — content an SME would sign (machinery)** | **built; pilot exit criterion open** | 615 tests; provenance on every field, 95% citation coverage on fixtures (only the 2 compliance questions uncited by design); Bloom's objectives; SME review/edit/approve with server-owned answer layout; approval in package + report; grounded LLM layer off by default, fails closed. The "<30% SME edits across 20 real SOPs from 3 pilots" exit needs real customers — not measurable here |
 | — | M2 — real application (accounts, DB, workers, server-side scoring) | not started | |
 | — | M3 — compliance-grade (audit trail, Part 11, revision-delta retraining, validation pack) | not started | |
 | — | M4 — market | not started | |

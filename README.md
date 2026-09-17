@@ -84,6 +84,25 @@ exporter = SCORMExporter()
 exporter.create_package(training_module, assessments, 'output_folder')
 ```
 
+## SME review and approval
+
+Nothing should reach learners unreviewed. After generation the web app returns a signed
+`review_url`: a page showing the source document (with line numbers) beside the generated
+objectives, sections and questions, all editable. Saving an edit re-validates it and re-runs the
+answer-position layout so an edited assessment keeps the same "a naive learner fails" guarantee as
+a generated one. Approving records who approved, in what role, when, and how many edits were
+made; the package's `metadata.json`, its pages (the DRAFT watermark becomes an approval banner)
+and the transparency report all carry that record. See USAGE_GUIDE.md.
+
+## Optional grounded LLM layer (off by default)
+
+`TRAINING_CREATOR_LLM=anthropic` (plus `ANTHROPIC_API_KEY` and `pip install -r
+requirements-llm.txt`) enables Claude-assisted objectives, section summaries and distractors.
+Every generated sentence must cite source lines and pass a grounding check (invented numbers,
+added actions and low-overlap text are rejected and the deterministic content is kept); every
+accepted and rejected item is written to `enhancement_report.json`. The check is a filter, not a
+proof — SME approval stays mandatory. Details and limits: `docs/LLM.md`.
+
 ## Output Formats
 
 - **SCORM 1.2**: Maximum compatibility with older LMS platforms

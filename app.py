@@ -43,6 +43,8 @@ from src.answer_key import document_key
 from src.scorm_exporter import SCORMExporter
 from src.transparency_report import generate_transparency_report, create_html_report, create_json_report
 from src.medical_device_config import MEDICAL_DEVICE_CONFIG
+from src.llm import LLMConfig, enhance_assessment, enhance_module, merge_reports
+from src.llm import build_provider as build_llm_provider
 from src.serialization import sop_from_dict, module_from_dict, assessment_from_dict
 
 app = Flask(__name__)
@@ -617,9 +619,40 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
             passing_score=passing_score
         )
 
+        # Step 3b: Optional grounded LLM enhancement. Off unless
+        # TRAINING_CREATOR_LLM=anthropic (see docs/LLM.md). The provider is
+        # built once so the calls share the cached document prefix; the
+        # enhance functions never raise and return the inputs unchanged when
+        # disabled or on any provider failure, with the reason in the report.
+        llm_config = LLMConfig.from_env()
+        enhancement_report = None
+        if llm_config.enabled:
+            provider = build_llm_provider(llm_config)
+            training_module, module_report = enhance_module(
+                training_module, sop_content, provider, llm_config)
+            assessment, assessment_report = enhance_assessment(
+                assessment, sop_content, provider, llm_config)
+            enhancement_report = merge_reports(
+                job_id, [module_report, assessment_report], llm_config)
+            app.logger.info(
+                f"[job_id={job_id}] LLM enhancement: "
+                f"{enhancement_report.accepted_count} accepted, "
+                f"{enhancement_report.rejected_count} rejected")
+        llm_summary = {
+            'enabled': bool(llm_config.enabled),
+            'model': llm_config.model if llm_config.enabled else None,
+            'accepted': enhancement_report.accepted_count if enhancement_report else 0,
+            'rejected': enhancement_report.rejected_count if enhancement_report else 0,
+        }
+
         # Create output directory for this job
         output_dir = Path(app.config['OUTPUT_FOLDER']) / job_id
         output_dir.mkdir(parents=True, exist_ok=True)
+        if enhancement_report is not None:
+            # Full per-item record (accepted and rejected, with reasons) for
+            # the SME; the job record and API response carry only the summary.
+            _atomic_write_json(output_dir / 'enhancement_report.json',
+                               enhancement_report.to_dict())
 
         package_name = secure_filename(sop_content.title.replace(' ', '_')[:50])
         source_filename = Path(file_path).name
@@ -647,6 +680,7 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
             'assessment': assessment.to_dict(),
             'edits_count': 0,
             'approval': None,
+            'llm_enhancement': llm_summary,
         }
         _atomic_write_json(_job_json_path(job_id), job_record)
 
@@ -675,6 +709,7 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
                 'passing_score': passing_score,
                 'estimated_duration': training_module.estimated_duration,
                 'learning_objectives': len(training_module.learning_objectives),
+                'llm_enhancement': llm_summary,
                 'medical_device_mode': True,
                 'compliance_questions_included': True,
                 'draft_watermarks_added': True

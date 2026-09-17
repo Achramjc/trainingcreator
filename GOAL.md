@@ -117,6 +117,19 @@ Verified on the merged tree, not by assertion:
 - **Minimum assessment length is now 5.** A three-question quiz with one double-weighted item
   cannot be made ungameable by layout; the generator, API and CLI refuse rather than pretend.
 
+**M1 (2026-09-17) — the machinery is built; the exit criterion is open.** Every extracted field
+carries a source span; objectives are Bloom's-aligned and cited; sections and questions cite their
+source; the transparency report measures citation coverage (95% on the fixtures — only the two
+regulatory compliance questions are uncited, by design). The web app has the SME loop: source
+beside generated content, inline edits with strict validation, server-owned answer layout so an
+edit cannot reintroduce a gameable quiz, and a named approval recorded in the package, its pages,
+and the report. The optional Claude layer (off by default) rewrites objectives, summarises
+sections and proposes distractors, and a lexical grounding check rejects invented numbers, added
+actions and low-overlap text — a filter, not a proof; `docs/LLM.md` lists what it cannot catch.
+What is *not* done: the exit criterion ("SMEs accept with <30% edits across 20 real SOPs from 3
+pilot customers") requires real customers and real SOPs. The `edits_count` the approval records
+is the instrument for measuring it.
+
 Carried into M1/M2 from this pass: server-side scoring (the only real fix for the static-package
 limit); the SME JSON export legitimately contains the key and sits on disk for the retention
 window — it should move behind an ownership check; internal exception text still reaches API
