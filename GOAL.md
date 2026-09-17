@@ -149,9 +149,9 @@ was right, not the key); the remaining gaps are a real LMS import and server-ver
 
 Carried into M1/M2 from this pass: server-side scoring (the only real fix for the static-package
 limit); the SME JSON export legitimately contains the key and sits on disk for the retention
-window — it should move behind an ownership check; internal exception text still reaches API
-error responses; a bare ALL-CAPS line inside a step body is mistaken for a section heading;
-three-level numbering (`4.1.1`) falls through to the integer pattern. `source_lines` and
+window — it should move behind an ownership check; (the remaining three items in this list — internal exception text in
+API responses, ALL-CAPS lines inside step bodies, three-level numbering — were closed in the
+pilot-hardening pass). `source_lines` and
 `source_ref` on every step and question are the groundwork for M1's citation coverage metric.
 
 ## Milestones

@@ -276,3 +276,24 @@ def test_generate_route_copies_the_sample_rather_than_pointing_at_it(samples_cli
     upload_root = Path(app.config["UPLOAD_FOLDER"])
     leftovers = list(upload_root.rglob(original.name))
     assert not leftovers, f"sample copy not cleaned up: {leftovers}"
+
+
+def test_generate_route_internal_error_hides_exception_text(client, monkeypatch):
+    """The sample route must not leak internal exception text (same rule as
+    /api/upload); the client gets a generic message with the job id only."""
+    import uuid as _uuid
+    import app as app_module
+    from src.parser import SOPParser
+
+    fixed = _uuid.UUID('12345678-1234-5678-1234-567812345678')
+    monkeypatch.setattr(app_module.uuid, 'uuid4', lambda: fixed)
+    monkeypatch.setattr(SOPParser, 'parse',
+                        lambda self, path: (_ for _ in ()).throw(RuntimeError('secret internal detail')))
+    sample_id = CATALOG[0]['id']
+    resp = client.post(f'/api/samples/{sample_id}/generate',
+                       data={'num_questions': '6', 'passing_score': '80',
+                             'scorm_version': '1.2', 'output_format': 'scorm'})
+    assert resp.status_code == 500
+    body = resp.get_data(as_text=True)
+    assert 'secret internal detail' not in body
+    assert str(fixed) in body

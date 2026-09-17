@@ -76,7 +76,9 @@ def generate_sample_route(sample_id):
         ALLOWED_OUTPUT_FORMATS,
         ALLOWED_SCORM_VERSIONS,
         MIN_ASSESSMENT_QUESTIONS,
+        RequestValidationError,
         _cleanup_upload,
+        _internal_error_response,
         app as flask_app,
         process_training,
     )
@@ -134,10 +136,12 @@ def generate_sample_route(sample_id):
         )
         flask_app.logger.info(f"[job_id={job_id}] Processing complete")
         return jsonify(result), 200
-    except ValueError as e:
+    except RequestValidationError as e:
+        # Raised by the app's own validation: written for the caller.
         return jsonify({"error": str(e)}), 400
     except Exception as e:  # noqa: BLE001 - mirrors /api/upload's error handling
-        flask_app.logger.error(f"Error generating from sample {sample_id}: {str(e)}")
-        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+        # Anything else is logged in full server-side; the client gets a
+        # generic message plus the job id, never the exception text.
+        return _internal_error_response(job_id, e)
     finally:
         _cleanup_upload(upload_path)
