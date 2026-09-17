@@ -95,7 +95,15 @@ class TrainingGenerator:
     }
 
     MAX_OBJECTIVES = 8
-    STEP_GROUPING_THRESHOLD = 6  # more than this many steps triggers grouping
+
+    @staticmethod
+    def _format_term_list(terms: List[str]) -> str:
+        """"A, B and C" -- no Oxford comma, matching SME-reviewed phrasing."""
+        if len(terms) == 1:
+            return terms[0]
+        if len(terms) == 2:
+            return f"{terms[0]} and {terms[1]}"
+        return ", ".join(terms[:-1]) + f" and {terms[-1]}"
 
     def _step_label(self, proc: Dict, max_len: int = 60) -> str:
         title = (proc.get('title') or '').strip()
@@ -163,86 +171,132 @@ class TrainingGenerator:
         return result
 
     def _cap_objectives(self, objectives: List[Dict]) -> List[Dict]:
-        """Last-resort cap at MAX_OBJECTIVES, always keeping a safety
-        objective if one was generated (grouping already keeps this from
-        triggering in the common case)."""
+        """Last-resort cap at MAX_OBJECTIVES, preserving order and always
+        keeping a safety objective if one was generated. The budgeting in
+        `_generate_objectives` keeps this from triggering in practice --
+        this only guards pathological inputs (e.g. very many definitions on
+        a document with almost no procedure)."""
         if len(objectives) <= self.MAX_OBJECTIVES:
             return objectives
         safety = next((o for o in objectives if o["source_ref"]["kind"] == "safety"), None)
-        others = [o for o in objectives if o is not safety]
-        budget = self.MAX_OBJECTIVES - (1 if safety else 0)
-        kept = others[:budget]
-        if safety:
-            kept.append(safety)
+        kept = objectives[: self.MAX_OBJECTIVES]
+        if safety and safety not in kept:
+            kept = objectives[: self.MAX_OBJECTIVES - 1] + [safety]
         return kept
+
+    def _purpose_objective(self, sop_content: SOPContent, provenance: Dict) -> Dict:
+        purpose_span = provenance.get("purpose")
+        if not (sop_content.purpose and purpose_span):
+            return None
+        bloom_level, verb = self._BLOOM["purpose"]
+        return {
+            "text": f"{verb} why this procedure exists: "
+                    f"{self._truncate_at_word(sop_content.purpose, 100)}",
+            "bloom_level": bloom_level,
+            "verb": verb,
+            "source_ref": {"kind": "purpose", "span": purpose_span, "step_number": None, "term": None},
+        }
+
+    def _scope_objective(self, sop_content: SOPContent, provenance: Dict) -> Dict:
+        scope_span = provenance.get("scope")
+        if not (sop_content.scope and scope_span):
+            return None
+        bloom_level, verb = self._BLOOM["scope"]
+        return {
+            "text": f"{verb} when this procedure applies and when it does not",
+            "bloom_level": bloom_level,
+            "verb": verb,
+            "source_ref": {"kind": "scope", "span": scope_span, "step_number": None, "term": None},
+        }
+
+    def _safety_objective(self, sop_content: SOPContent, provenance: Dict) -> Dict:
+        warning_spans = provenance.get("safety_warnings") or []
+        if not (sop_content.safety_warnings and warning_spans):
+            return None
+        bloom_level, verb = self._BLOOM["safety"]
+        safety_span = [min(s[0] for s in warning_spans), max(s[1] for s in warning_spans)]
+        return {
+            "text": f"{verb} each hazard in this procedure and the precaution it requires",
+            "bloom_level": bloom_level,
+            "verb": verb,
+            "source_ref": {"kind": "safety", "span": safety_span, "step_number": None, "term": None},
+        }
+
+    def _definition_objectives(self, sop_content: SOPContent, provenance: Dict) -> List[Dict]:
+        """Remember-level objective(s) for definitions.
+
+        Definitions are the least valuable objective type for an SME
+        reviewer -- with more than two terms they are collapsed into a
+        single combined objective so they don't crowd out step coverage;
+        with one or two terms the per-term form is kept.
+        """
+        bloom_level, verb = self._BLOOM["definition"]
+        def_spans = provenance.get("definitions") or {}
+        terms = [t for t in sop_content.definitions if t in def_spans]
+        if not terms:
+            return []
+
+        if len(terms) <= 2:
+            return [
+                {
+                    "text": f"{verb} {term}",
+                    "bloom_level": bloom_level,
+                    "verb": verb,
+                    "source_ref": {"kind": "definition", "span": def_spans[term], "step_number": None, "term": term},
+                }
+                for term in terms
+            ]
+
+        spans = [def_spans[t] for t in terms]
+        combined_span = [min(s[0] for s in spans), max(s[1] for s in spans)]
+        return [{
+            "text": f"{verb} the key terms used in this procedure: {self._format_term_list(terms)}",
+            "bloom_level": bloom_level,
+            "verb": verb,
+            "source_ref": {"kind": "definitions", "span": combined_span, "step_number": None, "term": None},
+        }]
+
+    def _step_objectives(self, steps: List[Dict], budget: int) -> List[Dict]:
+        """Apply-level objectives for the procedure, filling up to `budget`
+        slots: one objective per step when they fit, otherwise contiguous
+        near-equal groups -- never fewer than 2 step objectives when there
+        are at least 2 steps."""
+        if not steps:
+            return []
+        if len(steps) <= budget:
+            return [self._single_step_objective(p) for p in steps]
+
+        n_groups = max(1, min(budget, len(steps)))
+        if len(steps) >= 2:
+            n_groups = max(2, n_groups)
+        return self._grouped_step_objectives(steps, n_groups)
 
     def _generate_objectives(self, sop_content: SOPContent) -> List[Dict]:
         """Generate Bloom's-aligned learning objectives, each carrying a
-        `source_ref` that resolves to a valid span in `sop_content.lines`."""
-        objectives: List[Dict] = []
+        `source_ref` that resolves to a valid span in `sop_content.lines`.
+
+        Presentation order (and priority for the 8-objective budget) puts
+        the substance of the training first: purpose (Understand), scope
+        (Analyze), safety (Evaluate), the procedure steps (Apply), and
+        definitions (Remember) last -- steps get whatever budget remains
+        after the other categories, since they are what an SME actually
+        cares about an operator being able to do.
+        """
         provenance = sop_content.provenance or {}
 
-        # Definitions -> Remember
-        bloom_level, verb = self._BLOOM["definition"]
-        for term in sop_content.definitions:
-            span = (provenance.get("definitions") or {}).get(term)
-            if not span:
-                continue
-            objectives.append({
-                "text": f"{verb} {term}",
-                "bloom_level": bloom_level,
-                "verb": verb,
-                "source_ref": {"kind": "definition", "span": span, "step_number": None, "term": term},
-            })
+        purpose_obj = self._purpose_objective(sop_content, provenance)
+        scope_obj = self._scope_objective(sop_content, provenance)
+        safety_obj = self._safety_objective(sop_content, provenance)
+        lead_objectives = [o for o in (purpose_obj, scope_obj, safety_obj) if o]
 
-        # Purpose -> Understand
-        purpose_span = provenance.get("purpose")
-        if sop_content.purpose and purpose_span:
-            bloom_level, verb = self._BLOOM["purpose"]
-            objectives.append({
-                "text": f"{verb} why this procedure exists: "
-                        f"{self._truncate_at_word(sop_content.purpose, 100)}",
-                "bloom_level": bloom_level,
-                "verb": verb,
-                "source_ref": {"kind": "purpose", "span": purpose_span, "step_number": None, "term": None},
-            })
+        definition_objs = self._definition_objectives(sop_content, provenance)
 
-        # Scope -> Analyze
-        scope_span = provenance.get("scope")
-        if sop_content.scope and scope_span:
-            bloom_level, verb = self._BLOOM["scope"]
-            objectives.append({
-                "text": f"{verb} when this procedure applies and when it does not",
-                "bloom_level": bloom_level,
-                "verb": verb,
-                "source_ref": {"kind": "scope", "span": scope_span, "step_number": None, "term": None},
-            })
-
-        # Safety -> Evaluate (one objective covering every warning)
-        warning_spans = provenance.get("safety_warnings") or []
-        if sop_content.safety_warnings and warning_spans:
-            bloom_level, verb = self._BLOOM["safety"]
-            safety_span = [min(s[0] for s in warning_spans), max(s[1] for s in warning_spans)]
-            objectives.append({
-                "text": f"{verb} each hazard in this procedure and the precaution it requires",
-                "bloom_level": bloom_level,
-                "verb": verb,
-                "source_ref": {"kind": "safety", "span": safety_span, "step_number": None, "term": None},
-            })
-
-        # Steps -> Apply (one per step, grouped when there are more than
-        # STEP_GROUPING_THRESHOLD steps or when the 8-objective cap would
-        # otherwise be exceeded).
         steps = [p for p in sop_content.procedures if p.get("source_lines")]
-        if steps:
-            non_step_count = len(objectives)
-            budget = max(1, self.MAX_OBJECTIVES - non_step_count)
-            if len(steps) > self.STEP_GROUPING_THRESHOLD or len(steps) > budget:
-                n_groups = max(1, min(budget, self.STEP_GROUPING_THRESHOLD, len(steps)))
-                objectives.extend(self._grouped_step_objectives(steps, n_groups))
-            else:
-                objectives.extend(self._single_step_objective(p) for p in steps)
+        non_step_count = len(lead_objectives) + len(definition_objs)
+        budget = max(1, self.MAX_OBJECTIVES - non_step_count)
+        step_objs = self._step_objectives(steps, budget)
 
+        objectives = lead_objectives + step_objs + definition_objs
         return self._cap_objectives(objectives)
 
     @staticmethod

@@ -78,18 +78,36 @@ class TestBloomObjectives:
     def test_no_objective_exceeds_eight_total(self, training_module):
         assert len(training_module.objectives) <= 8
 
-    def test_definitions_map_to_remember(self, sample_sop, training_module):
-        def_objs = [o for o in training_module.objectives if o["source_ref"]["kind"] == "definition"]
-        assert def_objs  # sample has definitions
+    def test_definitions_collapse_to_one_combined_objective_past_two_terms(self, sample_sop, training_module):
+        # sample_sop.txt has 4 definitions -- combined into a single
+        # Remember objective so they don't crowd out step coverage.
+        assert len(sample_sop.definitions) > 2
+        def_objs = [o for o in training_module.objectives if o["source_ref"]["kind"] == "definitions"]
+        assert len(def_objs) == 1
+        obj = def_objs[0]
+        assert obj["bloom_level"] == "Remember"
+        assert obj["text"] == (
+            "Define the key terms used in this procedure: "
+            "Emergency Shutdown (E-Stop), Control Panel, Line Supervisor and Lockout/Tagout (LOTO)"
+        )
+        assert obj["source_ref"]["term"] is None
+        # no per-term "definition" (singular-kind) objectives remain
+        assert not any(o["source_ref"]["kind"] == "definition" for o in training_module.objectives)
+
+    def test_definitions_stay_per_term_at_two_or_fewer(self, numbered_sop, numbered_training_module):
+        # sample_sop_numbered.txt has exactly 2 definitions -- kept per-term.
+        assert len(numbered_sop.definitions) == 2
+        def_objs = [o for o in numbered_training_module.objectives if o["source_ref"]["kind"] == "definition"]
+        assert len(def_objs) == 2
         for obj in def_objs:
             assert obj["bloom_level"] == "Remember"
             assert obj["text"].startswith("Define ")
-            assert obj["source_ref"]["term"] in sample_sop.definitions
+            assert obj["source_ref"]["term"] in numbered_sop.definitions
+        assert not any(o["source_ref"]["kind"] == "definitions" for o in numbered_training_module.objectives)
 
     def test_purpose_maps_to_understand(self, training_module):
         purpose_objs = [o for o in training_module.objectives if o["source_ref"]["kind"] == "purpose"]
-        # purpose objective may be squeezed out by the 8-cap on the busy sample
-        # fixture, so only assert its shape when present.
+        assert purpose_objs
         for obj in purpose_objs:
             assert obj["bloom_level"] == "Understand"
 
@@ -98,23 +116,81 @@ class TestBloomObjectives:
         assert safety_objs
         assert safety_objs[0]["bloom_level"] == "Evaluate"
 
-    def test_steps_map_to_apply_and_get_grouped_past_six(self, sample_sop, training_module):
-        # sample_sop.txt has 9 steps, well past the grouping threshold, and
-        # 4 definitions + purpose + scope + safety already crowd the 8-cap,
-        # so the 9 steps must collapse into a single grouped objective.
+    def test_steps_get_remaining_budget_and_are_grouped_to_fill_it(self, sample_sop, training_module):
+        # sample_sop.txt: purpose + scope + safety (3) + one combined
+        # definitions objective (1) = 4 non-step objectives, leaving a
+        # budget of 4 slots for 9 steps -> 4 contiguous groups.
         step_objs = [o for o in training_module.objectives if o["source_ref"]["kind"] == "step"]
-        assert step_objs
+        assert len(step_objs) == 4
         for obj in step_objs:
             assert obj["bloom_level"] == "Apply"
-        assert any("–" in o["source_ref"]["step_number"] for o in step_objs)
+            assert "–" in obj["source_ref"]["step_number"]
+        # groups are contiguous and cover every step exactly once, in order
+        assert step_objs[0]["source_ref"]["step_number"] == "1–3"
+        assert step_objs[1]["source_ref"]["step_number"] == "4–5"
+        assert step_objs[2]["source_ref"]["step_number"] == "6–7"
+        assert step_objs[3]["source_ref"]["step_number"] == "8–9"
 
     def test_small_step_count_not_grouped(self, numbered_sop, numbered_training_module):
-        # sample_sop_numbered.txt has only 3 steps: no grouping needed.
+        # sample_sop_numbered.txt has only 3 steps and plenty of budget: no grouping needed.
         step_objs = [o for o in numbered_training_module.objectives
                      if o["source_ref"]["kind"] == "step"]
         assert len(step_objs) == len(numbered_sop.procedures)
         for obj, proc in zip(step_objs, numbered_sop.procedures):
             assert obj["source_ref"]["step_number"] == str(proc["step_number"])
+
+    def test_presentation_order_purpose_scope_safety_steps_definitions(self, training_module):
+        kinds = [o["source_ref"]["kind"] for o in training_module.objectives]
+        assert kinds == ["purpose", "scope", "safety", "step", "step", "step", "step", "definitions"]
+
+    def test_exact_objective_set_for_sample_sop(self, training_module):
+        assert training_module.learning_objectives == [
+            "Explain why this procedure exists: This Standard Operating Procedure (SOP) "
+            "establishes the proper protocol for performing an emergency",
+            "Determine when this procedure applies and when it does not",
+            "Identify each hazard in this procedure and the precaution it requires",
+            "Perform Steps 1–3: Identify Emergency Situation … Notify Supervision",
+            "Perform Steps 4–5: Secure the Area … Document the Incident",
+            "Perform Steps 6–7: Equipment Inspection … Safety Review",
+            "Perform Steps 8–9: Restart Authorization … Controlled Restart",
+            "Define the key terms used in this procedure: Emergency Shutdown (E-Stop), "
+            "Control Panel, Line Supervisor and Lockout/Tagout (LOTO)",
+        ]
+
+    def test_exact_objective_set_for_numbered_sop(self, numbered_training_module):
+        assert numbered_training_module.learning_objectives == [
+            "Explain why this procedure exists: This procedure defines the steps required "
+            "to calibrate the widget press prior to each production",
+            "Determine when this procedure applies and when it does not",
+            "Identify each hazard in this procedure and the precaution it requires",
+            "Perform Step 4.1: Power Down the Press",
+            "Perform Step 4.2: Attach Calibration Target",
+            "Perform Step 4.3: Record Baseline Reading",
+            "Define Calibration Target (CT)",
+            "Define Press Operator",
+        ]
+
+    def test_never_fewer_than_two_step_objectives_when_grouped(self):
+        # A document with a very busy set of non-step objectives (many
+        # definitions collapse to 1, plus purpose/scope/safety = 4 total)
+        # and a long procedure must still keep at least 2 step objectives.
+        content = (
+            "PURPOSE:\nDo the thing.\n\n"
+            "SCOPE:\nApplies everywhere.\n\n"
+            "DEFINITIONS:\n"
+            "Term One: First definition text here.\n"
+            "Term Two: Second definition text here.\n"
+            "Term Three: Third definition text here.\n\n"
+            "SAFETY WARNINGS:\nWARNING: Watch out for the thing.\n\n"
+            "PROCEDURE:\n\n"
+        )
+        for i in range(1, 13):
+            content += f"Step {i}: Do Thing {i}\nBody text for step {i}.\n\n"
+
+        sop = SOPParser()._extract_structure(content)
+        module = TrainingGenerator().generate(sop)
+        step_objs = [o for o in module.objectives if o["source_ref"]["kind"] == "step"]
+        assert len(step_objs) >= 2
 
 
 class TestSectionCitations:
