@@ -76,7 +76,8 @@ app.py                 Flask API: upload → generate → job.json → signed do
 | 2026-09-17 | **M1 — content an SME would sign (machinery)** | **built; pilot exit criterion open** | 615 tests; provenance on every field, 95% citation coverage on fixtures (only the 2 compliance questions uncited by design); Bloom's objectives; SME review/edit/approve with server-owned answer layout; approval in package + report; grounded LLM layer off by default, fails closed. The "<30% SME edits across 20 real SOPs from 3 pilots" exit needs real customers — not measurable here |
 | 2026-09-17 | **Pilot hardening** (owner's call: pilot M1 before M2) | **done** | 1264 tests. `/pilot` metrics with the edit-rate definition; six-regime gallery in the invariant sweep (worst naive strategy 62.5% across 8 documents); SCORM harness found the "2004" package was a 1.2 manifest with a 1.2 runtime, an API-discovery loop that hung inside frames, re-launch overwriting a pass, and no `LMSFinish` — all fixed and pinned by tests. Per-question evidence written as `cmi.interactions` in both bindings (no `correct_responses`). Still open: no real-LMS import |
 | — | M2 — real application (accounts, DB, workers, server-side scoring) | on hold | owner chose to pilot M1 first |
-| — | M3 — compliance-grade (audit trail, Part 11, revision-delta retraining, validation pack) | not started | |
+| 2026-09-17 | **M3 (partial) — audit trail** (owner's call: before M2) | in progress | streams: hash-chained per-job `audit.jsonl` with optional HMAC and semantic verification (package matches approved content); app/CLI integration; audit section in the transparency report and review UI |
+| — | M3 — rest (Part 11 e-signature, revision-delta retraining, validation pack) | not started | |
 | — | M4 — market | not started | |
 
 Update this table when a milestone changes state; put the measured evidence, not the intent.
