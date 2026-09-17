@@ -640,3 +640,48 @@ class TestAuditTrailHTML:
         content = path.read_text(encoding="utf-8")
         assert "<script>alert(1)</script>" not in content
         assert "&lt;script&gt;alert(1)&lt;/script&gt;" in content
+
+
+# ---------------------------------------------------------------------------
+# Input-document scan (prompt-injection pre-scan; see docs/SECURITY.md).
+# The adversarial cases live in tests/test_injection.py; what belongs here is
+# that a clean document says so, that the block is part of the report's shape,
+# and that a document *title* can no longer put live markup into the page.
+# ---------------------------------------------------------------------------
+class TestInputDocumentScan:
+
+    def test_clean_document_reports_no_indicators(self, sop, training, assessment,
+                                                  sample_sop_path):
+        report = _report(sop, training, assessment, sample_sop_path)
+        scan = report["input_document_scan"]
+        assert scan["risk"] == "none"
+        assert scan["findings"] == []
+        assert scan["gated_llm_enhancement"] is False
+        assert "lexical scan" in scan["statement"]
+        assert json.dumps(report)
+
+    def test_html_renders_the_block(self, tmp_path, sop, training, assessment,
+                                   sample_sop_path):
+        report = _report(sop, training, assessment, sample_sop_path)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert "Input Document Scan" in content
+        assert "LLM enhancement gated by this scan:\n        <strong>no</strong>" \
+            in content or "gated by this scan" in content
+
+    def test_a_document_title_cannot_inject_markup_into_the_report(
+            self, tmp_path, sop, training, assessment, sample_sop_path):
+        """The Source Document Analysis block dumps parsed fields into a <pre>.
+
+        json.dumps escapes quotes, not angle brackets, so before this was fixed a
+        document *titled* `<script>...` put live markup into an auditor's report.
+        """
+        hostile = copy.deepcopy(sop)
+        hostile.title = "<script>alert('sop')</script> Emergency Shutdown"
+        report = _report(hostile, training, assessment, sample_sop_path)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert "<script>alert('sop')</script>" not in content
+        assert "&lt;script&gt;alert(&#x27;sop&#x27;)&lt;/script&gt;" in content

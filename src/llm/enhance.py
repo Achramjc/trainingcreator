@@ -10,7 +10,16 @@ b. **section summaries** - a 2-4 sentence plain-language summary per section,
 c. **distractors** - replacements for weak wrong answers on multiple-choice
    questions only.  The correct option is never touched.
 
-Four invariants hold no matter what the model returns:
+Five invariants hold no matter what the model returns:
+
+* **Nothing hostile-shaped is used, whatever its citation says.**  Every item is
+  put through :func:`output_filter_reasons` *before* the grounding check: a URL,
+  an e-mail address, a phone-number-like pattern, an instruction-to-AI phrase, a
+  role marker, markup, hidden characters, or a mention of instructions/prompts/AI
+  the cited lines do not contain, and the item is dropped with kind
+  ``output_filter``.  This layer exists because grounding cannot help here - an
+  injected sentence really is in the document, so repeating it really is
+  grounded (``docs/SECURITY.md``).
 
 * **Inputs are never mutated.**  Everything works on a ``deepcopy`` and the
   original object is returned unchanged if anything goes wrong.  The
@@ -31,6 +40,7 @@ Four invariants hold no matter what the model returns:
 
 import copy
 import html
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -42,8 +52,15 @@ from ..assessments import (
     naive_strategies,
     strategy_pick,
 )
+from ..injection_scan import KIND_DESCRIPTIONS, KIND_REPETITION, scan_document
 from .config import LLMConfig
-from .grounding import Verdict, resolve_span, verify_claim, verify_distractor
+from .grounding import (
+    Verdict,
+    resolve_span,
+    span_excerpt,
+    verify_claim,
+    verify_distractor,
+)
 from .prompts import (
     DISTRACTORS_SCHEMA,
     OBJECTIVES_SCHEMA,
@@ -52,11 +69,17 @@ from .prompts import (
     objectives_prompt,
     summaries_prompt,
     system_blocks,
+    user_blocks,
 )
 
 TASK_OBJECTIVES = "objectives"
 TASK_SUMMARIES = "section_summaries"
 TASK_DISTRACTORS = "distractors"
+
+#: Reason kind recorded when an item is dropped by the output filters below
+#: rather than by the grounding check.  Named so the SME report can be read for
+#: "did anything come back that looked like an injection succeeded?".
+REASON_OUTPUT_FILTER = "output_filter"
 
 #: Longest an enhanced objective may be.  Longer than this is a paragraph, and
 #: an objective a learner cannot hold in their head is not an objective.
@@ -82,6 +105,11 @@ class EnhancementItem:
     proposed: str = ""
     span: Optional[List[int]] = None
     detail: Dict[str, Any] = field(default_factory=dict)
+    #: What decided this item, when it was not the grounding check.  Currently
+    #: only ``"output_filter"`` (see :func:`output_filter_reasons`); empty for
+    #: everything else.  An SME or auditor reading the report can filter on it
+    #: to answer "did anything come back that looked like an injection took?".
+    kind: str = ""
 
     def to_dict(self) -> Dict:
         return {
@@ -93,6 +121,7 @@ class EnhancementItem:
             "proposed": self.proposed,
             "span": list(self.span) if self.span else None,
             "detail": dict(self.detail),
+            "kind": self.kind,
         }
 
 
@@ -129,13 +158,38 @@ class EnhancementReport:
     def record(self, task: str, target: str, accepted: bool, reason: str,
                original: str = "", proposed: str = "",
                span: Optional[Sequence[int]] = None,
-               detail: Optional[Dict] = None) -> EnhancementItem:
+               detail: Optional[Dict] = None,
+               kind: str = "") -> EnhancementItem:
         item = EnhancementItem(
             task=task, target=str(target), accepted=bool(accepted),
             reason=reason, original=original, proposed=proposed,
-            span=list(span) if span else None, detail=dict(detail or {}))
+            span=list(span) if span else None, detail=dict(detail or {}),
+            kind=kind)
         self.items.append(item)
         return item
+
+    def record_output_filter(self, task: str, target: str, reasons: Sequence[str],
+                             original: str = "", proposed: str = "",
+                             span: Optional[Sequence[int]] = None
+                             ) -> EnhancementItem:
+        """Record a rejection by the output filters, with kind ``output_filter``.
+
+        Separate from :meth:`record_verdict` on purpose: an item dropped here was
+        not unsupported, it was *hostile-shaped*, and those are different findings
+        for whoever reads this report.
+        """
+        return self.record(
+            task, target, False,
+            "Rejected by the output filter (prompt-injection defence): "
+            + " ".join(reasons),
+            original=original, proposed=proposed, span=span,
+            detail={"output_filter_reasons": list(reasons)},
+            kind=REASON_OUTPUT_FILTER)
+
+    @property
+    def output_filtered(self) -> List[EnhancementItem]:
+        """Items the output filters dropped.  Read by tests and by the report."""
+        return [i for i in self.items if i.kind == REASON_OUTPUT_FILTER]
 
     def record_verdict(self, task: str, target: str, verdict: Verdict,
                        original: str = "", proposed: str = "",
@@ -199,6 +253,7 @@ class EnhancementReport:
             "config": self.config.to_dict(),
             "accepted_count": self.accepted_count,
             "rejected_count": self.rejected_count,
+            "output_filtered_count": len(self.output_filtered),
             "counts_by_task": self.counts_by_task(),
             "token_usage": self.usage_totals(),
             "calls": [dict(c) for c in self.calls],
@@ -259,9 +314,15 @@ def _call(provider, report: EnhancementReport, task: str, sop,
     A provider that *raises* is a bug in the provider, not in the pipeline, and
     it must not take the build down with it - so it is caught here and recorded
     exactly like a returned error.
+
+    The document goes in the user turn, fenced, not in a ``system`` block:
+    :func:`src.llm.prompts.user_blocks` builds both blocks and puts the cache
+    breakpoint on the document, so the prefix is still shared across the three
+    calls.  ``docs/SECURITY.md`` says why the position matters.
     """
     try:
-        result = provider.complete_json(system_blocks(sop), user_prompt, schema)
+        result = provider.complete_json(system_blocks(),
+                                        user_blocks(sop, user_prompt), schema)
     except Exception as exc:                  # noqa: BLE001 - see docstring
         report.calls.append({
             "task": task, "ok": False, "refused": False,
@@ -281,6 +342,104 @@ def _as_list(data: Optional[Dict], key: str) -> List[Dict]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+# ---------------------------------------------------------------------------
+# Output filters - the layer that assumes the prompt failed
+# ---------------------------------------------------------------------------
+# Prompt design asks the model not to repeat an instruction it found in the
+# document.  These filters assume, every time, that it did anyway.  They are
+# lexical, cheap and deterministic, and they run BEFORE the grounding check, for
+# two reasons: an injected sentence is *genuinely* supported by the lines it
+# cites (the text really is in the document), so grounding will not stop it; and
+# a rejection recorded as ``output_filter`` tells the SME something different
+# from "unsupported by the citation".
+#
+# A rejection only ever means "keep the deterministic text", so these fail
+# closed on purpose.  A summary carrying a numeric range that looks like a phone
+# number is a false positive whose whole cost is a slightly clunkier sentence.
+_OUTPUT_PHONE_RES = (
+    re.compile(r"\+\d[\d\s().-]{7,}\d"),
+    re.compile(r"\(\d{3}\)\s*\d{3}[-.\s]?\d{4}"),
+    re.compile(r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b"),
+    re.compile(r"\b(?:phone|tel|telephone|call|contact|dial|text|whatsapp)\b"
+               r"[^.\n]{0,24}?\b\d{3}[-.\s]?\d{4}\b", re.IGNORECASE),
+)
+
+#: Words that mean the model is talking about its own situation rather than the
+#: procedure.  Allowed only when the cited source lines use them too - "work
+#: instructions" is ordinary SOP vocabulary, "ignore the instructions above" is
+#: not.
+_OUTPUT_META_WORDS = ("instruction", "instructions", "prompt", "prompts",
+                      "assistant", "ai", "llm", "language model", "chatbot",
+                      "system message")
+
+#: Markup is rejected outright rather than escaped.  Everything generated here is
+#: escaped before it enters HTML anyway (CLAUDE.md invariant, tested), so a model
+#: emitting angle brackets into a learning objective is not a rendering problem -
+#: it is a signal that something in the document steered the output, and the
+#: deterministic original is better.
+_OUTPUT_MARKUP_RE = re.compile(r"[<>]")
+
+
+def output_filter_reasons(text, source_excerpt: str = "") -> List[str]:
+    """Why this generated item must not be used, or ``[]`` if it may be.
+
+    ``text`` is one objective, one summary sentence or one distractor.
+    ``source_excerpt`` is the cited lines, used only for the meta-word test: a
+    document that says "work instructions" may have that phrase back, a document
+    that does not may not.
+
+    The injection-shaped checks are delegated to :mod:`src.injection_scan`, so the
+    scanner and the filter cannot disagree about what an instruction-to-AI phrase,
+    a role marker, a prompt delimiter, a URL, an e-mail address, hidden text or
+    markup looks like.  One definition, two places it is applied.
+    """
+    candidate = str(text or "")
+    if not candidate.strip():
+        return ["The item is empty."]
+
+    reasons: List[str] = []
+    scan = scan_document([candidate])
+    for finding in scan.findings:
+        if finding.kind == KIND_REPETITION:      # meaningless for one line
+            continue
+        reasons.append("{0}: {1}".format(
+            finding.kind, KIND_DESCRIPTIONS.get(finding.kind, "flagged")))
+
+    for pattern in _OUTPUT_PHONE_RES:
+        if pattern.search(candidate):
+            reasons.append(
+                "phone_number: the item contains a telephone-number-like "
+                "pattern, which training content drawn from a procedure has no "
+                "reason to introduce.")
+            break
+
+    if _OUTPUT_MARKUP_RE.search(candidate):
+        reasons.append(
+            "markup: the item contains '<' or '>'. Generated training prose is "
+            "plain text; markup here means the model was echoing the document's "
+            "formatting or something worse.")
+
+    excerpt_lower = str(source_excerpt or "").lower()
+    meta_hits = [word for word in _OUTPUT_META_WORDS
+                 if re.search(r"\b" + re.escape(word) + r"\b", candidate.lower())
+                 and not re.search(r"\b" + re.escape(word) + r"\b", excerpt_lower)]
+    if meta_hits:
+        reasons.append(
+            "meta_reference: the item mentions {0}, which the cited source lines "
+            "do not. Training content describes the procedure, not the system "
+            "that generated it.".format(", ".join(sorted(set(meta_hits)))))
+
+    # De-duplicate while keeping order, so a sentence that trips two patterns of
+    # the same kind reads as one reason.
+    seen: set = set()
+    unique: List[str] = []
+    for reason in reasons:
+        if reason not in seen:
+            seen.add(reason)
+            unique.append(reason)
+    return unique
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +484,16 @@ def _enhance_objectives(module, sop, provider, config: LLMConfig,
                           "The objective is {0} characters; the limit is "
                           "{1}.".format(len(text), MAX_OBJECTIVE_CHARS),
                           original=originals[index], proposed=text, span=span)
+            continue
+
+        # Output filters before grounding: an objective that repeats an injected
+        # line is grounded by construction, so grounding is the wrong gate for it.
+        filtered = output_filter_reasons(
+            text, span_excerpt(sop, span, config.span_context_lines))
+        if filtered:
+            report.record_output_filter(
+                TASK_OBJECTIVES, target, filtered,
+                original=originals[index], proposed=text, span=span)
             continue
 
         verdict = verify_claim(text, sop, span, config)
@@ -418,12 +587,23 @@ def _enhance_summaries(module, sop, provider, config: LLMConfig,
         texts: List[str] = []
         spans: List[Any] = []
         failures: List[str] = []
+        filter_failures: List[str] = []
         for position, sentence in enumerate(sentences):
             if not isinstance(sentence, dict):
                 failures.append("Sentence {0} is malformed.".format(position + 1))
                 continue
             text = str(sentence.get("text") or "").strip()
             span = sentence.get("span")
+            # Output filters first, and one filtered sentence rejects the whole
+            # summary, exactly as one unsupported sentence does: a paragraph a
+            # learner reads in a regulated course is either wholly clean or it is
+            # not shown.
+            filtered = output_filter_reasons(
+                text, span_excerpt(sop, span, config.span_context_lines))
+            if filtered:
+                filter_failures.append("Sentence {0} ({1!r}): {2}".format(
+                    position + 1, text[:60], " ".join(filtered)))
+                continue
             verdict = verify_claim(text, sop, span, config)
             if verdict.ok:
                 texts.append(text)
@@ -433,6 +613,14 @@ def _enhance_summaries(module, sop, provider, config: LLMConfig,
                     position + 1, text[:60], " ".join(verdict.reasons)))
 
         joined = " ".join(texts)
+        if filter_failures:
+            report.record_output_filter(
+                TASK_SUMMARIES, target,
+                ["{0} of {1} sentences were filtered, so the whole summary is "
+                 "discarded.".format(len(filter_failures), len(sentences))]
+                + filter_failures,
+                proposed=joined, span=spans[0] if spans else None)
+            continue
         if failures:
             report.record(
                 TASK_SUMMARIES, target, False,
@@ -626,6 +814,16 @@ def _enhance_distractors(assessment, sop, provider, config: LLMConfig,
                               "range in the document; a distractor without a "
                               "traceable citation is not auditable.".format(span),
                               original=old, proposed=new, span=span)
+                continue
+
+            # A "wrong answer" carrying a URL, a contact or markup is a payload
+            # dressed as an option, and it would be shown to every learner.
+            filtered = output_filter_reasons(
+                new, span_excerpt(sop, span, config.span_context_lines))
+            if filtered:
+                report.record_output_filter(
+                    TASK_DISTRACTORS, slot, filtered,
+                    original=old, proposed=new, span=span)
                 continue
 
             verdict = verify_distractor(new, correct_text, sop, config)

@@ -10,6 +10,7 @@ from pathlib import Path
 import click
 
 from .audit import Actor, AuditLog, content_hash, file_hash, hmac_key_from_env
+from .injection_scan import llm_skip_note, result_from_dict, sanitize_for_terminal
 from .parser import SOPParser
 from .generator import TrainingGenerator
 from .assessments import MIN_ASSESSMENT_QUESTIONS, AssessmentGenerator
@@ -86,13 +87,35 @@ def main(input, output, format, questions, passing_score, package_name, llm,
         parser = SOPParser()
         sop_content = parser.parse(input)
 
+        # Everything document-derived is sanitized before it is printed. A
+        # document title can carry ANSI escape sequences, and a terminal will
+        # obey them: "\x1b[2K\r" erases the line an operator is reading as
+        # evidence and prints something else over it. See src/injection_scan.py
+        # and docs/SECURITY.md.
         if verbose:
-            click.echo(f"   Title: {sop_content.title}")
-            click.echo(f"   Version: {sop_content.version}")
+            click.echo(f"   Title: {sanitize_for_terminal(sop_content.title)}")
+            click.echo(f"   Version: {sanitize_for_terminal(sop_content.version)}")
             click.echo(f"   Procedures: {len(sop_content.procedures)} steps")
             click.echo(f"   Safety Warnings: {len(sop_content.safety_warnings)}")
             click.echo(f"   Definitions: {len(sop_content.definitions)}")
         click.echo("   ✓ Parsing complete")
+
+        # The input scan. Printed whenever it found anything, because the person
+        # running the CLI is the only human in this path.
+        scan_result = result_from_dict(getattr(sop_content, 'injection_scan', None))
+        if not scan_result.clean:
+            click.echo(f"   ⚠️  Input scan: {scan_result.risk.upper()} risk - "
+                       f"{sanitize_for_terminal(scan_result.summary())}")
+            for finding in scan_result.findings[:10]:
+                click.echo(f"      line {finding.line}: {finding.kind}: "
+                           f"{sanitize_for_terminal(finding.excerpt)}")
+            if len(scan_result.findings) > 10:
+                click.echo(f"      ... and {len(scan_result.findings) - 10} more")
+            if scan_result.blocks_llm:
+                click.echo("      This document contains text aimed at an "
+                           "automated system. The LLM layer will not run on it; "
+                           "deterministic generation continues. Read the flagged "
+                           "lines before you release this training.")
         click.echo()
 
         # Step 2: Generate training content
@@ -114,7 +137,7 @@ def main(input, output, format, questions, passing_score, package_name, llm,
                                             passing_score=passing_score)
 
         if verbose:
-            click.echo(f"   Assessment Title: {assessment.title}")
+            click.echo(f"   Assessment Title: {sanitize_for_terminal(assessment.title)}")
             click.echo(f"   Questions Generated: {len(assessment.questions)}")
             click.echo(f"   Passing Score: {assessment.passing_score}%")
         click.echo("   ✓ Assessment generated")
@@ -131,7 +154,22 @@ def main(input, output, format, questions, passing_score, package_name, llm,
         if llm is not None:
             llm_config = llm_config.with_enabled(llm)
 
-        if llm_config.enabled:
+        # The injection gate: a `high`-risk document is never sent to a model,
+        # even with --llm, and there is no override in this build
+        # (docs/SECURITY.md). The report still gets written, carrying the note
+        # that says why nothing was enhanced.
+        if llm_config.enabled and scan_result.blocks_llm:
+            report = merge_reports("package", [], llm_config)
+            report.note(llm_skip_note(scan_result))
+            report_path = output_path / ENHANCEMENT_REPORT_FILENAME
+            with open(report_path, 'w', encoding='utf-8') as handle:
+                json.dump(report.to_dict(), handle, indent=2, ensure_ascii=False)
+            click.echo("🤖 Grounded LLM enhancement SKIPPED - the input scan "
+                       "flagged this document "
+                       f"({', '.join(scan_result.high_kinds)}).")
+            click.echo(f"   ✓ Enhancement report written: {report_path}")
+            click.echo()
+        elif llm_config.enabled:
             click.echo("🤖 Running grounded LLM enhancement "
                        f"(model {llm_config.model})...")
             provider = build_llm_provider(llm_config)
@@ -145,7 +183,7 @@ def main(input, output, format, questions, passing_score, package_name, llm,
             with open(report_path, 'w', encoding='utf-8') as handle:
                 json.dump(report.to_dict(), handle, indent=2, ensure_ascii=False)
             for line in report.summary_lines():
-                click.echo(f"   {line}")
+                click.echo(f"   {sanitize_for_terminal(line)}")
             click.echo(f"   ✓ Enhancement report written: {report_path}")
             click.echo("   ⚠️  Machine-assisted draft - a named SME must review "
                        "and approve before release.")

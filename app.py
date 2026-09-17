@@ -56,6 +56,7 @@ from src.transparency_report import (
 from src.medical_device_config import MEDICAL_DEVICE_CONFIG
 from src.llm import LLMConfig, enhance_assessment, enhance_module, merge_reports
 from src.llm import build_provider as build_llm_provider
+from src.injection_scan import llm_skip_note, result_from_dict as scan_from_dict
 from src.serialization import sop_from_dict, module_from_dict, assessment_from_dict
 from src.pilot_metrics import collect as collect_pilot_metrics
 
@@ -861,9 +862,26 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
         # built once so the calls share the cached document prefix; the
         # enhance functions never raise and return the inputs unchanged when
         # disabled or on any provider failure, with the reason in the report.
+        #
+        # The injection gate sits in front of it: a document the scanner rates
+        # `high` (text aimed at a model, or hidden characters) is never sent to a
+        # model, even with the layer enabled, and whatever the document says
+        # about itself. There is no override in this build - see
+        # docs/SECURITY.md. Deterministic generation above has already run and is
+        # unaffected: it is regex, it cannot be persuaded, and everything it
+        # produces is escaped where it is rendered.
+        injection_scan = dict(getattr(sop_content, 'injection_scan', None) or {})
+        scan_result = scan_from_dict(injection_scan)
         llm_config = LLMConfig.from_env()
         enhancement_report = None
-        if llm_config.enabled:
+        llm_skipped_by_scan = bool(llm_config.enabled and scan_result.blocks_llm)
+        if llm_skipped_by_scan:
+            enhancement_report = merge_reports(job_id, [], llm_config)
+            enhancement_report.note(llm_skip_note(scan_result))
+            app.logger.warning(
+                f"[job_id={job_id}] LLM enhancement skipped: injection scan "
+                f"risk={scan_result.risk} kinds={','.join(scan_result.high_kinds)}")
+        elif llm_config.enabled:
             provider = build_llm_provider(llm_config)
             training_module, module_report = enhance_module(
                 training_module, sop_content, provider, llm_config)
@@ -924,6 +942,14 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
                 'scorm_version': scorm_version,
                 'output_format': output_format,
             },
+            # Also at the top level, not only inside sop_content, because the
+            # review page and anyone reading job.json should not have to know
+            # where the parser keeps it.
+            'injection_scan': injection_scan,
+            # True when the LLM layer was enabled and the injection gate stopped
+            # it, so "was a model shown this document?" is answerable from the job
+            # record. The reason itself is in enhancement_report.json's notes.
+            'llm_skipped_by_injection_scan': llm_skipped_by_scan,
             'sop_content': sop_content.to_dict(),
             'training_module': module_dict,
             'assessment': assessment_dict,
@@ -957,6 +983,7 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
             'download_url': f'/api/download/{job_id}/{download_filename}?t={token}',
             'transparency_report_url': f'/api/download/{job_id}/transparency_report.html?t={token}',
             'review_url': f'/review/{job_id}?t={token}',
+            'injection_scan': injection_scan,
             'metadata': {
                 'title': sop_content.title,
                 'version': sop_content.version,
@@ -1186,10 +1213,17 @@ def review_page(job_id):
     sop = job.get('sop_content') or {}
     source_lines = (sop.get('raw_content') or '').splitlines()
 
+    # The input scan, for the banner at the top of the review page. Read from the
+    # job record (the top-level copy, falling back to the one inside
+    # sop_content), never re-scanned here: the SME must see what was scanned at
+    # generation time, which is what the gate acted on.
+    injection_scan = job.get('injection_scan') or sop.get('injection_scan') or {}
+
     return render_template(
         'review.html',
         job_id=job_id,
         token=request.args.get('t', ''),
+        injection_scan=injection_scan,
         status=job.get('status', 'draft'),
         edits_count=job.get('edits_count', 0),
         approval=job.get('approval'),
