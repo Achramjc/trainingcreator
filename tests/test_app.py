@@ -88,6 +88,8 @@ def test_upload_success_each_format(client, sample_sop_path):
         assert payload["success"] is True
         assert "download_url" in payload
         assert "transparency_report_url" in payload
+        assert "review_url" in payload
+        assert payload["review_url"].startswith(f"/review/{payload['job_id']}?t=")
 
         download_resp = client.get(payload["download_url"])
         assert download_resp.status_code == 200

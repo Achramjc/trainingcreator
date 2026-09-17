@@ -35,7 +35,8 @@ class SCORMExporter:
     def create_package(self, training_module: TrainingModule,
                        assessment: Assessment,
                        output_path: str,
-                       package_name: Optional[str] = None) -> str:
+                       package_name: Optional[str] = None,
+                       approval: Optional[dict] = None) -> str:
         """
         Create a SCORM package from training content
 
@@ -44,6 +45,11 @@ class SCORMExporter:
             assessment: Assessment questions
             output_path: Directory to create package in
             package_name: Optional custom package name
+            approval: Optional SME approval record - ``{"approved_by", "role",
+                "approved_at", "notes", "edits_count"}``. When present, every
+                page's DRAFT watermark is replaced with an approval banner and
+                the record is embedded in metadata.json. When ``None`` (the
+                default), output is byte-identical to the unapproved package.
 
         Returns:
             Path to created ZIP file
@@ -60,11 +66,12 @@ class SCORMExporter:
 
         # Create SCORM structure
         self._create_manifest(package_dir, training_module, assessment)
-        self._create_content_files(package_dir, training_module, assessment)
+        self._create_content_files(package_dir, training_module, assessment, approval=approval)
         self._create_api_files(package_dir)
 
         # Create metadata file for transparency
-        self._create_metadata_file(package_dir, training_module, assessment, package_name)
+        self._create_metadata_file(package_dir, training_module, assessment, package_name,
+                                    approval=approval)
 
         # Create ZIP package
         zip_path = output_path / f"{package_name}.zip"
@@ -149,18 +156,20 @@ class SCORMExporter:
                   encoding='UTF-8')
 
     def _create_content_files(self, package_dir: Path, training_module: TrainingModule,
-                             assessment: Assessment):
+                             assessment: Assessment, approval: Optional[dict] = None):
         """Create HTML content files"""
         # Create CSS file
         self._create_css_file(package_dir)
 
         # Create content pages for each section
         for idx, section in enumerate(training_module.sections, 1):
-            html_content = self._create_content_html(section, training_module.title, idx)
+            html_content = self._create_content_html(section, training_module.title, idx,
+                                                       approval=approval)
             (package_dir / f"content_{idx}.html").write_text(html_content, encoding='utf-8')
 
         # Create assessment page
-        assessment_html = self._create_assessment_html(assessment, training_module.title)
+        assessment_html = self._create_assessment_html(assessment, training_module.title,
+                                                         approval=approval)
         (package_dir / "assessment.html").write_text(assessment_html, encoding='utf-8')
 
     def _create_css_file(self, package_dir: Path):
@@ -276,10 +285,12 @@ class SCORMExporter:
         """
         (package_dir / "styles.css").write_text(css_content)
 
-    def _create_content_html(self, section: dict, title: str, page_num: int) -> str:
+    def _create_content_html(self, section: dict, title: str, page_num: int,
+                            approval: Optional[dict] = None) -> str:
         """Create HTML for a content section"""
         # Add watermark to content
-        content_with_watermark = self._add_draft_watermark(section.get('content', ''))
+        content_with_watermark = self._add_draft_watermark(section.get('content', ''),
+                                                             approval=approval)
 
         page = f"""<!DOCTYPE html>
 <html>
@@ -316,7 +327,8 @@ class SCORMExporter:
 </html>"""
         return page
 
-    def _create_assessment_html(self, assessment: Assessment, title: str) -> str:
+    def _create_assessment_html(self, assessment: Assessment, title: str,
+                               approval: Optional[dict] = None) -> str:
         """Create HTML for assessment.
 
         INTEGRITY: this page is built from ``assessment.to_learner_dict()`` only.
@@ -332,8 +344,8 @@ class SCORMExporter:
         already deterministically shuffled at generation time with the correct
         answer's position balanced across the assessment.
         """
-        # Add watermark
-        watermark = self._add_draft_watermark("")
+        # Add watermark (or, once approved, the approval banner in its place)
+        watermark = self._add_draft_watermark("", approval=approval)
 
         learner_payload = assessment.to_learner_dict()
 
@@ -588,19 +600,26 @@ class SCORMExporter:
             filename = filename.replace(char, '_')
         return filename.strip()
 
-    def _add_draft_watermark(self, html_content: str) -> str:
+    def _add_draft_watermark(self, html_content: str, approval: Optional[dict] = None) -> str:
         """
-        Add draft watermark to all training content
-
-        This watermark makes it clear that the content is auto-generated
-        and requires review before use in production training.
+        Prepend a DRAFT watermark to training content, or - once a named
+        human has approved the job - an approval banner in its place.
 
         Args:
             html_content: Original HTML content
+            approval: Optional approval record (``approved_by``, ``role``,
+                ``approved_at``, plus whatever else the caller stores; only
+                these three are shown). All values are HTML-escaped, since an
+                approver's name is operator-entered text, not trusted markup.
+                ``None`` (the default) keeps today's DRAFT watermark exactly
+                as before.
 
         Returns:
-            HTML content with watermark prepended
+            HTML content with the watermark/banner prepended
         """
+        if approval:
+            return self._add_approval_banner(html_content, approval)
+
         watermark = """
     <div style="border: 3px solid #ff9800; background: #fff3cd; padding: 15px; margin: 10px 0; border-radius: 5px;">
         <h3 style="color: #ff6f00; margin: 0 0 10px 0;">⚠️ DRAFT TRAINING - REVIEW REQUIRED</h3>
@@ -619,8 +638,39 @@ class SCORMExporter:
 
         return watermark + html_content
 
+    def _add_approval_banner(self, html_content: str, approval: dict) -> str:
+        """Build the approval banner that replaces the DRAFT watermark.
+
+        Nothing here is trusted markup: ``approved_by``, ``role`` and the
+        formatted date are all HTML-escaped before being embedded.
+        """
+        approved_by = html.escape(str(approval.get("approved_by", "")))
+        role = html.escape(str(approval.get("role", "")))
+        approved_at = approval.get("approved_at", "")
+        display_date = str(approved_at)
+        try:
+            parsed = datetime.fromisoformat(str(approved_at).replace("Z", "+00:00"))
+            display_date = parsed.strftime("%Y-%m-%d")
+        except (TypeError, ValueError):
+            pass
+        display_date = html.escape(display_date)
+
+        banner = """
+    <div style="border: 3px solid #28a745; background: #d4edda; padding: 15px; margin: 10px 0; border-radius: 5px;">
+        <h3 style="color: #1e7e34; margin: 0 0 10px 0;">✅ APPROVED TRAINING</h3>
+        <p style="margin: 5px 0;"><strong>Approved by {approved_by} ({role}) on {date}</strong></p>
+        <p style="margin: 10px 0 0 0; font-size: 0.9em;">
+            Tool: Training Creator (Non-Validated) |
+            <strong>Your validated LMS will maintain all training records</strong>
+        </p>
+    </div>
+    """.format(approved_by=approved_by, role=role, date=display_date)
+
+        return banner + html_content
+
     def _create_metadata_file(self, package_dir: Path, training_module: TrainingModule,
-                             assessment: Assessment, source_info: str = "Unknown"):
+                             assessment: Assessment, source_info: str = "Unknown",
+                             approval: Optional[dict] = None):
         """
         Create metadata.json for full transparency
 
@@ -632,6 +682,10 @@ class SCORMExporter:
             training_module: Generated training module
             assessment: Generated assessment
             source_info: Information about source document
+            approval: Optional approval record. When present it is embedded
+                verbatim under the "approval" key and ``review_status``
+                switches from DRAFT to APPROVED. ``None`` (the default)
+                leaves metadata.json exactly as before.
         """
         try:
             from .medical_device_config import MEDICAL_DEVICE_CONFIG
@@ -652,7 +706,7 @@ class SCORMExporter:
                 # discovering it. See src/answer_key.py.
                 "assessment_integrity": MEDICAL_DEVICE_CONFIG.get(
                     "assessment_integrity", {}),
-                "review_status": "DRAFT - Requires SME Review",
+                "review_status": "APPROVED" if approval else "DRAFT - Requires SME Review",
                 "lms_notes": "Import to validated LMS for training record management per 21 CFR 820.25",
                 "generated_timestamp": datetime.now().isoformat(),
                 "compliance_context": {
@@ -661,6 +715,8 @@ class SCORMExporter:
                     "validation_status": "Non-validated content generation tool"
                 }
             }
+            if approval:
+                metadata["approval"] = approval
 
             with open(package_dir / 'metadata.json', 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -677,9 +733,11 @@ class SCORMExporter:
                     "training_sections": len(training_module.sections),
                     "assessment_questions": len(assessment.questions)
                 },
-                "review_status": "DRAFT",
+                "review_status": "APPROVED" if approval else "DRAFT",
                 "generated_timestamp": datetime.now().isoformat()
             }
+            if approval:
+                metadata["approval"] = approval
 
             with open(package_dir / 'metadata.json', 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
