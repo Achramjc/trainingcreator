@@ -132,9 +132,8 @@ Step 3: [Third step description]
 ```bash
 python -m src.cli -i sop.txt -o ./output -f scorm1.2
 ```
-- Maximum LMS compatibility
-- Works with: Moodle, Blackboard, Canvas, TalentLMS
-- Creates ZIP file ready to upload
+- Broadest LMS compatibility of the two SCORM versions
+- Creates ZIP file ready to upload to any SCORM 1.2-conformant LMS
 - Tracks completion and scores
 
 ### SCORM 2004
@@ -216,6 +215,11 @@ for sop_file in sop_dir.glob('*.txt'):
 ```
 
 ## LMS Upload Instructions
+
+The steps below are each platform's standard SCORM package import flow, from their own
+documentation — Training Creator has not been verified against these specific LMS platforms
+(see the "LMS Compatibility" note in README.md and GOAL.md for current status). Always test an
+imported package in your own LMS before rolling it out.
 
 ### Moodle
 

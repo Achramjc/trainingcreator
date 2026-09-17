@@ -3,7 +3,7 @@
 -r requirements.txt
 
 # Production WSGI server
-gunicorn>=21.2.0
+gunicorn~=21.2
 
 # Optional production enhancements
 # sentry-sdk>=1.40.0  # Error tracking

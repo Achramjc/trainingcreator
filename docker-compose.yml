@@ -6,7 +6,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - FLASK_ENV=production
+      - FLASK_DEBUG=false
       - SECRET_KEY=change-this-in-production
       - MAX_CONTENT_LENGTH=16777216
     volumes:
