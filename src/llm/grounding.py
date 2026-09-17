@@ -10,19 +10,41 @@ and everything that survives still goes to an SME for approval.
 
 The check is deliberately mechanical and deliberately strict.  It is not a
 semantic entailment judge - it cannot be, because a second model grading the
-first one is exactly the black box QA/RA will not accept.  It is four cheap,
-explainable tests that a reviewer can re-run by eye:
+first one is exactly the black box QA/RA will not accept.  It is a handful of
+cheap, explainable tests that a reviewer can re-run by eye:
 
 1. **The citation resolves.**  The span the model gave must be real line
    numbers inside the document it was shown.
 2. **No invented numbers.**  Every digit-bearing token in the sentence (a
    count, a limit, a duration, a form number, a channel) must appear in the
-   cited excerpt.  This is the single highest-value test: a hallucinated "30
-   minutes" in a regulated procedure is the failure mode that ends the company.
-3. **The wording comes from the source.**  At least ``min_overlap`` of the
-   sentence's content words appear in the excerpt - or, for a terse sentence
-   built around named things, every capitalised or defined term does.
+   cited excerpt.  A hallucinated "30 minutes" in a regulated procedure is the
+   failure mode that ends the company.
+3. **The wording comes from the source.**  At least ``min_overlap`` (70%) of
+   the sentence's content words appear in the excerpt - or, for a terse
+   sentence built around named things, every capitalised or defined term does.
+3b. **An absolute cap on unsupported material.**  At most
+   ``max_unsupported_words`` (3) content words may be missing, whatever the
+   ratio says and whatever named terms the sentence contains.  A ratio scales
+   with length; this does not.
+3c. **No added steps.**  A clause introduced by "and", "then", "also",
+   "before", "after" whose content words are *all* absent from the excerpt is
+   an invented action, condition or actor, and is rejected by name.
 4. **Shape.**  Non-empty, and no longer than ``max_sentence_chars``.
+
+Rules 3b and 3c exist because of a real adversarial finding: at a 50% bar,
+*"Press the red E-STOP button and then call the fire department"* was ACCEPTED
+against the step it half-quotes.  The supported half paid for the invented
+half, and the result was an instruction to call the fire department, carrying a
+citation that looked legitimate.  Lexical grounding cannot distinguish that
+from a paraphrase, so the check **fails closed**: a false rejection only keeps
+the deterministic original, a false acceptance puts an invented instruction
+into regulated training.  Heavy paraphrases are rejected too, and that is the
+intended trade - the prompt asks for the document's own wording.
+
+What this cannot catch is stated plainly in ``docs/LLM.md``: an invented clause
+assembled entirely from words that *do* appear in the cited lines will pass.
+That is one of the reasons SME approval is mandatory and the layer is off by
+default.
 
 False (distractor) options invert test 3: a wrong answer that the document
 *asserts* is not a distractor, it is a broken question, and it is rejected.
@@ -65,6 +87,20 @@ after all always any before cannot every immediately least mandatory may most
 must never no none not only optional permitted prohibited required shall some
 without
 """.split())
+
+#: Words that introduce an additional action, condition or actor.  A clause
+#: they open whose content words are ALL absent from the cited excerpt is an
+#: added step - the single most dangerous thing a model can do to a controlled
+#: procedure, and the one a ratio test is worst at seeing, because the rest of
+#: the sentence is faithfully quoted and pays for it.
+ADDED_STEP_CONNECTIVES = frozenset({
+    "then", "and", "also", "before", "after", "additionally", "furthermore",
+    "plus", "next", "afterwards", "subsequently",
+})
+
+#: Clause boundaries.  Runs are scanned within a clause so that a connective in
+#: one clause does not swallow the next.
+_CLAUSE_SPLIT_RE = re.compile(r"[;:,.!?()\[\]–—]|\s-\s")
 
 _PUNCT_RE = re.compile(r"[^\w\s%]+", re.UNICODE)
 _WS_RE = re.compile(r"\s+")
@@ -134,11 +170,59 @@ def capitalised_terms(text) -> Set[str]:
     for index, word in enumerate(words):
         if index == 0:
             continue
-        if word.isupper() and len(word) > 1:
-            terms.add(normalize(word))
-        elif word[0].isupper():
-            terms.add(normalize(word))
+        if not (word[0].isupper() or (word.isupper() and len(word) > 1)):
+            continue
+        # Normalisation splits hyphenated and slashed terms ("E-STOP",
+        # "Lockout/Tagout"), and the excerpt's word set is split the same way,
+        # so compare token by token rather than on the rejoined string.
+        terms.update(normalize(word).split())
     return {t for t in terms if t and t not in STOPWORDS}
+
+
+def unsupported_words(text, excerpt_words: Set[str]) -> List[str]:
+    """Content words of ``text`` absent from the excerpt, in order, deduplicated."""
+    out: List[str] = []
+    for word in content_words(text):
+        if word not in excerpt_words and word not in out:
+            out.append(word)
+    return out
+
+
+def added_clause_words(text, excerpt_words: Set[str]) -> List[str]:
+    """Content words of an *added* clause: one no part of which is in the excerpt.
+
+    Scans each clause for a connective from :data:`ADDED_STEP_CONNECTIVES` and
+    takes the run of content words it introduces, up to the next connective or
+    the end of the clause.  A run whose every word is missing from the cited
+    lines is reported; a run with even one supported word is not, because that
+    is an elaboration of something the document does say rather than a new
+    instruction bolted on.
+
+    "Press the red E-STOP button and then call the fire department" yields
+    ``["call", "fire", "department"]``: the first half is quoted faithfully, the
+    second half is invented, and no ratio over the whole sentence sees it.
+    """
+    findings: List[List[str]] = []
+    for clause in _CLAUSE_SPLIT_RE.split(str(text or "")):
+        run: Optional[List[str]] = None
+        for token in normalize(clause).split():
+            if token in ADDED_STEP_CONNECTIVES:
+                if run:
+                    findings.append(run)
+                run = []
+                continue
+            if run is not None and token not in STOPWORDS:
+                run.append(token)
+        if run:
+            findings.append(run)
+
+    out: List[str] = []
+    for run in findings:
+        if all(word not in excerpt_words for word in run):
+            for word in run:
+                if word not in out:
+                    out.append(word)
+    return out
 
 
 def polarity_signature(text) -> frozenset:
@@ -282,6 +366,33 @@ def verify_claim(sentence, sop, span,
                 overlap, cfg.min_overlap,
                 "; unsupported terms: " + ", ".join(missing_terms)
                 if missing_terms else ""))
+
+    # (3b) absolute cap on unsupported material.
+    #
+    # Independent of the ratio, and NOT waived by the defined-terms
+    # alternative above: a sentence packed with the document's own named terms
+    # must not thereby earn the right to carry four invented words.  The ratio
+    # scales with length; this does not.
+    missing_words = unsupported_words(text, excerpt_words)
+    detail["unsupported_words"] = missing_words
+    if len(missing_words) > cfg.max_unsupported_words:
+        reasons.append(
+            "{0} content words do not appear in the cited lines (limit {1}); "
+            "unsupported: {2}.".format(
+                len(missing_words), cfg.max_unsupported_words,
+                ", ".join(missing_words)))
+
+    # (3c) added steps.
+    #
+    # The failure a ratio cannot see: a faithfully quoted instruction with an
+    # invented one appended. "Press the red E-STOP button and then call the
+    # fire department" is 62% supported and wholly unacceptable.
+    added = added_clause_words(text, excerpt_words)
+    detail["added_clause_words"] = added
+    if added:
+        reasons.append(
+            "It adds an action, condition or actor the cited lines do not "
+            "contain; unsupported: {0}.".format(", ".join(added)))
 
     return Verdict(not reasons, reasons, detail)
 

@@ -21,6 +21,8 @@ from .config import (
     ENV_ENABLE,
     ENV_LIVE_TESTS,
     ENV_MODEL,
+    MAX_UNSUPPORTED_CONTENT_WORDS,
+    MIN_CONTENT_WORD_OVERLAP,
     LLMConfig,
     live_tests_enabled,
 )
@@ -59,6 +61,8 @@ __all__ = [
     "ENV_ENABLE",
     "ENV_LIVE_TESTS",
     "ENV_MODEL",
+    "MAX_UNSUPPORTED_CONTENT_WORDS",
+    "MIN_CONTENT_WORD_OVERLAP",
     "LLMConfig",
     "live_tests_enabled",
     "Provider",

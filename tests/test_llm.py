@@ -8,9 +8,14 @@ repository allowed to leave the machine.
 
 What is actually being defended here:
 
-* the grounding check rejects the four things that would end this product in an
+* the grounding check rejects the things that would end this product in an
   audit - an invented number, an unsupported paraphrase, a citation that does
-  not resolve, and a "wrong answer" the document actually states;
+  not resolve, an invented instruction appended to a faithfully quoted one, and
+  a "wrong answer" the document actually states;
+* it fails CLOSED: heavy paraphrases are rejected too, and there are tests
+  saying so on purpose;
+* its documented blind spots stay documented - two characterization tests pin
+  the cases docs/LLM.md admits it cannot catch, so they cannot change silently;
 * enhancement never mutates its inputs and never crashes the pipeline;
 * M0's non-negotiable invariants survive the layer: the answer key still does
   not reach the learner, and a naive learner still fails - including after
@@ -45,7 +50,14 @@ from src.llm import (
     verify_distractor,
     worst_naive_score,
 )
-from src.llm.config import ENV_API_KEY, ENV_ENABLE, ENV_LIVE_TESTS, ENV_MODEL
+from src.llm.config import (
+    ENV_API_KEY,
+    ENV_ENABLE,
+    ENV_LIVE_TESTS,
+    ENV_MODEL,
+    MAX_UNSUPPORTED_CONTENT_WORDS,
+    MIN_CONTENT_WORD_OVERLAP,
+)
 from src.llm.enhance import TASK_DISTRACTORS, TASK_OBJECTIVES, TASK_SUMMARIES
 from src.parser import SOPParser
 
@@ -64,6 +76,9 @@ STEP5_SPAN = [48, 49]
 SAFETY_SPAN = [25, 28]
 # Lines 33-34 are Step 1 and its body ("... Alert nearby personnel ...").
 STEP1_SPAN = [33, 34]
+# Lines 36-40 are Step 2 ("Activate Emergency Stop"), its body and its
+# lettered sub-steps.
+STEP2_SPAN = [36, 40]
 
 
 # ---------------------------------------------------------------------------
@@ -195,21 +210,124 @@ def test_claim_with_a_number_not_in_the_excerpt_is_rejected(sop):
     assert supported.ok is True, supported.reasons
 
 
-def test_paraphrase_above_the_overlap_threshold_is_accepted(sop):
+def test_light_paraphrase_in_the_documents_own_words_is_accepted(sop):
+    """Accepted, but only just: the bar is deliberately close to quotation."""
     verdict = verify_claim(
-        "Apply the reporting rule by completing Form MS-101 within 30 minutes "
-        "of a shutdown.", sop, STEP5_SPAN)
+        "Press the red E-STOP button at the nearest workstation; buttons are "
+        "spaced 50 feet apart along the line.", sop, STEP2_SPAN)
     assert verdict.ok is True, verdict.reasons
-    # Genuinely a paraphrase, not a copy - the threshold is doing work.
-    assert 0.5 <= verdict.detail["content_word_overlap"] < 1.0
+    # A real paraphrase, not a copy - the threshold is doing work.
+    assert MIN_CONTENT_WORD_OVERLAP <= verdict.detail["content_word_overlap"] < 1.0
+    assert verdict.detail["unsupported_words"] == ["buttons", "spaced", "apart"]
 
 
-def test_paraphrase_below_the_overlap_threshold_is_rejected(sop):
+def test_heavy_paraphrase_is_rejected_and_that_is_intended(sop):
+    """A fluent restatement that drops the document's wording is REJECTED.
+
+    This is not a bug to be tuned away. The prompt asks for the document's own
+    wording, and the check fails closed: a false rejection only keeps the
+    deterministic original, whereas a false acceptance puts unverifiable text
+    into regulated training. Note also that "five seconds" would sail past the
+    numbers rule - the document says "5 seconds" - which is precisely why the
+    wording rules are not optional.
+    """
+    verdict = verify_claim(
+        "Hit the emergency stop control closest to you; all moving equipment "
+        "loses power within five seconds.", sop, STEP2_SPAN)
+    assert verdict.ok is False
+    assert verdict.detail["content_word_overlap"] < MIN_CONTENT_WORD_OVERLAP
+    assert len(verdict.detail["unsupported_words"]) > MAX_UNSUPPORTED_CONTENT_WORDS
+    assert any("limit 3" in reason for reason in verdict.reasons)
+
+
+def test_paraphrase_far_below_the_overlap_threshold_is_rejected(sop):
     verdict = verify_claim(
         "Supervisors log the shutdown details on Form MS-101 promptly after "
         "every incident.", sop, STEP5_SPAN)
     assert verdict.ok is False
     assert verdict.detail["content_word_overlap"] < 0.5
+
+
+def test_an_invented_step_appended_to_a_grounded_sentence_is_rejected(sop):
+    """The failure a ratio alone cannot see.
+
+    The first half is quoted faithfully from the cited lines and pays for the
+    second half, which is invented. At a 50% bar this sentence was ACCEPTED -
+    an instruction to call the fire department, in a controlled procedure that
+    says no such thing, carrying a citation that looks legitimate.
+    """
+    verdict = verify_claim(
+        "Press the red E-STOP button and then call the fire department.",
+        sop, STEP2_SPAN)
+
+    assert verdict.ok is False
+    assert verdict.detail["added_clause_words"] == ["call", "fire", "department"]
+    added_reason = [r for r in verdict.reasons if "adds an action" in r]
+    assert added_reason, verdict.reasons
+    for word in ("call", "fire", "department"):
+        assert word in added_reason[0]
+
+
+def test_an_added_clause_is_caught_even_when_the_ratio_would_pass(sop):
+    """Rule (3c) is independent of the ratio, not a restatement of it."""
+    verdict = verify_claim(
+        "Press the red emergency stop button located at your nearest "
+        "workstation and notify the fire marshal.", sop, STEP2_SPAN)
+
+    assert verdict.detail["content_word_overlap"] >= MIN_CONTENT_WORD_OVERLAP
+    assert verdict.ok is False
+    assert verdict.detail["added_clause_words"] == ["notify", "fire", "marshal"]
+
+
+def test_an_elaboration_of_supported_material_is_not_an_added_step(sop):
+    """A clause after "and" with even one supported word is not an addition."""
+    verdict = verify_claim(
+        "The emergency stop will cut power to all moving equipment and audible "
+        "alarms will activate.", sop, STEP2_SPAN)
+    assert verdict.detail["added_clause_words"] == []
+    assert verdict.ok is True, verdict.reasons
+
+
+def test_known_blind_spot_added_clause_built_from_present_words(sop):
+    """DOCUMENTED LIMITATION, asserted so it cannot change silently.
+
+    The added-step rule fires only when EVERY content word of the added clause
+    is missing from the excerpt. Step 2 says nothing about notifying anyone,
+    but "line" appears in the cited window ("production line"), so the clause
+    is read as an elaboration and the sentence passes. Recombining the
+    document's own vocabulary into an instruction it never gives is a failure
+    a lexical check cannot see. See docs/LLM.md, "What the check cannot catch",
+    and note that this is a standing reason SME approval is mandatory.
+    """
+    verdict = verify_claim(
+        "Press the red emergency stop button and then notify the Line "
+        "Supervisor.", sop, STEP2_SPAN)
+    assert verdict.ok is True
+    assert verdict.detail["unsupported_words"] == ["notify", "supervisor"]
+    assert verdict.detail["added_clause_words"] == []
+
+
+def test_known_blind_spot_swapped_actor(sop):
+    """DOCUMENTED LIMITATION: the document assigns Form MS-101 to the Line
+    Supervisor, not the Safety Officer, but both roles are the document's own
+    vocabulary and the swap is semantic, not lexical."""
+    verdict = verify_claim(
+        "The Safety Officer must complete an Emergency Shutdown Report within "
+        "30 minutes of the event.", sop, STEP5_SPAN)
+    assert verdict.ok is True
+    assert verdict.detail["unsupported_words"] == ["safety", "officer"]
+
+
+def test_named_terms_do_not_buy_extra_unsupported_words(sop):
+    """The defined-terms alternative must not override the absolute cap."""
+    verdict = verify_claim(
+        "The Line Supervisor files the Emergency Shutdown Report on Form "
+        "MS-101 whenever Maintenance escalates a Category Four stoppage.",
+        sop, STEP5_SPAN)
+    assert verdict.ok is False
+    assert len(verdict.detail["unsupported_words"]) > MAX_UNSUPPORTED_CONTENT_WORDS
+    assert any("limit {0}".format(MAX_UNSUPPORTED_CONTENT_WORDS) in reason
+               for reason in verdict.reasons)
 
 
 def test_claim_with_an_out_of_range_span_is_rejected(sop):
@@ -426,8 +544,8 @@ def test_anthropic_provider_maps_sdk_errors_to_reasons():
 # enhance_module
 # ---------------------------------------------------------------------------
 GOOD_OBJECTIVE = (
-    "Apply the emergency assessment rule by determining whether immediate "
-    "evacuation is required and alerting nearby personnel."
+    "Assess the nature and severity of an emergency and determine whether "
+    "immediate evacuation is required."
 )
 
 
@@ -897,7 +1015,7 @@ def test_cli_llm_flag_writes_the_enhancement_report(tmp_path, monkeypatch):
     assert "SME must review" in result.output
 
     exported = json.loads((output_dir / "training.json").read_text(encoding="utf-8"))
-    assert exported["training_module"]["learning_objectives"][1].startswith("Apply")
+    assert exported["training_module"]["learning_objectives"][1] == GOOD_OBJECTIVE
 
 
 def test_cli_without_the_flag_writes_no_report(tmp_path, monkeypatch):

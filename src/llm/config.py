@@ -39,6 +39,23 @@ DEFAULT_MAX_TOKENS = 16000
 DEFAULT_TIMEOUT_SECONDS = 120.0
 DEFAULT_MAX_RETRIES = 2
 
+#: Fraction of a generated sentence's content words that must appear in the
+#: cited excerpt.  Raised from 0.5 to 0.7 after an adversarial pass found that
+#: an invented clause riding on an otherwise-grounded sentence ("Press the red
+#: E-STOP button and then call the fire department") cleared a 50% bar: the
+#: supported half paid for the invented half.  Lexical grounding cannot tell an
+#: added instruction from a paraphrase, so the check fails CLOSED - a false
+#: rejection only keeps the deterministic original, a false acceptance puts an
+#: invented instruction into regulated training.
+MIN_CONTENT_WORD_OVERLAP = 0.7
+
+#: Absolute cap on how many of a sentence's content words may be missing from
+#: the cited excerpt, regardless of the ratio.  A ratio alone scales with
+#: sentence length - a long sentence can carry several invented words and still
+#: look well-grounded - so this bounds the absolute amount of unsupported
+#: material in any single sentence.
+MAX_UNSUPPORTED_CONTENT_WORDS = 3
+
 ENV_ENABLE = "TRAINING_CREATOR_LLM"
 ENV_MODEL = "TRAINING_CREATOR_LLM_MODEL"
 ENV_API_KEY = "ANTHROPIC_API_KEY"
@@ -57,7 +74,11 @@ class LLMConfig:
     max_retries: int = DEFAULT_MAX_RETRIES
     #: Fraction of a generated sentence's content words that must appear in the
     #: cited excerpt.  See :func:`src.llm.grounding.verify_claim`.
-    min_overlap: float = 0.5
+    min_overlap: float = MIN_CONTENT_WORD_OVERLAP
+    #: Absolute cap on unsupported content words in one sentence.  Checked
+    #: independently of ``min_overlap``, and not waived by the
+    #: capitalised/defined-terms alternative.
+    max_unsupported_words: int = MAX_UNSUPPORTED_CONTENT_WORDS
     #: A generated sentence longer than this is rejected unread: training prose
     #: that runs past it is not a summary sentence, it is a paragraph.
     max_sentence_chars: int = 300
@@ -116,6 +137,7 @@ class LLMConfig:
             "timeout_seconds": self.timeout,
             "max_retries": self.max_retries,
             "min_content_word_overlap": self.min_overlap,
+            "max_unsupported_content_words": self.max_unsupported_words,
             "max_sentence_chars": self.max_sentence_chars,
             "notes": list(self.notes),
         }

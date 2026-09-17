@@ -81,9 +81,10 @@ re-run — see below.
 
 ## What the grounding check rejects
 
-`src/llm/grounding.py`. Four cheap, explainable tests a reviewer can re-run by
+`src/llm/grounding.py`. Six cheap, explainable tests a reviewer can re-run by
 eye — deliberately not a second model grading the first, because a model
-judging a model is the black box QA/RA will not accept.
+judging a model is the black box QA/RA will not accept. Read the next section
+too: knowing what these tests *cannot* see is part of using them honestly.
 
 For a generated **claim** (`verify_claim`):
 
@@ -97,12 +98,49 @@ For a generated **claim** (`verify_claim`):
    highest-value test in the file: a hallucinated figure in a controlled
    procedure is the failure mode that ends the company in this market.
 3. **The wording must come from the source.** After NFKC normalisation,
-   case-folding, punctuation stripping and stopword removal, at least **50%**
-   of the sentence's content words must appear in the cited excerpt — *or*
-   every capitalised and defined term in the sentence must. A plausible-sounding
-   addition ("operators must wear insulated gloves") scores near zero and is
-   rejected.
-4. **Shape.** Non-empty, and at most 300 characters (objectives: 200).
+   case-folding, punctuation stripping and stopword removal, at least
+   **70%** (`MIN_CONTENT_WORD_OVERLAP`) of the sentence's content words must
+   appear in the cited excerpt — *or* every capitalised and defined term in
+   the sentence must. A plausible-sounding addition ("operators must wear
+   insulated gloves") scores near zero and is rejected.
+4. **At most 3 unsupported content words** (`MAX_UNSUPPORTED_CONTENT_WORDS`),
+   whatever the ratio says. A ratio scales with sentence length — a long
+   sentence can carry several invented words and still look well-grounded — so
+   this bounds the absolute amount of unsupported material. The defined-terms
+   alternative in rule 3 does **not** waive it: packing a sentence with the
+   document's own named terms must not buy the right to four invented words.
+5. **No added steps.** A clause introduced by *and, then, also, before, after,
+   additionally, furthermore, plus, next, afterwards, subsequently* whose
+   content words are **all** absent from the excerpt is treated as an invented
+   action, condition or actor, and rejected with those words named in the
+   reason. A clause with even one supported word is an elaboration, not an
+   addition, and passes.
+6. **Shape.** Non-empty, and at most 300 characters (objectives: 200).
+
+Rules 4 and 5 exist because of a real adversarial finding, not a hypothetical.
+At the original 50% bar,
+
+> *"Press the red E-STOP button and then call the fire department."*
+
+cited against the step it half-quotes was **accepted**: the faithfully quoted
+first half paid for the invented second half, and the output was an instruction
+to call the fire department in a procedure that says no such thing — carrying a
+citation that looked legitimate. Lexical grounding cannot tell that from a
+paraphrase, so the check **fails closed**. A false rejection only keeps the
+deterministic original; a false acceptance puts an invented instruction into
+regulated training.
+
+The cost of failing closed is that fluent paraphrases are rejected too:
+
+> *"Hit the emergency stop control closest to you; all moving equipment loses
+> power within five seconds."*
+
+is rejected (58% overlap, 5 unsupported words) even though it is *true*. That
+is the intended behaviour, not a bug to tune away — the prompts ask for the
+document's own wording, and the deterministic text is a perfectly good
+fallback. Note also that "five seconds" would sail past the numbers rule, since
+the document writes "5 seconds": the wording rules are not optional decoration
+on top of rule 2.
 
 For a proposed **distractor** (`verify_distractor`):
 
@@ -118,6 +156,46 @@ For a proposed **distractor** (`verify_distractor`):
   restart until an inspection is documented"* (asserted → rejected) and
   *"Always restart immediately without an inspection"* (contradicted →
   accepted) share most of their words and differ only in polarity.
+
+## What the check cannot catch
+
+Read this section before deciding how much to trust the layer. The grounding
+check is **lexical**. It compares words, and only words, against the lines the
+model cited. It has no model of meaning, and the following get past it:
+
+- **An invented clause assembled from words that do appear in the cited lines.**
+  This is the important one. The added-step rule fires only when *every*
+  content word of the added clause is missing from the excerpt. A sentence like
+  *"Press the red emergency stop button and then notify the Line Supervisor"*,
+  cited against Step 2, passes — "notify", "line" and "supervisor" all appear
+  elsewhere within the cited window — even though Step 2 says nothing about
+  notifying anyone. Recombining the document's own vocabulary into an
+  instruction the document does not give is a failure mode this check cannot
+  see by construction.
+- **A relationship reversed between supported terms.** "The Safety Officer
+  completes Form MS-101" uses only words the document contains; that the
+  document assigns the form to the Line Supervisor is a semantic fact, not a
+  lexical one. The polarity test covers negation and modality ("never" vs
+  "always", "must" vs "may"); it does not cover swapped actors or objects.
+- **A number that is correct in the excerpt but wrong in context** — the rule
+  checks that each figure *appears* in the cited lines, not that it is attached
+  to the right thing.
+- **A claim that is true of the wrong step.** The citation is checked for
+  resolution and support; nothing checks that the model cited the step it was
+  actually asked to summarise.
+- **Omission.** A summary that leaves out the one warning that matters is
+  perfectly grounded and perfectly dangerous.
+
+This is why the framing in this document is not modesty. **The check is a
+filter against the worst and most common failures, not a proof of correctness.
+It is why SME approval remains mandatory, and why the layer is off by default.**
+A reviewer reading `enhancement_report.json` is looking at machine-assisted
+drafts with their citations attached, so that checking them is fast — they are
+not looking at verified content.
+
+If you want a stronger guarantee than this, the honest answer is to keep the
+layer off: the deterministic pipeline's output is already fully traceable, and
+it is what ships when every proposal is rejected.
 
 ## M0's invariants are re-proved, not assumed
 
@@ -199,7 +277,7 @@ traceability.
 | `calls[]` | Per model call: ok, refused, error, token usage. |
 | `token_usage` | Summed input / cache-read / output tokens. |
 | `notes[]` | Configuration notes and the post-enhancement naive-learner re-check result. |
-| `config` | Backend, model, thresholds. **Never the API key.** |
+| `config` | Backend, model, and the thresholds actually applied (`min_content_word_overlap`, `max_unsupported_content_words`, `max_sentence_chars`). **Never the API key.** |
 
 The rejection reasons are the point. "These numbers do not appear in the cited
 lines: 15" is a sentence an SME can act on, and it is the evidence that the

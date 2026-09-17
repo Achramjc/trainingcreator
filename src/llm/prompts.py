@@ -168,7 +168,14 @@ For each one you can genuinely improve, return a replacement that:
   restart are met is `evaluate`);
 - is observable and assessable - what the learner will be able to DO, not what \
   they will "know" or "be aware of";
-- stays within what the cited lines support, in the document's own terms;
+- **reuses the document's own wording.** Build the objective out of the nouns \
+  and verbs on the lines you cite. Do not substitute synonyms for the \
+  document's terms, and do not reach for smoother phrasing that drops them;
+- **adds no action, condition or actor the cited lines do not contain.** Not a \
+  follow-up step, not a precondition, not another role, not a "and then notify \
+  X" - however obvious or sensible it seems. A faithful sentence with one \
+  invented clause appended is the single worst thing you can return here, and \
+  it is checked for explicitly;
 - is one sentence, under 200 characters.
 
 Keep the `index` of the objective you are replacing. Leave out any objective \
@@ -237,8 +244,17 @@ the procedure is about and what it requires of them.
 Each sentence is cited separately with its own `[start, end]` span, and each is \
 checked against those lines on its own: one unsupported sentence rejects the \
 whole summary for that section, so keep every sentence tight to the text you \
-cite. Plain sentences only - no HTML, no markdown, no lists. Under 300 \
-characters per sentence.
+cite.
+
+Reuse the document's own wording - build each sentence from the nouns and verbs \
+on the lines you cite, rather than restating them in smoother language. Add no \
+action, condition or actor the cited lines do not contain: no extra step, no \
+precondition the document does not state, no role it does not name. A sentence \
+that quotes the procedure faithfully and then appends one invented clause is \
+the worst possible output here, and it is checked for explicitly.
+
+Plain sentences only - no HTML, no markdown, no lists. Under 300 characters per \
+sentence.
 
 Skip any section you cannot summarise from the document (an introduction whose \
 content is only a title block, for instance). Use the section ids exactly as \
