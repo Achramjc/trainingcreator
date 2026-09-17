@@ -91,6 +91,39 @@ program on. The blocking gaps, verified in the code:
   (`README.md:15`). Neither exists anywhere in the codebase.
 - README claims compatibility with six named LMS platforms with no conformance test behind it.
 
+## Status — M0 complete (2026-09-17)
+
+Verified on the merged tree, not by assertion:
+
+- **Naive learners fail.** The worst any fixed strategy scores — always option 1/2/3/4, always
+  last, always True, always the longest option, always the shortest — is **60%**, against pass
+  marks of 70% (standard) and 80% (medical device). Measured independently of the test suite on
+  both shipped fixtures, both generators, 5–12 questions. Before M0 the answer was 100%.
+  `tests/test_assessments.py` asserts this property against each assessment's own passing score.
+- **No answer key in the package.** Learner-facing files carry only a per-question salt and a
+  salted SHA-256 of the normalised correct text; `correct_answer` and `explanation` never leave
+  Python. Verified in a real headless Chromium run on both code paths the shipped JavaScript can
+  take (`crypto.subtle` over http://localhost, pure-JS fallback over `file://`): always-first
+  fails, all-correct passes. Honest limit, documented in `src/answer_key.py` and `metadata.json`:
+  a learner with dev tools can hash the 2–4 displayed options against the public salt; server-side
+  scoring is M2.
+- **Content fidelity.** Every step now carries its full body, sub-steps, and `source_lines`;
+  definitions, responsibilities, purpose and scope parse from their sections; numbered
+  conventions (`4.1`, `4.2`, `4.10`) work. 458 pytest assertions replace two print scripts that
+  could not fail; CI runs them on Python 3.10–3.12.
+- **Platform hygiene.** Secret and debug flag from the environment, signed and expiring download
+  links, path containment, JSON 413s, source documents deleted after processing, 24h output
+  retention. README no longer claims xAPI, customizable templates, or tested LMS compatibility.
+- **Minimum assessment length is now 5.** A three-question quiz with one double-weighted item
+  cannot be made ungameable by layout; the generator, API and CLI refuse rather than pretend.
+
+Carried into M1/M2 from this pass: server-side scoring (the only real fix for the static-package
+limit); the SME JSON export legitimately contains the key and sits on disk for the retention
+window — it should move behind an ownership check; internal exception text still reaches API
+error responses; a bare ALL-CAPS line inside a step body is mistaken for a section heading;
+three-level numbering (`4.1.1`) falls through to the integer pattern. `source_lines` and
+`source_ref` on every step and question are the groundwork for M1's citation coverage metric.
+
 ## Milestones
 
 ### M0 — Make it honest and correct *(blocking; nothing else matters first)*

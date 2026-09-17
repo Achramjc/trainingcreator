@@ -107,7 +107,12 @@ def test_download_requires_token(client, sample_sop_path):
     assert stripped_resp.status_code == 403
 
     # Tamper with the token.
-    tampered_url = download_url[:-1] + ("x" if download_url[-1] != "x" else "y")
+    # Flip a character well inside the signature, not the last one: the final
+    # base64url character of an itsdangerous token has slack bits, so several
+    # values decode to the same HMAC byte and the "tampered" link would still
+    # verify roughly 7% of the time.
+    cut = len(download_url) - 8
+    tampered_url = download_url[:cut] + ("x" if download_url[cut] != "x" else "y") + download_url[cut + 1:]
     tampered_resp = client.get(tampered_url)
     assert tampered_resp.status_code == 403
 
