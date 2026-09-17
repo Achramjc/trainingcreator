@@ -25,7 +25,8 @@ src/assessments.py     AssessmentGenerator / MedicalDeviceAssessmentGenerator �
                        joint answer-position search; min 5 questions)
 src/answer_key.py      salted-hash learner keys + the client-side verifier JS (Python and JS
                        normalisers must stay identical — change both or neither)
-src/scorm_exporter.py  manifest + content pages + assessment.html (learner payload only) + zip
+src/scorm_exporter.py  two distinct CAM bindings (1.2 / 2004 4th Ed), one API wrapper that finds
+                       API or API_1484_11 through frames, content pages, assessment.html, zip
 src/transparency_report.py  SME/auditor report (HTML + JSON): citation coverage, approval record
 src/serialization.py   rebuild model objects from their to_dict() JSON (review round-trips)
 src/llm/               optional grounded LLM layer (config, provider, prompts, grounding, enhance);
@@ -51,6 +52,9 @@ app.py                 Flask API: upload → generate → job.json → signed do
 - **Every generated sentence cites source lines.** Objectives, sections and questions carry
   `source_ref`; the transparency report measures coverage. LLM output that fails grounding is
   dropped in favour of the deterministic original. `tests/test_transparency.py`, `tests/test_llm.py`.
+- **SCORM packages are schema-valid and run against a fake LMS on both API surfaces.**
+  `tests/conformance/` (manifests against ADL's vendored XSDs; runtime in Chromium, SCO two frames
+  below the API window). No real LMS has been tested — say so.
 - **Don't claim what isn't tested.** README/USAGE_GUIDE/DEPLOYMENT describe only what exists.
 
 ## Working conventions
@@ -70,7 +74,7 @@ app.py                 Flask API: upload → generate → job.json → signed do
 | 2026-09-16 | Goal defined | done | `GOAL.md` |
 | 2026-09-17 | **M0 — honest and correct** | **done** | 458 tests; naive worst 60% vs 70/80 pass; no key in package; both browser hash paths verified; CI on 3.10–3.12 |
 | 2026-09-17 | **M1 — content an SME would sign (machinery)** | **built; pilot exit criterion open** | 615 tests; provenance on every field, 95% citation coverage on fixtures (only the 2 compliance questions uncited by design); Bloom's objectives; SME review/edit/approve with server-owned answer layout; approval in package + report; grounded LLM layer off by default, fails closed. The "<30% SME edits across 20 real SOPs from 3 pilots" exit needs real customers — not measurable here |
-| 2026-09-17 | **Pilot hardening** (owner's call: pilot M1 before M2) | in progress | streams: pilot metrics (`edits_by_category`, edit rate, `/pilot`); six-regime sample-SOP gallery wired into the invariant sweep; SCORM 1.2/2004 conformance harness (manifest rules + fake-LMS runtime in Chromium) |
+| 2026-09-17 | **Pilot hardening** (owner's call: pilot M1 before M2) | **done** | 1203 tests. `/pilot` metrics with the edit-rate definition; six-regime gallery in the invariant sweep (worst naive strategy 62.5% across 8 documents); SCORM harness found the "2004" package was a 1.2 manifest with a 1.2 runtime, an API-discovery loop that hung inside frames, re-launch overwriting a pass, and no `LMSFinish` — all fixed and pinned by tests. Still open: no `cmi.interactions` (per-question evidence for auditors), no real-LMS import |
 | — | M2 — real application (accounts, DB, workers, server-side scoring) | on hold | owner chose to pilot M1 first |
 | — | M3 — compliance-grade (audit trail, Part 11, revision-delta retraining, validation pack) | not started | |
 | — | M4 — market | not started | |

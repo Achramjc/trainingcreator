@@ -89,7 +89,8 @@ program on. The blocking gaps, verified in the code:
 **Truth in advertising**
 - README advertises **xAPI (Tin Can)** output (`README.md:84`) and **customizable templates**
   (`README.md:15`). Neither exists anywhere in the codebase.
-- README claims compatibility with six named LMS platforms with no conformance test behind it.
+- README claimed compatibility with six named LMS platforms with no conformance test behind it
+  (removed in M0; replaced in the pilot-hardening pass by an XSD + fake-LMS harness — still no real LMS import).
 
 ## Status — M0 complete (2026-09-17)
 
@@ -129,6 +130,20 @@ actions and low-overlap text — a filter, not a proof; `docs/LLM.md` lists what
 What is *not* done: the exit criterion ("SMEs accept with <30% edits across 20 real SOPs from 3
 pilot customers") requires real customers and real SOPs. The `edits_count` the approval records
 is the instrument for measuring it.
+
+**Pilot hardening (2026-09-17).** Instrumentation for the M1 exit criterion (`/pilot`, edit rate
+defined as edits over editable items across approved jobs); a six-regime sample gallery (medical
+device, pharma, food, aerospace, clinical lab, general manufacturing) that now runs through every
+invariant test — worst naive strategy 62.5% across all eight documents; and a SCORM conformance
+harness that validates both manifests against ADL's official XSDs and drives the package in a
+fake LMS in Chromium on both API surfaces. That harness found the "SCORM 2004" output had been a
+1.2 manifest with a 1.2 runtime and a version string — non-functional in any 2004 LMS — plus an
+API-discovery loop that never terminated inside frames without an LMS, a re-launch that
+overwrote a pass with "incomplete", and a missing `LMSFinish`. All fixed; each defect is pinned by
+a negative test. Criterion 4 is now *partly* met: schema-valid and runtime-verified against a
+fake LMS, not against a real one or ADL's test suite. The remaining gap that matters to the
+regulated buyer: the package reports a score and a status, not per-question evidence
+(`cmi.interactions`) — see `docs/SCORM_CONFORMANCE.md`.
 
 Carried into M1/M2 from this pass: server-side scoring (the only real fix for the static-package
 limit); the SME JSON export legitimately contains the key and sits on disk for the retention

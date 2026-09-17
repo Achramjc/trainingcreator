@@ -138,7 +138,9 @@ python -m src.cli -i sop.txt -o ./output -f scorm1.2
 - Creates ZIP file ready to upload to any SCORM 1.2-conformant LMS
 - Tracks completion and scores
 
-### SCORM 2004
+### SCORM 2004 (4th Edition)
+
+Both package types are validated against ADL's official XSDs and driven in a fake LMS in CI on their own API surfaces (`API` for 1.2, `API_1484_11` for 2004); see `docs/SCORM_CONFORMANCE.md` for exactly what is and is not verified. No named LMS has been tested.
 ```bash
 python -m src.cli -i sop.txt -o ./output -f scorm2004
 ```
