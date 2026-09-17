@@ -46,6 +46,7 @@ from src.medical_device_config import MEDICAL_DEVICE_CONFIG
 from src.llm import LLMConfig, enhance_assessment, enhance_module, merge_reports
 from src.llm import build_provider as build_llm_provider
 from src.serialization import sop_from_dict, module_from_dict, assessment_from_dict
+from src.pilot_metrics import collect as collect_pilot_metrics
 
 app = Flask(__name__)
 
@@ -283,6 +284,110 @@ def _count_edits(original, edited):
             total += _count_edits(o, e)
         return total
     return 0 if original == edited else 1
+
+
+#: The five leaf categories `edits_by_category` breaks `edits_count` into,
+#: plus `title`. Every job.json (from the first upload onward) carries this
+#: dict with all six keys present, so pilot_metrics.collect() never has to
+#: guess about a missing key.
+_EDIT_CATEGORY_KEYS = (
+    'title', 'objectives', 'sections', 'questions', 'question_options', 'question_answers',
+)
+
+
+def _zero_edit_categories():
+    return {key: 0 for key in _EDIT_CATEGORY_KEYS}
+
+
+def _correct_option_text(question):
+    """The text of `question`'s correct option, or None if that can't be
+    determined (missing/malformed options or correct_answer).
+
+    Used to compare *which fact is asserted correct* across an edit, rather
+    than *which index* is marked correct - `_relayout_assessment_answers`
+    re-shuffles option order on every save, so comparing indices across a
+    save would count the server's own layout as an SME edit.
+    """
+    if not isinstance(question, dict):
+        return None
+    options = question.get('options')
+    correct = question.get('correct_answer')
+    if not isinstance(options, list) or isinstance(correct, bool) or not isinstance(correct, int):
+        return None
+    if not (0 <= correct < len(options)):
+        return None
+    return options[correct]
+
+
+def _count_edits_by_category(draft_module, module_dict, draft_assessment, assessment_dict):
+    """Break `_count_edits`'s single total down by what kind of content
+    changed, comparing (like `_count_edits`) the SME's raw submission
+    against the untouched draft.
+
+    Returns a dict with exactly `_EDIT_CATEGORY_KEYS`:
+    - `title`: 1 if the module title text changed, else 0.
+    - `objectives`: leaf diffs (`_count_edits`) within `learning_objectives`.
+    - `sections`: leaf diffs within `sections` (title, content, id, ... all
+      count, matched by list position - same semantics as the top-level
+      `edits_count`).
+    - `questions`: leaf diffs within each question *excluding* `options` and
+      `correct_answer` (text, type, explanation, points, ... - those two
+      fields are broken out below instead), matched by question list
+      position.
+    - `question_options`: leaf diffs within each question's `options` list,
+      matched by position - i.e. option *text* rewrites. Moving which option
+      is correct without changing any option's wording contributes 0 here.
+    - `question_answers`: 1 per question whose correct option's *text*
+      (`_correct_option_text`) differs between draft and submission, however
+      that happened - the SME picking a different existing option as
+      correct, or rewriting the text of the option that was already correct.
+      Compared by text, not index, so the server's own answer-position
+      layout (which runs *after* this count, in `_relayout_assessment_answers`)
+      can never itself register as an edit.
+
+    Questions added or removed between draft and submission (a list-length
+    change) are counted in full, undifferentiated, under `questions` - the
+    pilot's synthetic-fixture tests don't exercise this path, and a whole
+    added/removed question is an edge case rare enough in real review
+    sessions not to warrant its own category.
+    """
+    categories = _zero_edit_categories()
+
+    draft_module = draft_module if isinstance(draft_module, dict) else {}
+    module_dict = module_dict if isinstance(module_dict, dict) else {}
+    categories['title'] = _count_edits(draft_module.get('title'), module_dict.get('title'))
+    categories['objectives'] = _count_edits(
+        draft_module.get('learning_objectives'), module_dict.get('learning_objectives'))
+    categories['sections'] = _count_edits(draft_module.get('sections'), module_dict.get('sections'))
+
+    draft_assessment = draft_assessment if isinstance(draft_assessment, dict) else {}
+    assessment_dict = assessment_dict if isinstance(assessment_dict, dict) else {}
+    draft_questions = draft_assessment.get('questions')
+    new_questions = assessment_dict.get('questions')
+    draft_questions = draft_questions if isinstance(draft_questions, list) else []
+    new_questions = new_questions if isinstance(new_questions, list) else []
+
+    for i in range(max(len(draft_questions), len(new_questions))):
+        old_q = draft_questions[i] if i < len(draft_questions) else _ABSENT
+        new_q = new_questions[i] if i < len(new_questions) else _ABSENT
+        if old_q is _ABSENT or new_q is _ABSENT:
+            categories['questions'] += _count_edits(old_q, new_q)
+            continue
+
+        old_fields = {k: v for k, v in old_q.items() if k not in ('options', 'correct_answer')} \
+            if isinstance(old_q, dict) else old_q
+        new_fields = {k: v for k, v in new_q.items() if k not in ('options', 'correct_answer')} \
+            if isinstance(new_q, dict) else new_q
+        categories['questions'] += _count_edits(old_fields, new_fields)
+
+        old_options = old_q.get('options') if isinstance(old_q, dict) else None
+        new_options = new_q.get('options') if isinstance(new_q, dict) else None
+        categories['question_options'] += _count_edits(old_options, new_options)
+
+        if _correct_option_text(old_q) != _correct_option_text(new_q):
+            categories['question_answers'] += 1
+
+    return categories
 
 
 def _validate_module_dict(data):
@@ -679,6 +784,11 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
             'training_module': training_module.to_dict(),
             'assessment': assessment.to_dict(),
             'edits_count': 0,
+            'edits_by_category': _zero_edit_categories(),
+            'edit_rounds': 0,
+            'review_opened_at': None,
+            'first_edit_at': None,
+            'approved_at': None,
             'approval': None,
             'llm_enhancement': llm_summary,
         }
@@ -838,6 +948,10 @@ def review_page(job_id):
     if job is None:
         return 'Job not found', 404
 
+    if job.get('review_opened_at') is None:
+        job['review_opened_at'] = _utcnow_iso()
+        _atomic_write_json(_job_json_path(job_id), job)
+
     sop = job.get('sop_content') or {}
     source_lines = (sop.get('raw_content') or '').splitlines()
 
@@ -907,6 +1021,8 @@ def review_submit(job_id):
         _count_edits(draft.get('training_module'), module_dict)
         + _count_edits(draft.get('assessment'), assessment_dict)
     )
+    edits_by_category = _count_edits_by_category(
+        draft.get('training_module'), module_dict, draft.get('assessment'), assessment_dict)
 
     sop_content = sop_from_dict(job.get('sop_content'))
     training_module = module_from_dict(module_dict)
@@ -923,12 +1039,18 @@ def review_submit(job_id):
         return jsonify({'error': _naive_failure_message(
             naive_failures[0], assessment.passing_score)}), 400
 
+    now = _utcnow_iso()
     job['training_module'] = module_dict
     job['assessment'] = assessment.to_dict()
     job['status'] = 'edited'
     job['edits_count'] = edits_count
+    job['edits_by_category'] = edits_by_category
+    job['edit_rounds'] = int(job.get('edit_rounds', 0) or 0) + 1
+    if job.get('first_edit_at') is None:
+        job['first_edit_at'] = now
     job['approval'] = None  # content changed - any prior approval no longer applies
-    job['updated_at'] = _utcnow_iso()
+    job['approved_at'] = None
+    job['updated_at'] = now
     _atomic_write_json(_job_json_path(job_id), job)
 
     req = job.get('request', {})
@@ -944,6 +1066,8 @@ def review_submit(job_id):
         'job_id': job_id,
         'status': job['status'],
         'edits_count': edits_count,
+        'edits_by_category': edits_by_category,
+        'edit_rounds': job['edit_rounds'],
         # The re-laid-out assessment (server-owned answer positions applied),
         # so the review page can re-render option order without a reload.
         'assessment': assessment.to_dict(),
@@ -1018,6 +1142,7 @@ def approve_job(job_id):
 
     job['approval'] = approval
     job['status'] = 'approved'
+    job['approved_at'] = approval['approved_at']
     job['updated_at'] = _utcnow_iso()
     _atomic_write_json(_job_json_path(job_id), job)
 
@@ -1056,6 +1181,69 @@ def approve_job(job_id):
             'draft_watermarks_added': False,
         },
     }), 200
+
+
+# --- Pilot metrics --------------------------------------------------------
+# GOAL.md's M1 exit criterion ("SMEs accept generated content with <30%
+# edits") needs measurement across real pilot SMEs and SOPs; these two
+# routes are that instrumentation. Both are disabled (404, not merely
+# unauthorized) unless PILOT_METRICS_TOKEN is set in the environment, so a
+# default deployment never exposes SME edit data - which can include
+# free-text approval notes - to an unauthenticated caller.
+
+def _check_pilot_token():
+    """Return None if the request is authorized for the pilot metrics
+    routes, else an (error_message, status_code) pair - 404 if the feature
+    is disabled (no PILOT_METRICS_TOKEN configured), 403 if a token was
+    required but the one supplied (bearer header or `?token=`) doesn't
+    match."""
+    configured = os.environ.get('PILOT_METRICS_TOKEN')
+    if not configured:
+        return ('Not found', 404)
+
+    provided = request.args.get('token')
+    if not provided:
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            provided = auth_header[len('Bearer '):]
+
+    if not provided or not secrets.compare_digest(provided, configured):
+        return ('Forbidden', 403)
+
+    return None
+
+
+@app.route('/pilot/metrics')
+def pilot_metrics_json():
+    """JSON aggregate pilot metrics (see src/pilot_metrics.py for the exact
+    shape and the edit-rate definition)."""
+    token_error = _check_pilot_token()
+    if token_error:
+        message, status = token_error
+        return jsonify({'error': message}), status
+
+    metrics = collect_pilot_metrics(app.config['OUTPUT_FOLDER'])
+    return jsonify(metrics), 200
+
+
+@app.route('/pilot')
+def pilot_dashboard():
+    """Server-rendered pilot dashboard: the same aggregates as
+    /pilot/metrics, plus a per-job table linking to each job's review page
+    (tokens minted the same way /api/upload mints them)."""
+    token_error = _check_pilot_token()
+    if token_error:
+        message, status = token_error
+        return message, status
+
+    metrics = collect_pilot_metrics(app.config['OUTPUT_FOLDER'])
+    review_urls = {}
+    for job in metrics.get('jobs', []):
+        job_id = job.get('job_id')
+        if job_id:
+            review_urls[job_id] = f"/review/{job_id}?t={generate_download_token(job_id)}"
+
+    return render_template('pilot.html', metrics=metrics, review_urls=review_urls)
 
 
 @app.route('/health')

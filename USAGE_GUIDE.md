@@ -6,10 +6,11 @@
 3. [Input Formats](#input-formats)
 4. [Output Formats](#output-formats)
 5. [SME Review and Approval (Web App)](#sme-review-and-approval-web-app)
-6. [Advanced Usage](#advanced-usage)
-7. [LMS Upload Instructions](#lms-upload-instructions)
-8. [Customization](#customization)
-9. [Troubleshooting](#troubleshooting)
+6. [Running a Pilot](#running-a-pilot)
+7. [Advanced Usage](#advanced-usage)
+8. [LMS Upload Instructions](#lms-upload-instructions)
+9. [Customization](#customization)
+10. [Troubleshooting](#troubleshooting)
 
 ## Installation
 
@@ -246,6 +247,88 @@ the thing being reviewed has changed - it needs a fresh sign-off.
 The review and approval endpoints reuse the same signed, expiring token as
 downloads (`DOWNLOAD_TTL_SECONDS`), so a review link works for exactly as
 long as a download link does.
+
+## Running a Pilot
+
+GOAL.md's M1 exit criterion is **SMEs accept generated content with <30% edits across 20 real
+SOPs from 3 pilot customers** - not something you can measure without real customers reviewing
+real SOPs. This section is that pilot's instrumentation and protocol.
+
+### What's measured
+
+Every job already carries what a pilot needs, written into `job.json` as review happens:
+`edits_count` (the flat total, unchanged), `edits_by_category` (how much of the edit landed in
+`title`, `objectives`, `sections`, `questions`, `question_options`, or `question_answers`),
+`edit_rounds` (how many times **Save edits** was clicked), and the timestamps
+`review_opened_at`, `first_edit_at`, and `approved_at`. `src/pilot_metrics.py` turns a directory
+of these into aggregates - see its module docstring for the exact **edit rate** definition (the
+number to compare against the <30% target): the weighted ratio of edits made to the size of the
+reviewable content, computed only over *approved* jobs.
+
+### 1. Turn it on
+
+Set `PILOT_METRICS_TOKEN` in the environment before starting `app.py`. This is off by default -
+with no token configured, `/pilot` and `/pilot/metrics` both return `404` (not `403`), so a
+default deployment never exposes SME edit data:
+
+```bash
+export PILOT_METRICS_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python3 app.py
+```
+
+Keep this token as secret as a password - it reads every job's content and every reviewer's
+approval notes across the whole output folder, not just one job.
+
+### 2. Run the pilot
+
+The recommended protocol, echoing GOAL.md's target ("20 real SOPs from 3 pilot customers"):
+
+1. Pick 3-5 real, controlled SOPs from the customer(s) piloting the tool - the more
+   representative of their actual document set, the more the result means.
+2. Send the **same** SOPs to each of your 2-3 SMEs, so the per-source-document breakdown (see
+   below) is actually comparing like with like.
+3. Ask each SME to open their `review_url`, decide whether each objective, section, and question
+   is right as generated, edit anything that isn't, and **Approve**.
+4. Tell them not to discuss their review with the other SMEs before finishing - the point is to
+   measure how the *generated* content lands with an independent expert, not the result of a
+   group edit.
+5. Do not coach anyone toward "fewer edits." An SME who would edit something should edit it;
+   suppressing that would make the number meaningless.
+
+### 3. Read the results
+
+Visit `/pilot?token=<PILOT_METRICS_TOKEN>` for a dashboard (aggregates, edits-by-category,
+a per-source-document table, and a per-job table linking to each job's review page), or
+`GET /pilot/metrics?token=<PILOT_METRICS_TOKEN>` for the same data as JSON. From the command
+line against the same `OUTPUT_FOLDER` the app is using:
+
+```bash
+python3 -m src.pilot_metrics ./outputs
+python3 -m src.pilot_metrics ./outputs --json   # for scripting / a spreadsheet import
+```
+
+**What the numbers mean:**
+- **Edit rate** (the headline number): the fraction of the reviewable content (objectives,
+  sections, and questions' text/options/answers) that differed between what the model generated
+  and what an SME actually approved, averaged across every approved job with the approved jobs
+  weighted by how much content they had. **GOAL.md's M1 exit criterion is met when this is
+  below 30%.**
+- **Approval rate**: how many jobs opened for review ended up approved at all (a job an SME
+  never approves is a stronger signal than a high edit rate on one they did).
+- **Edits by category**: where the edits land - a pilot dominated by `sections` edits points at
+  the generator's content fidelity; one dominated by `question_answers`/`question_options`
+  points at distractor or blueprint quality; `title`/`objectives` edits are typically the
+  cheapest to fix.
+- **Per-source-document breakdown**: since the same SOP is meant to go to multiple SMEs, a wide
+  spread in edit rate *for the same document* is itself informative - it may mean the SOP is
+  ambiguous, or that SME judgment genuinely varies, more than it means the generator is wrong.
+- **Median time to approve**: from job creation to approval - a rough proxy for how much of the
+  "4-8 hours per SOP" GOAL.md cites this actually saves, once a real pilot has enough approved
+  jobs to make a median meaningful.
+
+Twenty SOPs and three SMEs is a small sample - treat single-digit-job numbers as directional,
+not final, and prefer the per-category and per-source-document breakdowns over the single
+headline percentage when deciding what to fix next.
 
 ## Advanced Usage
 
