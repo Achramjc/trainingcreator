@@ -33,8 +33,12 @@ Risk levels
 -----------
 ``"high"``
     An instruction-to-AI phrasing, a role/prompt delimiter, or hidden or
-    obfuscated text (zero-width, bidi override, homoglyphs, base64 blob, ANSI
-    escape, stray control characters).  Callers gate the LLM layer on this.
+    obfuscated text (zero-width, invisible/tag characters, bidi override,
+    homoglyphs, base64 blob, ANSI escape, stray control characters).  Callers gate
+    the LLM layer on this.  Phrasing families are verb x object matched across a
+    clause-bounded window, so a synonym does not walk through, and an override
+    phrase preceded by a negation is *not* a finding - "never ignore an audible
+    alarm" is a procedure, "ignore all previous instructions" is not.
 ``"low"``
     URLs, e-mail addresses, renderable markup (``<script``, ``javascript:``,
     ``onclick=``), or a line repeated to excess.  Worth a reviewer's eye; not
@@ -45,8 +49,11 @@ Risk levels
 ``"none"``
     Nothing matched.  All eight documents shipped in this repository
     (``examples/sample_sop*.txt`` and the six ``examples/gallery`` SOPs) must
-    stay at ``"none"``; ``tests/test_injection.py`` asserts it, because a scanner
-    that cries wolf on a real SOP would just get switched off.
+    stay at ``"none"``, and so must a corpus of real web-sourced procedures
+    (``tests/test_injection.py``, ``INJECTION_SCAN_CORPUS_DIR``; last measured:
+    107 documents, 101 none / 6 low / 0 high) - because a scanner that cries wolf
+    on a real SOP would just get switched off.  Widening a pattern means
+    re-measuring against that corpus.
 
 The deterministic pipeline runs regardless of the verdict.  It is regex and
 string slicing: it cannot be talked into anything, its output is escaped
@@ -56,6 +63,8 @@ what gets gated, because a model is the only component here that can be
 persuaded.
 """
 
+import base64
+import binascii
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -85,6 +94,7 @@ KIND_GENERATION_DIRECTIVE = "generation_directive"
 #: correctly".  Also ``high``: hidden text has no legitimate use in a
 #: controlled procedure, and it is how the phrasings above get past a reviewer.
 KIND_ZERO_WIDTH = "zero_width"
+KIND_INVISIBLE_CHARS = "invisible_chars"
 KIND_BIDI_OVERRIDE = "bidi_override"
 KIND_HOMOGLYPH = "homoglyph"
 KIND_BASE64_BLOB = "base64_blob"
@@ -101,6 +111,7 @@ KIND_EVENT_HANDLER = "event_handler"
 KIND_REPETITION = "repetition"
 
 HIGH_KINDS = frozenset({
+    KIND_INVISIBLE_CHARS,
     KIND_INSTRUCTION_OVERRIDE,
     KIND_ROLE_ASSIGNMENT,
     KIND_AI_ADDRESSED,
@@ -145,6 +156,10 @@ KIND_DESCRIPTIONS: Dict[str, str] = {
         "training or quiz content drawn from it should come out.",
     KIND_ZERO_WIDTH:
         "Zero-width characters: text a reviewer cannot see on the page.",
+    KIND_INVISIBLE_CHARS:
+        "Invisible or formatting characters (Unicode tag characters, soft "
+        "hyphens, invisible operators, line/paragraph separators): text that "
+        "carries content a reviewer cannot see.",
     KIND_BIDI_OVERRIDE:
         "Bidirectional override characters: text that displays in an order "
         "other than the one it is stored in.",
@@ -176,73 +191,222 @@ KIND_DESCRIPTIONS: Dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Patterns
 #
-# Every pattern below is tuned against the eight documents in this repository:
-# zero findings on all of them is a hard requirement (tests/test_injection.py),
-# because a scanner that fires on a real SOP gets turned off.  That tuning is
-# why some patterns are narrower than their description: "ignore" needs an
-# instruction-ish object, "reveal" needs a prompt-ish object, and a bare
-# ALL-CAPS heading or a markdown `###` heading is not a role fence.
+# Two forces shape every pattern here, and they pull in opposite directions.
+#
+# *Recall*: an attacker writes prose, not tokens, so a pattern that only matches
+# one phrasing catches one attacker.  The verb/object families below are matched
+# across a window rather than adjacently, so "disregard all earlier guidance"
+# lands the same way "ignore previous instructions" does.
+#
+# *Precision*: zero findings on real procedures is a hard requirement
+# (tests/test_injection.py runs the eight documents this repository ships, a
+# curated list of real procedural sentences, and - when
+# INJECTION_SCAN_CORPUS_DIR is set - a corpus of real web-sourced procedures).
+# A scanner that fires on a real SOP gets switched off, and then it defends
+# nothing.
+#
+# The discriminator that makes both possible is almost always *what the sentence
+# is about*.  A procedure talks about the document's own instructions ("do not
+# ignore the manufacturer's instructions"); an injection talks about the
+# reader's standing instructions ("ignore all previous instructions").  So the
+# override family needs a precedence or possessive qualifier - all, any, earlier,
+# prior, previous, preceding, above, original, your - and not merely an
+# instruction-shaped noun.  Same idea throughout: "state that" must open a
+# clause (not "studies state that"), "AI" must be an addressee (not "the
+# AI-assisted inspection camera"), "###" must be followed by a role word (half
+# the gallery is markdown).
 # ---------------------------------------------------------------------------
+
+#: Verbs an override instruction is built from.  ``set aside`` and ``pay no
+#: attention to`` are multi-word, hence the alternation rather than a word list.
+_OVERRIDE_VERBS = (
+    r"(?:ignor\w*|disregard\w*|forget|override|overrid\w+|bypass\w*|discard\w*|"
+    r"skip|set\s+aside|pay\s+no\s+attention\s+to|do\s+not\s+follow|"
+    r"don'?t\s+follow|no\s+longer\s+follow|never\s+follow|stop\s+following)"
+)
+
+#: Qualifiers that mark the object as *the reader's standing instructions*
+#: rather than the document's own.  Required, and this is the whole reason the
+#: family does not fire on "do not ignore the manufacturer's instructions".
+_OVERRIDE_QUALIFIERS = (
+    r"(?:all|any|every|earlier|prior|previous|preceding|foregoing|above|"
+    r"original|initial|former|old|existing|your)"
+)
+
+#: Nouns that name instructions.  Deliberately wide, because the qualifier above
+#: is carrying the precision.
+_OVERRIDE_OBJECTS = (
+    r"(?:instruction|instructions|guidance|guidelines?|rules?|prompts?|"
+    r"directions?|directives?|context|constraints?|restrictions?|guardrails?|"
+    r"system\s+messages?|training|programming|orders?)"
+)
+
+#: Up to six words may sit between the verb and its object, so the window is
+#: generous but still bounded to one clause (no sentence-ending punctuation).
+_WINDOW = r"(?:[^.;:!?\n]{0,60}?)"
+
 _TEXT_PATTERNS: Tuple[Tuple[str, "re.Pattern"], ...] = (
     # -- instruction-to-AI phrasings ---------------------------------------
+    # verb -> (qualifier) -> object, across a clause-bounded window.
     (KIND_INSTRUCTION_OVERRIDE, re.compile(
-        r"\b(?:ignore|disregard|forget|override|bypass|skip)\b[^.\n]{0,40}?"
-        r"\b(?:instruction|instructions|prompt|prompts|system\s+message|"
-        r"guardrails?|restrictions?)\b",
+        r"\b" + _OVERRIDE_VERBS + r"\b" + _WINDOW
+        + r"\b" + _OVERRIDE_QUALIFIERS + r"\s+(?:\w+\s+){0,2}?"
+        + _OVERRIDE_OBJECTS + r"\b",
+        re.IGNORECASE)),
+    # "…the above", "…everything above/before", "…what you were told".
+    (KIND_INSTRUCTION_OVERRIDE, re.compile(
+        r"\b" + _OVERRIDE_VERBS + r"\b" + _WINDOW
+        + r"\b(?:(?:the|everything|anything|all)\s+"
+          r"(?:above|before|preceding|foregoing|earlier|prior)\b|"
+          r"what\s+you\s+(?:were|have\s+been)\s+told\b|"
+          r"what\s+(?:came|went)\s+before\b)",
+        re.IGNORECASE)),
+    # A fresh instruction block announced as such.
+    (KIND_INSTRUCTION_OVERRIDE, re.compile(
+        r"\bnew\s+(?:instructions?|directive|task|rules?|prompt)\s*[:\-]",
         re.IGNORECASE)),
     (KIND_INSTRUCTION_OVERRIDE, re.compile(
-        r"\b(?:ignore|disregard|forget)\b[^.\n]{0,20}?\b(?:the\s+)?"
-        r"(?:above|preceding|foregoing|everything\s+above)\b",
+        r"\b(?:instead\s+of|rather\s+than)\s+(?:following|obeying)\s+"
+        r"(?:the|your|those|these|all)\b",
         re.IGNORECASE)),
-    (KIND_INSTRUCTION_OVERRIDE, re.compile(
-        r"\bnew\s+(?:instructions?|directive|task|rules)\s*[:\-]", re.IGNORECASE)),
+    # -- role assignment ---------------------------------------------------
+    # "from now on you are …" / "you are now …" / "you are no longer …":
+    # the cue is the *re-assignment*, which is why plain "if you are a nurse"
+    # (very common in real procedures) is not matched.
     (KIND_ROLE_ASSIGNMENT, re.compile(
-        r"\byou\s+are\s+(?:now\b|no\s+longer\b|an?\s+(?:ai\b|assistant\b|"
-        r"language\s+model\b|helpful\b|expert\b|chatbot\b|bot\b))",
+        r"\b(?:from\s+now\s+on|starting\s+now|for\s+the\s+rest\s+of\s+this)\b"
+        r"[^.\n]{0,20}?\byou\s+(?:are|will\s+be|must\s+be|act)\b",
         re.IGNORECASE)),
     (KIND_ROLE_ASSIGNMENT, re.compile(
-        r"\b(?:act|behave|respond|answer)\s+as\s+(?:an?\s+|if\s+you\s+)",
+        r"\byou\s+are\s+(?:now|no\s+longer|hereby|henceforth)\b", re.IGNORECASE)),
+    # "you are DAN", "you are Sydney, a chat mode": a *persona* as the
+    # predicate.  Two narrow shapes only - an ALL-CAPS name (the jailbreak
+    # personas are all shaped like this) or a capitalised name introduced by an
+    # apposition - because "if you are British, use UK spelling" is an ordinary
+    # sentence and must not fire.
+    (KIND_ROLE_ASSIGNMENT, re.compile(
+        r"\b[Yy]ou\s+are\s+(?:an?\s+|the\s+)?(?:[A-Z]{2,}[A-Za-z0-9_-]*)\b")),
+    (KIND_ROLE_ASSIGNMENT, re.compile(
+        r"\b[Yy]ou\s+are\s+(?:an?\s+|the\s+)?[A-Z][A-Za-z0-9_-]+\s*,\s*"
+        r"(?:a|an|the)\b")),
+    # "you are a model/assistant/AI …", with or without a jailbreak tail.
+    (KIND_ROLE_ASSIGNMENT, re.compile(
+        r"\byou\s+are\s+(?:an?|the)\s+(?:\w+\s+){0,2}?"
+        r"(?:ai|a\.i\.|llm|language\s+model|model|assistant|chatbot|bot|agent|"
+        r"system)\b",
         re.IGNORECASE)),
     (KIND_ROLE_ASSIGNMENT, re.compile(
-        r"\b(?:pretend|roleplay|role-play)\b", re.IGNORECASE)),
+        r"\bwith(?:out)?\s+(?:no\s+|any\s+)?"
+        r"(?:restrictions?|limits?|limitations?|filters?|guardrails?|rules?)\b"
+        r"[^.\n]{0,20}?\b(?:you|model|assistant|ai)\b|"
+        r"\byou\s+(?:are|have)\b[^.\n]{0,30}?\b(?:no|without)\s+"
+        r"(?:restrictions?|limits?|limitations?|filters?|guardrails?)\b",
+        re.IGNORECASE)),
+    (KIND_ROLE_ASSIGNMENT, re.compile(
+        r"\b(?:act|behave|respond|answer|speak|reply)\s+as\s+(?:an?\s+|if\s+you\s+)",
+        re.IGNORECASE)),
+    (KIND_ROLE_ASSIGNMENT, re.compile(
+        r"\bpretend(?:\s+to\s+be|\s+that\s+you)?\b|\brole[\s-]?play\b|"
+        r"\byour\s+new\s+(?:role|task|job|persona|identity|instructions?)\b|"
+        r"\bassume\s+the\s+(?:role|persona|identity)\s+of\b",
+        re.IGNORECASE)),
+    # "you will now <verb>" only for verbs that reassign behaviour - "you will
+    # now see the settings menu" is a real procedure sentence.
+    (KIND_ROLE_ASSIGNMENT, re.compile(
+        r"\byou\s+will\s+now\s+(?:act|be|behave|respond|answer|reply|obey|"
+        r"follow|ignore|pretend|only|always|never|output|write|say|generate|"
+        r"summarise|summarize|operate|function)\b",
+        re.IGNORECASE)),
+    # -- addressed to a model ----------------------------------------------
+    # "Note to the AI assistant …", "Message for the model …": the addressee
+    # construction is required, so "the AI-assisted camera" is not a finding.
     (KIND_AI_ADDRESSED, re.compile(
-        r"\bas\s+an?\s+(?:ai|a\.i\.|llm|language\s+model|chatbot)\b",
+        r"\b(?:note|notes|message|instruction|instructions|reminder|directive|"
+        r"memo|aside|comment|hint|tip|attention|prompt)\s+"
+        r"(?:to|for)\s+(?:the\s+|any\s+|all\s+)?"
+        r"(?:ai|a\.i\.|artificial\s+intelligence|assistant|ai\s+assistant|"
+        r"model|language\s+model|llm|chatbot|bot|machine|system|"
+        r"summaris\w+|summariz\w+|reviewer\s+bot|automated\s+\w+|"
+        r"generator|claude|chatgpt|gpt|copilot|gemini)\b",
+        re.IGNORECASE)),
+    # A vocative: "AI assistant, …", "Dear language model", "Hey Claude:".
+    (KIND_AI_ADDRESSED, re.compile(
+        r"\b(?:dear|hey|hello|hi|ok|okay|attention)\s+"
+        r"(?:ai|a\.i\.|assistant|ai\s+assistant|language\s+model|model|llm|"
+        r"chatbot|claude|chatgpt|gpt|copilot|gemini)\b",
         re.IGNORECASE)),
     (KIND_AI_ADDRESSED, re.compile(
-        r"\b(?:ai|assistant|model|chatbot|claude|chatgpt|gpt)\s*[,:]\s*(?:please\s+)?"
-        r"(?:ignore|note|include|add|remember|output|write|say|do)\b",
+        r"\b(?:ai|a\.i\.|assistant|ai\s+assistant|language\s+model|llm|chatbot|"
+        r"claude|chatgpt|gpt|copilot|gemini)\s*[,:]\s*"
+        r"(?:please\s+|kindly\s+|now\s+)?"
+        r"(?:ignore|disregard|note|include|add|remember|output|write|say|do|"
+        r"mark|state|make|set|use|read|follow|summaris\w+|summariz\w+)\b",
         re.IGNORECASE)),
+    # "as an AI", "you are an AI language model" - the self-reference an
+    # injection uses to explain to the model what it supposedly is.
     (KIND_AI_ADDRESSED, re.compile(
-        r"\b(?:dear|hey|hello)\s+(?:ai|assistant|language\s+model|claude|chatgpt)\b",
+        r"\bas\s+an?\s+(?:ai|a\.i\.|llm|language\s+model|chatbot|"
+        r"artificial\s+intelligence)\b",
         re.IGNORECASE)),
+    # An addressee in the second person: "AI assistant summarising this", "the
+    # model reading this document".
+    (KIND_AI_ADDRESSED, re.compile(
+        r"\b(?:ai\s+assistant|language\s+model|llm|chatbot|ai\s+model|"
+        r"ai\s+system|assistant)\s+"
+        r"(?:that\s+|which\s+|who\s+)?"
+        r"(?:is\s+|are\s+)?"
+        r"(?:summaris\w+|summariz\w+|generat\w+|read\w*|process\w*|writ\w+|"
+        r"creat\w+|review\w*|train\w*)\b",
+        re.IGNORECASE)),
+    # -- asking for the prompt, or for concealment -------------------------
     (KIND_PROMPT_DISCLOSURE, re.compile(
-        r"\bsystem\s+prompt\b", re.IGNORECASE)),
+        r"\b(?:system|initial|hidden|original)\s+prompt\b", re.IGNORECASE)),
     (KIND_PROMPT_DISCLOSURE, re.compile(
-        r"\b(?:reveal|disclose|print|output|repeat|show|expose|leak|dump)\b"
+        r"\b(?:reveal|disclose|print|output|repeat|show|expose|leak|dump|"
+        r"echo|recite)\b"
         r"[^.\n]{0,30}?\b(?:your|the|these|its)\s+"
-        r"(?:system\s+|hidden\s+|initial\s+|original\s+)?"
-        r"(?:prompt|prompts|instructions|guidelines|configuration|context)\b",
+        r"(?:system\s+|hidden\s+|initial\s+|original\s+|full\s+)?"
+        r"(?:prompt|prompts|instructions|guidelines|configuration|context|"
+        r"rules)\b",
         re.IGNORECASE)),
     (KIND_PROMPT_DISCLOSURE, re.compile(
-        r"\b(?:do\s*n[o']?t|never|don't)\s+(?:tell|mention|reveal|disclose|show)\b"
-        r"[^.\n]{0,30}?\b(?:the\s+)?(?:user|reviewer|human|reader|anyone|sme)\b",
+        r"\b(?:do\s*n[o']?t|never|don't|without)\s+"
+        r"(?:tell|telling|mention|mentioning|reveal|revealing|disclose|"
+        r"disclosing|show|showing|informing|inform)\b"
+        r"[^.\n]{0,30}?\b(?:the\s+)?(?:user|reviewer|human|reader|anyone|sme|"
+        r"operator\s+reading)\b",
         re.IGNORECASE)),
     (KIND_PROMPT_DISCLOSURE, re.compile(
-        r"\bkeep\s+th(?:is|ese)\s+(?:instructions?|note|text|secret)\b"
-        r"[^.\n]{0,20}?\b(?:secret|hidden|to\s+yourself)\b",
+        r"\bkeep\s+th(?:is|ese)\s+"
+        r"(?:instructions?|note|text|message|secret|part|section)\b"
+        r"[^.\n]{0,20}?\b(?:secret|hidden|confidential|to\s+yourself|"
+        r"between\s+us)\b",
         re.IGNORECASE)),
     # -- directives about the generated training ---------------------------
     (KIND_GENERATION_DIRECTIVE, re.compile(
         r"\bwhen\s+(?:you\s+)?"
         r"(?:summaris\w+|summariz\w+|generat\w+|creat\w+|writ\w+|produc\w+|"
-        r"paraphras\w+|translat\w+|paraphrase)\b[^.\n]{0,40}?"
-        r"\b(?:this|the)\s+(?:document|sop|procedure|text|training|content)\b",
+        r"paraphras\w+|translat\w+|process\w+|read\w+|convert\w*|train\w*)\b"
+        r"[^.\n]{0,40}?"
+        r"\b(?:this|the|these)\s+(?:document|sop|procedure|text|training|"
+        r"content|instructions?|material)\b",
         re.IGNORECASE)),
     (KIND_GENERATION_DIRECTIVE, re.compile(
-        r"\b(?:when|while|if)\s+(?:you\s+are\s+)?"
-        r"(?:generating|creating|writing|producing|building|drafting)\s+"
-        r"(?:the\s+|any\s+)?(?:training|course|quiz|question|questions|"
-        r"assessment|summary|summaries|objectives?)\b",
+        r"\b(?:when|while|if|before)\s+(?:you\s+(?:are\s+)?)?"
+        r"(?:generating|creating|writing|producing|building|drafting|making|"
+        r"preparing)\s+"
+        r"(?:the\s+|any\s+|a\s+)?(?:training|course|quiz|question|questions|"
+        r"assessment|summary|summaries|objectives?|module|lesson)\b",
+        re.IGNORECASE)),
+    # "option B is always correct", "answer 3 as correct", "mark option A".
+    (KIND_GENERATION_DIRECTIVE, re.compile(
+        r"\b(?:option|answer|choice|response)\s*[\"'(\[]?[A-Da-d1-4][\"')\]]?\s*"
+        r"(?:\w+\s+){0,3}?\b(?:is|as|are|be)\s+(?:always\s+|the\s+)?"
+        r"(?:correct|right|true)\b",
+        re.IGNORECASE)),
+    (KIND_GENERATION_DIRECTIVE, re.compile(
+        r"\b(?:mark|make|treat|select|choose|pick|set)\s+"
+        r"(?:option|answer|choice|response)\b",
         re.IGNORECASE)),
     (KIND_GENERATION_DIRECTIVE, re.compile(
         r"\b(?:mark|make|treat|select|choose|pick)\s+(?:option\s+|answer\s+|"
@@ -253,16 +417,46 @@ _TEXT_PATTERNS: Tuple[Tuple[str, "re.Pattern"], ...] = (
         r"\b(?:correct\s+answer|answer\s+key)\b[^.\n]{0,25}?"
         r"\b(?:always|every\s+question|for\s+all\s+questions)\b",
         re.IGNORECASE)),
+    # "state that …" as an imperative opening a clause; "studies state that"
+    # (a noun subject) is not an instruction to anybody.
     (KIND_GENERATION_DIRECTIVE, re.compile(
-        r"\binclude\s+(?:the\s+|this\s+)?(?:link|url|phone\s+number|contact|"
-        r"address)\b[^.\n]{0,40}?\b(?:in\s+(?:the|every|each|any)\s+"
-        r"(?:summary|summaries|training|course|objective|objectives|question|"
-        r"questions|answer|answers|module|content)|in\s+your\s+\w+)",
+        r"(?:^|[.;:!?]\s+|\band\s+|\bthen\s+|\bplease\s+|\balso\s+|,\s*)"
+        r"(?:state|say|claim|assert|report|write|answer)\s+that\b",
+        re.IGNORECASE)),
+    (KIND_GENERATION_DIRECTIVE, re.compile(
+        r"\btell\s+(?:the\s+)?(?:learner|learners|reader|readers|user|users|"
+        r"trainee|trainees|student|students|them)\b",
+        re.IGNORECASE)),
+    # "include the link in every summary", "add the phone number … to every
+    # objective".  The *destination* has to be a training artifact - an
+    # objective, a question, a summary, the course - because "add the link URL in
+    # the second box" and "include the phone number of the recipient in the
+    # letter header" are ordinary procedure steps, and an earlier draft of this
+    # pattern flagged both (one of them inside the real-document corpus).  The
+    # narrower recall is backed up by the output filters, which reject a URL or a
+    # phone number in generated text however it got there.
+    (KIND_GENERATION_DIRECTIVE, re.compile(
+        r"\b(?:include|add|insert|append|put|embed|mention)\b[^.\n]{0,40}?"
+        r"\b(?:in|into|to)\s+"
+        r"(?:the\s+|every\s+|each\s+|any\s+|all\s+|your\s+)?"
+        r"(?:objective|objectives|question|questions|summary|summaries|"
+        r"answer|answers|quiz|training|course|module|lesson)\b",
         re.IGNORECASE)),
     # -- prompt-format delimiters and role fences --------------------------
     (KIND_PROMPT_DELIMITER, re.compile(r"<\|[^\n]{0,40}?\|?>")),
     (KIND_PROMPT_DELIMITER, re.compile(r"\[/?INST\]|\[/?SYS\]|<</?SYS>>")),
     (KIND_PROMPT_DELIMITER, re.compile(r"<\|?(?:im_start|im_end|endoftext)\|?>")),
+    # An XML-ish role tag on its own: <system>, </assistant>, <system_prompt>.
+    (KIND_PROMPT_DELIMITER, re.compile(
+        r"</?\s*(?:system|assistant|user|human|instructions?|prompt|"
+        r"system_prompt|im_start|im_end)\s*/?>",
+        re.IGNORECASE)),
+    # A fenced code block whose info string is a role - ```system, ~~~assistant.
+    (KIND_PROMPT_DELIMITER, re.compile(
+        r"^\s*(?:`{3,}|~{3,})\s*"
+        r"(?:system|assistant|user|human|instruction|instructions|prompt|"
+        r"context|developer)\b\s*$",
+        re.IGNORECASE)),
     # `###` is a markdown heading in half the SOPs in this repository, so it is
     # a fence only when what follows it is a *role*, Alpaca-style.
     (KIND_PROMPT_DELIMITER, re.compile(
@@ -306,6 +500,41 @@ _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
 #: A long unbroken run that looks encoded rather than written.
 _BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])")
+
+#: Invisible and formatting characters beyond the zero-width set above.  Unicode
+#: TAG characters (U+E0000-U+E007F) are the important ones: they mirror ASCII,
+#: render as nothing at all, and are a known carrier for a whole instruction
+#: hidden behind an innocuous sentence.  The rest are the characters that show up
+#: in the same role - soft hyphens used to break a keyword up, the invisible
+#: math operators, CGJ, the Arabic letter mark, Mongolian vowel separator, the
+#: line/paragraph separators, and the interlinear annotation marks.
+_TAG_CHAR_RE = re.compile(r"[\U000E0000-\U000E007F]")
+_INVISIBLE_SINGLE_CHARS = "\u034f\u061c\u180e\u2028\u2029\u2061\u2062\u2063\u2064\ufff9\ufffa\ufffb"
+_INVISIBLE_SINGLE_RE = re.compile("[" + _INVISIBLE_SINGLE_CHARS + "]")
+#: A soft hyphen is legitimate typography in isolation (hyphenation hints in
+#: copied text), so only a *run* of them - the shape used to break a word up so a
+#: keyword check misses it - is reported.
+_SOFT_HYPHEN_RUN_RE = re.compile(r"(?:\u00ad[^\u00ad]{0,3}){2,}")
+#: Variation selectors carry emoji presentation legitimately, so they only count
+#: when the character they follow is a letter or digit - i.e. when they are
+#: decorating text rather than a symbol.
+_VARIATION_SELECTOR_RE = re.compile(r"[0-9A-Za-z][\ufe00-\ufe0f]")
+
+#: Text that a base64 blob has to decode into before it is worth re-scanning:
+#: mostly printable, and long enough to carry a sentence.
+_BASE64_MIN_DECODED_CHARS = 12
+_BASE64_MIN_PRINTABLE_RATIO = 0.9
+
+#: A negation in front of an override phrase turns it from an instruction into a
+#: *warning about* one, which is what real procedures contain: "never ignore an
+#: audible alarm", "do not ignore any safety rules". The window is short on
+#: purpose - it is the immediate verb phrase, not the whole sentence.
+_NEGATED_OVERRIDE_RE = re.compile(
+    r"(?:do\s*not|do\s+not\s+ever|don'?t|never|cannot|can'?t|must\s+not|"
+    r"shall\s+not|should\s+not|avoid|failure\s+to|without)\s+(?:\w+\s+){0,2}$",
+    re.IGNORECASE)
+#: How far back the negation veto looks from the start of a match.
+_NEGATION_LOOKBACK = 28
 
 #: Minimum times a line must repeat, and its minimum length, before repetition
 #: is worth reporting.  A short repeated line ("N/A", "---", a blank cell) is
@@ -442,6 +671,8 @@ def visible(text) -> str:
             out.append("    ")
             continue
         if char in ZERO_WIDTH_CHARS or char in BIDI_CHARS \
+                or char in _INVISIBLE_SINGLE_CHARS or char == "\u00ad" \
+                or _TAG_CHAR_RE.match(char) or "\ufe00" <= char <= "\ufe0f" \
                 or _CONTROL_RE.match(char) or char == "\x1b" or char in "\r\n":
             out.append("<U+{0:04X}>".format(ord(char)))
             continue
@@ -465,6 +696,8 @@ def sanitize_for_terminal(text) -> str:
     cleaned = _CONTROL_RE.sub("", cleaned)
     cleaned = cleaned.replace("\r", "")
     cleaned = _ZERO_WIDTH_RE.sub("", cleaned)
+    cleaned = _TAG_CHAR_RE.sub("", cleaned)
+    cleaned = _INVISIBLE_SINGLE_RE.sub("", cleaned)
     return _BIDI_RE.sub("", cleaned)
 
 
@@ -508,6 +741,75 @@ def _homoglyph_count(line: str) -> int:
     return hits if hits >= HOMOGLYPH_MIN_COUNT else 0
 
 
+def _is_negated(text: str, start: int) -> bool:
+    """Is the match at ``start`` preceded by a negation?
+
+    "Never ignore an audible alarm" and "do not ignore any safety rules" are
+    sentences real procedures contain; "ignore all previous instructions" is not.
+    The difference is one word in front of the verb, and it is the single most
+    useful discriminator in this module.
+    """
+    window = text[max(0, start - _NEGATION_LOOKBACK):start]
+    return bool(_NEGATED_OVERRIDE_RE.search(window))
+
+
+def _invisible_hit(line: str) -> bool:
+    """Invisible or formatting characters other than the zero-width set.
+
+    Tag characters first, because they are the ones that can carry an entire
+    instruction.  Soft hyphens need a run and variation selectors need to be
+    decorating text rather than an emoji, so that ordinary copied typography does
+    not register.
+    """
+    if _TAG_CHAR_RE.search(line) or _INVISIBLE_SINGLE_RE.search(line):
+        return True
+    if _SOFT_HYPHEN_RUN_RE.search(line):
+        return True
+    return bool(_VARIATION_SELECTOR_RE.search(line))
+
+
+def decode_tag_characters(text) -> str:
+    """The ASCII hidden in Unicode TAG characters, if any.
+
+    U+E0041 is a tag "A".  A sentence followed by tag-encoded text looks like the
+    sentence alone in every editor, browser and review page - which is the point.
+    Exposed because a reviewer asking "what does the hidden text say?" deserves an
+    answer, and :func:`scan_document` puts it in the finding's excerpt.
+    """
+    out = []
+    for char in str(text):
+        if 0xE0000 <= ord(char) <= 0xE007F:
+            code = ord(char) - 0xE0000
+            if 0x20 <= code <= 0x7E:
+                out.append(chr(code))
+    return "".join(out)
+
+
+def _decode_base64_text(blob: str) -> str:
+    """Decode ``blob`` if it is base64 of readable text, else "".
+
+    Deliberately conservative: padding is repaired, decoding must succeed as
+    UTF-8, and the result must be long enough and printable enough to be a
+    sentence rather than a coincidence.  A hex digest or an identifier decodes to
+    noise and is left alone.
+    """
+    padded = blob + "=" * (-len(blob) % 4)
+    try:
+        raw = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return ""
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+    if len(text) < _BASE64_MIN_DECODED_CHARS:
+        return ""
+    printable = sum(1 for char in text if char.isprintable() or char in "\t\n\r")
+    if printable / float(len(text)) < _BASE64_MIN_PRINTABLE_RATIO:
+        return ""
+    return text
+
+
 def scan_document(lines) -> ScanResult:
     """Scan a document for prompt-injection indicators.
 
@@ -530,22 +832,51 @@ def scan_document(lines) -> ScanResult:
         for kind, pattern in _TEXT_PATTERNS:
             if kind in seen_kinds:
                 continue
-            if pattern.search(line):
-                seen_kinds.add(kind)
-                add(number, kind, line)
+            match = pattern.search(line)
+            if match is None:
+                continue
+            if kind == KIND_INSTRUCTION_OVERRIDE and _is_negated(line, match.start()):
+                continue
+            seen_kinds.add(kind)
+            add(number, kind, line)
 
         if _ZERO_WIDTH_RE.search(line):
             add(number, KIND_ZERO_WIDTH, line)
+        if _invisible_hit(line):
+            hidden = decode_tag_characters(line)
+            excerpt = _excerpt(line)
+            if hidden:
+                excerpt += ' [hidden tag text: "{0}"]'.format(_excerpt(hidden, 60))
+            findings.append(Finding(line=number, kind=KIND_INVISIBLE_CHARS,
+                                    excerpt=excerpt))
         if _BIDI_RE.search(line):
             add(number, KIND_BIDI_OVERRIDE, line)
         if "\x1b" in line:
             add(number, KIND_ANSI_ESCAPE, line)
         if _CONTROL_RE.search(line):
             add(number, KIND_CONTROL_CHAR, line)
-        if _BASE64_RE.search(line):
-            add(number, KIND_BASE64_BLOB, line)
         if _homoglyph_count(line):
             add(number, KIND_HOMOGLYPH, line)
+
+        # Base64: report the blob, and then scan what it decodes to.  An attacker
+        # who base64s "ignore all previous instructions" is hiding the phrasing
+        # from a reader, not from a decoder, and a reviewer needs to be told which
+        # of the two it was.  One blob per line is decoded, matching the
+        # one-finding-per-line-per-kind convention everywhere else here.
+        blob = _BASE64_RE.search(line)
+        if blob is not None:
+            add(number, KIND_BASE64_BLOB, line)
+            decoded = _decode_base64_text(blob.group(0))
+            for kind, pattern in (_TEXT_PATTERNS if decoded else ()):
+                hit = pattern.search(decoded)
+                if hit is None:
+                    continue
+                if kind == KIND_INSTRUCTION_OVERRIDE and _is_negated(decoded,
+                                                                    hit.start()):
+                    continue
+                findings.append(Finding(
+                    line=number, kind=kind,
+                    excerpt="base64-decoded: " + _excerpt(decoded)))
 
     findings.extend(_repetition_findings(document))
 
