@@ -106,6 +106,40 @@ ALLOWED_SCORM_VERSIONS = {'1.2', '2004'}
 DOWNLOAD_TOKEN_SALT = 'training-creator-download-v1'
 
 
+class RequestValidationError(ValueError):
+    """A validation error this app itself raises about a request's own
+    content (bad upload parameters, a malformed SME edit, ...).
+
+    Its message is written for the person making the request and is safe to
+    return verbatim. Anything else - a bare ValueError or any other
+    exception raised deeper in the pipeline (parser, generator, exporter) -
+    is an internal failure, not a validation message, and must never reach
+    the client as text; see `_internal_error_response`.
+    """
+
+
+def _internal_error_response(job_id, exc):
+    """Log an unexpected exception in full (with the job id, if there is
+    one) and return a generic 500 body that carries no internal exception
+    text - only the job id, so support can find the matching log line.
+
+    `job_id` is not a secret (it is already echoed back on success and
+    embedded in download URLs), so including it in the response is safe and
+    is the whole point: it lets a person report a failure that support can
+    actually locate in the logs.
+    """
+    if job_id:
+        app.logger.error(f"[job_id={job_id}] Unhandled error: {exc}", exc_info=True)
+        message = (
+            'An internal error occurred while processing this request. '
+            f'Please contact support with this job id: {job_id}'
+        )
+    else:
+        app.logger.error(f"Unhandled error: {exc}", exc_info=True)
+        message = 'An internal error occurred while processing this request.'
+    return jsonify({'error': message}), 500
+
+
 def allowed_file(filename):
     """Check if file extension is allowed"""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -398,52 +432,54 @@ def _count_edits_by_category(draft_module, module_dict, draft_assessment, assess
 
 def _validate_module_dict(data):
     """Strictly validate an edited TrainingModule dict (the shape of
-    TrainingModule.to_dict()). Raises ValueError with a precise message."""
+    TrainingModule.to_dict()). Raises RequestValidationError with a precise
+    message safe to return to the caller verbatim."""
     if not isinstance(data, dict):
-        raise ValueError('module must be a JSON object')
+        raise RequestValidationError('module must be a JSON object')
 
     title = data.get('title')
     if not isinstance(title, str) or not title.strip():
-        raise ValueError('module.title must be a non-empty string')
+        raise RequestValidationError('module.title must be a non-empty string')
 
     objectives = data.get('learning_objectives')
     if not isinstance(objectives, list) or not objectives:
-        raise ValueError('module.learning_objectives must be a non-empty list')
+        raise RequestValidationError('module.learning_objectives must be a non-empty list')
     for i, obj in enumerate(objectives):
         if not isinstance(obj, str) or not obj.strip():
-            raise ValueError(f'module.learning_objectives[{i}] must be a non-empty string')
+            raise RequestValidationError(f'module.learning_objectives[{i}] must be a non-empty string')
 
     sections = data.get('sections')
     if not isinstance(sections, list) or not sections:
-        raise ValueError('module.sections must be a non-empty list')
+        raise RequestValidationError('module.sections must be a non-empty list')
     for i, section in enumerate(sections):
         if not isinstance(section, dict):
-            raise ValueError(f'module.sections[{i}] must be an object')
+            raise RequestValidationError(f'module.sections[{i}] must be an object')
         if not isinstance(section.get('id'), str) or not section['id']:
-            raise ValueError(f'module.sections[{i}] must have a non-empty id')
+            raise RequestValidationError(f'module.sections[{i}] must have a non-empty id')
         if not isinstance(section.get('content'), str):
-            raise ValueError(f'module.sections[{i}].content must be a string')
+            raise RequestValidationError(f'module.sections[{i}].content must be a string')
 
     if not isinstance(data.get('estimated_duration', 0), int):
-        raise ValueError('module.estimated_duration must be an integer')
+        raise RequestValidationError('module.estimated_duration must be an integer')
 
 
 def _validate_assessment_dict(data):
     """Strictly validate an edited Assessment dict (the shape of
-    Assessment.to_dict()). Raises ValueError with a precise message."""
+    Assessment.to_dict()). Raises RequestValidationError with a precise
+    message safe to return to the caller verbatim."""
     if not isinstance(data, dict):
-        raise ValueError('assessment must be a JSON object')
+        raise RequestValidationError('assessment must be a JSON object')
 
     passing_score = data.get('passing_score')
     if not isinstance(passing_score, int) or isinstance(passing_score, bool) \
             or not (0 < passing_score <= 100):
-        raise ValueError('assessment.passing_score must be an integer between 1 and 100')
+        raise RequestValidationError('assessment.passing_score must be an integer between 1 and 100')
 
     questions = data.get('questions')
     if not isinstance(questions, list):
-        raise ValueError('assessment.questions must be a list')
+        raise RequestValidationError('assessment.questions must be a list')
     if len(questions) < MIN_ASSESSMENT_QUESTIONS:
-        raise ValueError(
+        raise RequestValidationError(
             f'assessment must have at least {MIN_ASSESSMENT_QUESTIONS} questions '
             f'(has {len(questions)})')
 
@@ -451,39 +487,39 @@ def _validate_assessment_dict(data):
     for i, q in enumerate(questions):
         label = f'assessment.questions[{i}]'
         if not isinstance(q, dict):
-            raise ValueError(f'{label} must be an object')
+            raise RequestValidationError(f'{label} must be an object')
 
         qid = q.get('id')
         if not isinstance(qid, str) or not qid:
-            raise ValueError(f'{label}.id must be a non-empty string')
+            raise RequestValidationError(f'{label}.id must be a non-empty string')
         if qid in seen_ids:
-            raise ValueError(f'{label}.id "{qid}" is used by more than one question')
+            raise RequestValidationError(f'{label}.id "{qid}" is used by more than one question')
         seen_ids.add(qid)
 
         text = q.get('text')
         if not isinstance(text, str) or not text.strip():
-            raise ValueError(f'{label}.text must be a non-empty string')
+            raise RequestValidationError(f'{label}.text must be a non-empty string')
 
         options = q.get('options')
         if not isinstance(options, list) or not (2 <= len(options) <= 4):
-            raise ValueError(f'{label}.options must be a list of 2 to 4 items')
+            raise RequestValidationError(f'{label}.options must be a list of 2 to 4 items')
         for j, opt in enumerate(options):
             if not isinstance(opt, str) or not opt.strip():
-                raise ValueError(f'{label}.options[{j}] must be a non-empty string')
+                raise RequestValidationError(f'{label}.options[{j}] must be a non-empty string')
         normalized = [opt.strip().lower() for opt in options]
         if len(set(normalized)) != len(normalized):
-            raise ValueError(f'{label}.options must not contain duplicate options')
+            raise RequestValidationError(f'{label}.options must not contain duplicate options')
 
         correct = q.get('correct_answer')
         if isinstance(correct, bool) or not isinstance(correct, int) \
                 or not (0 <= correct < len(options)):
-            raise ValueError(
+            raise RequestValidationError(
                 f'{label}.correct_answer must be an integer index into options '
                 f'(0..{len(options) - 1})')
 
         explanation = q.get('explanation', '')
         if not isinstance(explanation, str):
-            raise ValueError(f'{label}.explanation must be a string')
+            raise RequestValidationError(f'{label}.explanation must be a string')
 
 
 def _relayout_assessment_answers(assessment, sop_content):
@@ -627,6 +663,7 @@ def index():
 def upload_file():
     """Handle file upload and initiate processing"""
     upload_path = None
+    job_id = None
     try:
         # Check if file is present
         if 'file' not in request.files:
@@ -696,11 +733,15 @@ def upload_file():
     except RequestEntityTooLarge:
         # Let this propagate to the 413 error handler instead of becoming a 500.
         raise
-    except ValueError as e:
+    except RequestValidationError as e:
+        # Raised by this app's own input checks - the message is written
+        # for the caller and safe to return verbatim.
         return jsonify({'error': str(e)}), 400
     except Exception as e:
-        app.logger.error(f"Error processing upload: {str(e)}")
-        return jsonify({'error': f'Processing failed: {str(e)}'}), 500
+        # Anything else (a parser/generator/exporter failure, a bare
+        # ValueError from deeper in the pipeline, ...) is internal - never
+        # echo str(e) to the client.
+        return _internal_error_response(job_id, e)
     finally:
         if upload_path is not None:
             _cleanup_upload(upload_path)
@@ -709,9 +750,9 @@ def upload_file():
 def process_training(file_path, job_id, num_questions, passing_score, scorm_version, output_format):
     """Process SOP and generate training package"""
     if output_format not in ALLOWED_OUTPUT_FORMATS:
-        raise ValueError(f"Unsupported output_format: {output_format}")
+        raise RequestValidationError(f"Unsupported output_format: {output_format}")
     if scorm_version not in ALLOWED_SCORM_VERSIONS:
-        raise ValueError(f"Unsupported scorm_version: {scorm_version}")
+        raise RequestValidationError(f"Unsupported scorm_version: {scorm_version}")
 
     try:
         # Step 1: Parse SOP
@@ -832,8 +873,10 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
             }
         }
 
+    except RequestValidationError:
+        raise
     except Exception as e:
-        app.logger.error(f"[job_id={job_id}] Error in process_training: {str(e)}")
+        app.logger.error(f"[job_id={job_id}] Error in process_training: {e}", exc_info=True)
         raise
 
 
@@ -895,7 +938,7 @@ def _export_outputs(output_dir, package_name, sop_content, training_module, asse
 
     else:
         # Defensive; unreachable because of the validation upstream.
-        raise ValueError(f"Unsupported output_format: {output_format}")
+        raise RequestValidationError(f"Unsupported output_format: {output_format}")
 
     return download_filename
 
@@ -1007,64 +1050,70 @@ def review_submit(job_id):
     try:
         _validate_module_dict(module_dict)
         _validate_assessment_dict(assessment_dict)
-    except ValueError as e:
+    except RequestValidationError as e:
         return jsonify({'error': str(e)}), 400
 
-    # The untouched generation, snapshotted the first time a job is edited,
-    # so edits_count is always measured against what the model produced.
-    draft_path = _draft_json_path(job_id)
-    if draft_path.is_file():
-        try:
-            with open(draft_path, encoding='utf-8') as f:
-                draft = json.load(f)
-        except (OSError, json.JSONDecodeError):
+    try:
+        # The untouched generation, snapshotted the first time a job is
+        # edited, so edits_count is always measured against what the model
+        # produced.
+        draft_path = _draft_json_path(job_id)
+        if draft_path.is_file():
+            try:
+                with open(draft_path, encoding='utf-8') as f:
+                    draft = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                draft = {'training_module': job['training_module'], 'assessment': job['assessment']}
+        else:
             draft = {'training_module': job['training_module'], 'assessment': job['assessment']}
-    else:
-        draft = {'training_module': job['training_module'], 'assessment': job['assessment']}
-        _atomic_write_json(draft_path, draft)
+            _atomic_write_json(draft_path, draft)
 
-    edits_count = (
-        _count_edits(draft.get('training_module'), module_dict)
-        + _count_edits(draft.get('assessment'), assessment_dict)
-    )
-    edits_by_category = _count_edits_by_category(
-        draft.get('training_module'), module_dict, draft.get('assessment'), assessment_dict)
+        edits_count = (
+            _count_edits(draft.get('training_module'), module_dict)
+            + _count_edits(draft.get('assessment'), assessment_dict)
+        )
+        edits_by_category = _count_edits_by_category(
+            draft.get('training_module'), module_dict, draft.get('assessment'), assessment_dict)
 
-    sop_content = sop_from_dict(job.get('sop_content'))
-    training_module = module_from_dict(module_dict)
-    assessment = assessment_from_dict(assessment_dict)
+        sop_content = sop_from_dict(job.get('sop_content'))
+        training_module = module_from_dict(module_dict)
+        assessment = assessment_from_dict(assessment_dict)
 
-    # Answer *position* is server-owned layout, not SME content (see
-    # _relayout_assessment_answers) - re-run it before anything else looks at
-    # `correct_answer`. edits_count above was already computed against the
-    # SME's raw submission, so this re-layout cannot inflate or hide it.
-    _relayout_assessment_answers(assessment, sop_content)
+        # Answer *position* is server-owned layout, not SME content (see
+        # _relayout_assessment_answers) - re-run it before anything else looks
+        # at `correct_answer`. edits_count above was already computed against
+        # the SME's raw submission, so this re-layout cannot inflate or hide it.
+        _relayout_assessment_answers(assessment, sop_content)
 
-    naive_failures = _naive_strategy_failures(assessment)
-    if naive_failures:
-        return jsonify({'error': _naive_failure_message(
-            naive_failures[0], assessment.passing_score)}), 400
+        naive_failures = _naive_strategy_failures(assessment)
+        if naive_failures:
+            return jsonify({'error': _naive_failure_message(
+                naive_failures[0], assessment.passing_score)}), 400
 
-    now = _utcnow_iso()
-    job['training_module'] = module_dict
-    job['assessment'] = assessment.to_dict()
-    job['status'] = 'edited'
-    job['edits_count'] = edits_count
-    job['edits_by_category'] = edits_by_category
-    job['edit_rounds'] = int(job.get('edit_rounds', 0) or 0) + 1
-    if job.get('first_edit_at') is None:
-        job['first_edit_at'] = now
-    job['approval'] = None  # content changed - any prior approval no longer applies
-    job['approved_at'] = None
-    job['updated_at'] = now
-    _atomic_write_json(_job_json_path(job_id), job)
+        now = _utcnow_iso()
+        job['training_module'] = module_dict
+        job['assessment'] = assessment.to_dict()
+        job['status'] = 'edited'
+        job['edits_count'] = edits_count
+        job['edits_by_category'] = edits_by_category
+        job['edit_rounds'] = int(job.get('edit_rounds', 0) or 0) + 1
+        if job.get('first_edit_at') is None:
+            job['first_edit_at'] = now
+        job['approval'] = None  # content changed - any prior approval no longer applies
+        job['approved_at'] = None
+        job['updated_at'] = now
+        _atomic_write_json(_job_json_path(job_id), job)
 
-    req = job.get('request', {})
-    download_filename = _export_outputs(
-        _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
-        req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
-        job.get('source_filename'), approval=None,
-    )
+        req = job.get('request', {})
+        download_filename = _export_outputs(
+            _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
+            req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
+            job.get('source_filename'), approval=None,
+        )
+    except RequestValidationError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return _internal_error_response(job_id, e)
 
     token = request.args.get('t', '')
     return jsonify({
@@ -1152,16 +1201,21 @@ def approve_job(job_id):
     job['updated_at'] = _utcnow_iso()
     _atomic_write_json(_job_json_path(job_id), job)
 
-    sop_content = sop_from_dict(job.get('sop_content'))
-    training_module = module_from_dict(job.get('training_module'))
-    assessment = assessment_from_dict(job.get('assessment'))
+    try:
+        sop_content = sop_from_dict(job.get('sop_content'))
+        training_module = module_from_dict(job.get('training_module'))
+        assessment = assessment_from_dict(job.get('assessment'))
 
-    req = job.get('request', {})
-    download_filename = _export_outputs(
-        _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
-        req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
-        job.get('source_filename'), approval=approval,
-    )
+        req = job.get('request', {})
+        download_filename = _export_outputs(
+            _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
+            req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
+            job.get('source_filename'), approval=approval,
+        )
+    except RequestValidationError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return _internal_error_response(job_id, e)
 
     token = request.args.get('t', '')
     return jsonify({

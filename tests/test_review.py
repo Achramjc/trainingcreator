@@ -212,6 +212,50 @@ def test_review_submit_duplicate_options_is_400(client, sample_sop_path):
     assert "error" in resp.get_json()
 
 
+def test_review_submit_validation_error_returns_precise_message(client, sample_sop_path):
+    """RequestValidationError (raised by this app's own _validate_module_dict
+    / _validate_assessment_dict) is a message written for the SME, and must
+    reach them verbatim rather than being swallowed by the generic-error
+    handling that covers unexpected internal failures."""
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
+    job = app_module._read_job_json(job_id)
+    module = job["training_module"]
+    module["title"] = ""  # invalid: _validate_module_dict requires non-empty
+    assessment = job["assessment"]
+
+    resp = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "module.title must be a non-empty string"
+
+
+def test_review_submit_internal_error_hides_exception_but_keeps_job_id(
+        client, sample_sop_path, monkeypatch):
+    """An unexpected failure while rebuilding/exporting an edited job (not a
+    validation error) must not leak its exception text - only a generic
+    message and the job id."""
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
+    job = app_module._read_job_json(job_id)
+    module = job["training_module"]
+    assessment = job["assessment"]
+
+    def boom(data):
+        raise RuntimeError("secret internal detail")
+
+    monkeypatch.setattr(app_module, "sop_from_dict", boom)
+
+    resp = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert resp.status_code == 500
+    body = resp.get_data(as_text=True)
+    assert "secret internal detail" not in body
+    assert job_id in body
+
+
 def test_review_submit_missing_job_is_404(client, sample_sop_path):
     payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
     job = app_module._read_job_json(job_id)

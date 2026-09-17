@@ -108,28 +108,6 @@ def package_factory(tmp_path_factory):
     return factory
 
 
-@pytest.fixture
-def chromium():
-    """A headless Chromium, or a clean skip when none is installed.
-
-    Mirrors ``tests/test_scorm.py::_launch_chromium``: never installs
-    anything, so the plain CI job stays green without a browser.
-
-    Deliberately function-scoped.  ``sync_playwright()`` owns an asyncio loop
-    for as long as it is open, and a second ``sync_playwright()`` on the same
-    thread while one is open raises - which is exactly what a session-scoped
-    browser here would do to ``tests/test_scorm.py``'s own browser test.
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        pytest.skip("Playwright for Python is not installed")
-
-    from tests.test_scorm import _launch_chromium
-
-    with sync_playwright() as playwright:
-        browser = _launch_chromium(playwright)
-        try:
-            yield browser
-        finally:
-            browser.close()
+# The ``chromium`` fixture (a headless Chromium on the session's one shared
+# Playwright driver, or a clean skip when none is installed) is defined once,
+# in tests/conftest.py, and used here and by tests/test_scorm.py alike.

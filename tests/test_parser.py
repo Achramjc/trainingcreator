@@ -228,6 +228,73 @@ class TestNumberedConventionFixture:
 
 
 # ---------------------------------------------------------------------------
+# Three-level numbering ("4.1.1"): a bare N.M.K falls through to the integer
+# pattern before this fix. Under an enclosing N.M step it is a sub-step
+# (like a lettered "a." item); with no enclosing step it is its own step.
+# ---------------------------------------------------------------------------
+
+class TestThreeLevelNumbering:
+    def test_three_level_lines_become_substeps_of_enclosing_step(self):
+        content = (
+            "PROCEDURE:\n\n"
+            "5.1 First outer step\n"
+            "Narrative for 5.1.\n"
+            "5.1.1 Sub-step one text\n"
+            "5.1.2 Sub-step two text\n\n"
+            "5.2 Second outer step\n"
+            "Narrative for 5.2.\n"
+        )
+        sop = SOPParser()._extract_structure(content)
+
+        assert [p["step_number"] for p in sop.procedures] == ["5.1", "5.2"]
+
+        step1 = sop.procedures[0]
+        assert len(step1["substeps"]) == 2
+        assert "Sub-step one text" in step1["substeps"][0]
+        assert "Sub-step two text" in step1["substeps"][1]
+        # The narrative and the sub-step text are both retained in the body.
+        assert "Narrative for 5.1." in step1["body"]
+        assert "Sub-step one text" in step1["body"]
+
+        step2 = sop.procedures[1]
+        assert step2["substeps"] == []
+        assert "Narrative for 5.2." in step2["body"]
+
+    def test_bare_three_level_line_is_its_own_step(self):
+        content = (
+            "PROCEDURE:\n\n"
+            "4.1.1 Bare three-level step\n"
+            "Narrative text for the bare step.\n"
+        )
+        sop = SOPParser()._extract_structure(content)
+
+        assert len(sop.procedures) == 1
+        assert sop.procedures[0]["step_number"] == "4.1.1"
+        assert sop.procedures[0]["title"] == "Bare three-level step"
+        assert "Narrative text for the bare step." in sop.procedures[0]["body"]
+
+    def test_dotted_three_level_numbers_sort_naturally_through_the_pipeline(self):
+        """4.1.10 must sort after 4.1.9 (and not next to 4.1.1) once these
+        steps reach the existing natural-sort pipeline in src.assessments."""
+        from src.assessments import ordered_steps
+
+        content = (
+            "PROCEDURE:\n\n"
+            "4.1.1 First\n"
+            "Body one.\n\n"
+            "4.1.9 Ninth\n"
+            "Body nine.\n\n"
+            "4.1.10 Tenth\n"
+            "Body ten.\n"
+        )
+        sop = SOPParser()._extract_structure(content)
+        assert [p["step_number"] for p in sop.procedures] == ["4.1.1", "4.1.9", "4.1.10"]
+
+        ordered = ordered_steps(sop.procedures)
+        assert [p["step_number"] for p in ordered] == ["4.1.1", "4.1.9", "4.1.10"]
+
+
+# ---------------------------------------------------------------------------
 # Markdown input still works
 # ---------------------------------------------------------------------------
 

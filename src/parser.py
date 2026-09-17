@@ -47,15 +47,22 @@ _NUMBERING_RE = re.compile(r"^(\d+(?:\.\d+)*)[.):]?\s+(.+)$")
 
 # Step headings inside a PROCEDURE section, tried in this order:
 #   "Step 2: Activate Emergency Stop" / "Step 3 -" / "Step 4."
+#   "4.1.1 Sub-step text"                (three-level numbering; promoted to
+#                                          its own step only when it has no
+#                                          enclosing "4.1" step - see
+#                                          _extract_procedures)
 #   "4.1 Power Down the Press"           (numbered sub-section under a
 #                                          numbered PROCEDURE heading)
 #   "1. Identify Emergency Situation" / "1) ..." / "1: ..."
 _STEP_WORD_RE = re.compile(r"^step\s+(\d+)\s*[:.\-]?\s*(.*)$", re.IGNORECASE)
+_STEP_SUBDECIMAL_RE = re.compile(r"^(\d+\.\d+\.\d+)\.?\s+(.*)$")
 _STEP_DECIMAL_RE = re.compile(r"^(\d+\.\d+)\.?\s+(.*)$")
 _STEP_PLAIN_RE = re.compile(r"^(\d+)[.):]\s*(.*)$")
 
 # Lettered sub-steps: "a. ..." / "b) ..."
 _SUBSTEP_RE = re.compile(r"^\s*([a-z])[.)]\s+(.*)$")
+# Three-level numeric sub-steps ("5.1.1 ...") nested under a "5.1" step.
+_NUMERIC_SUBSTEP_RE = re.compile(r"^\s*(\d+\.\d+\.\d+)\.?\s+(.*)$")
 
 _WARNING_MARKER_RE = re.compile(r"^\s*(warning|caution|danger)\s*:\s*(.*)$", re.IGNORECASE)
 _STOP_MARKER_RE = re.compile(r"^\s*(warning|caution|danger|note)\s*:", re.IGNORECASE)
@@ -585,6 +592,10 @@ class SOPParser:
         if m:
             return m.group(1), m.group(2).strip()
 
+        m = _STEP_SUBDECIMAL_RE.match(stripped)
+        if m:
+            return m.group(1), m.group(2).strip()
+
         m = _STEP_DECIMAL_RE.match(stripped)
         if m:
             return m.group(1), m.group(2).strip()
@@ -599,11 +610,12 @@ class SOPParser:
         """
         Split a step's body lines into (substeps, full_body_text).
 
-        Lettered sub-steps (a./b./c. or a)/b)/c)) are pulled out into
-        `substeps`, one entry per lettered item (continuation lines that
-        follow a sub-step marker, up to the next marker, are folded in).
-        `full_body_text` is the whole body -- narrative paragraph(s) plus
-        sub-step text with the letter markers stripped -- whitespace
+        Lettered sub-steps (a./b./c. or a)/b)/c)) and three-level numeric
+        sub-steps ("5.1.1 ...", nested under this step's own "5.1") are
+        pulled out into `substeps`, one entry per item (continuation lines
+        that follow a sub-step marker, up to the next marker, are folded
+        in). `full_body_text` is the whole body -- narrative paragraph(s)
+        plus sub-step text with the markers stripped -- whitespace
         normalised into a single line, per the parser's output contract.
         """
         substeps: List[str] = []
@@ -611,7 +623,7 @@ class SOPParser:
         full_parts: List[str] = []
 
         for line in body_lines:
-            m = _SUBSTEP_RE.match(line)
+            m = _SUBSTEP_RE.match(line) or _NUMERIC_SUBSTEP_RE.match(line)
             if m:
                 if current is not None:
                     substeps.append(_normalize_ws(current))
@@ -634,20 +646,63 @@ class SOPParser:
         """
         Extract procedure steps from lines[start:end].
 
-        Each step captures its full body -- narrative text and lettered
-        sub-steps -- up to the next step heading or the next section
-        heading (e.g. an ALL-CAPS heading line like "DOCUMENTATION:" or
-        "REFERENCES:"), across blank lines.
+        Each step captures its full body -- narrative text and lettered or
+        three-level-numeric sub-steps -- up to the next step heading or the
+        next section heading (e.g. an ALL-CAPS heading line like
+        "DOCUMENTATION:" or "REFERENCES:"), across blank lines.
+
+        A three-level numbered line ("4.1.1 ...") is treated as a sub-step
+        of its enclosing "4.1" step when one precedes it in this range
+        (appended to that step's `substeps`, like a lettered "a." item);
+        with no such enclosing step it is promoted to a step of its own,
+        numbered "4.1.1".
         """
-        step_heads = []  # (line_idx, step_number, title)
+        candidates = []  # (line_idx, step_number, title)
         for i in range(start, end):
             match = self._match_step_heading(lines[i])
             if match:
                 step_num, title = match
-                step_heads.append((i, step_num, title))
+                candidates.append((i, step_num, title))
 
-        if not step_heads:
+        if not candidates:
             return []
+
+        # Two levels of numbering ("4", "4.1", "Step 4") can bound a step;
+        # three-level numbers ("4.1.1") are resolved below against these.
+        base_heads = [c for c in candidates if c[1].count(".") < 2]
+        three_level = [c for c in candidates if c[1].count(".") == 2]
+
+        base_boundary_set = {c[0] for c in base_heads}
+        base_boundary_set.update(idx for idx in heading_idxs if start <= idx < end)
+        base_boundary_set.add(end)
+        base_boundaries = sorted(base_boundary_set)
+
+        def enclosing_base_step(idx):
+            """The base step whose body contains line `idx`, or None."""
+            enclosing = None
+            for c in base_heads:
+                if c[0] < idx:
+                    enclosing = c
+                else:
+                    break
+            if enclosing is None:
+                return None
+            body_end = end
+            for b in base_boundaries:
+                if b > enclosing[0]:
+                    body_end = b
+                    break
+            return enclosing if enclosing[0] < idx < body_end else None
+
+        promoted = []
+        for (i, step_num, title) in three_level:
+            prefix = step_num.rsplit(".", 1)[0]
+            enclosing = enclosing_base_step(i)
+            if enclosing is not None and enclosing[1] == prefix:
+                continue  # absorbed as a sub-step of its enclosing N.M step
+            promoted.append((i, step_num, title))
+
+        step_heads = sorted(base_heads + promoted, key=lambda c: c[0])
 
         boundary_set = {h[0] for h in step_heads}
         boundary_set.update(idx for idx in heading_idxs if start <= idx < end)

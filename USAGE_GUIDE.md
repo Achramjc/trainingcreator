@@ -169,6 +169,15 @@ python -m src.cli -i sop.txt -o ./output -f json
 
 ## SME Review and Approval (Web App)
 
+### Try it with a sample
+
+Before uploading your own SOP, the web app's gallery lets you try the whole flow - generation
+through SME review - against one of six bundled sample SOPs, one per regulatory regime (medical
+device, pharmaceutical, food safety, aerospace, clinical laboratory, and general manufacturing).
+`GET /api/samples` returns the catalog; `POST /api/samples/<id>/generate` accepts the same form
+fields as `/api/upload` (`num_questions`, `passing_score`, `scorm_version`, `output_format`) and
+returns the same response shape, including a `review_url` you can open right away.
+
 `app.py` (`python3 app.py`) generates a package immediately, exactly as the CLI
 does - but nothing generated this way is ready for learners until a named
 human reviews and approves it. Every `/api/upload` response now includes a

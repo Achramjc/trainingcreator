@@ -69,6 +69,40 @@ def test_upload_bad_scorm_version(client, sample_sop_path):
     assert resp.status_code == 400
 
 
+# ---------------------------------------------------------------------------
+# Internal errors must not leak into the response
+# ---------------------------------------------------------------------------
+
+def test_upload_internal_error_hides_exception_text_but_keeps_job_id(
+        client, sample_sop_path, monkeypatch):
+    """An unexpected failure deep in the pipeline (here: the parser) must
+    not leak its exception text to the client - only a generic message and
+    the job id, so support can find the matching log line."""
+    fixed_job_id = "11111111-1111-1111-1111-111111111111"
+    monkeypatch.setattr(app_module.uuid, "uuid4", lambda: fixed_job_id)
+
+    def boom(self, file_path):
+        raise RuntimeError("secret internal detail")
+
+    monkeypatch.setattr(app_module.SOPParser, "parse", boom)
+
+    resp = _upload(client, sample_sop_path)
+    assert resp.status_code == 500
+
+    body = resp.get_data(as_text=True)
+    assert "secret internal detail" not in body
+    assert fixed_job_id in body
+
+
+def test_upload_validation_error_still_returns_precise_message(client, sample_sop_path):
+    """A validation error the app itself raises (not an internal failure)
+    keeps its precise, user-facing message."""
+    resp = _upload(client, sample_sop_path, num_questions="9999")
+    assert resp.status_code == 400
+    error = resp.get_json()["error"]
+    assert "Number of questions must be between" in error
+
+
 def test_oversized_upload_returns_json_413(app, client):
     app.config["MAX_CONTENT_LENGTH"] = 100  # tiny, for the test
     try:

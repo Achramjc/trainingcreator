@@ -11,7 +11,6 @@ inside assessment.html agrees with Python byte for byte.
 import hashlib
 import html as html_module
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -527,67 +526,38 @@ def test_cli_standalone_html_escapes_and_declares_itself_a_preview():
 
 # ---------------------------------------------------------------------------
 # Browser check (bonus - skipped unless Playwright for Python is installed)
+#
+# The ``chromium`` fixture (a headless Chromium on the session's one shared
+# Playwright driver, or a clean skip when none is installed) is defined once,
+# in tests/conftest.py, and shared with tests/conformance/.
 # ---------------------------------------------------------------------------
-def _launch_chromium(playwright):
-    """Launch Chromium, or skip.
-
-    Never installs anything: if the Playwright package and the browser build on
-    disk disagree (a pinned image can carry one and expect another) fall back to
-    whatever Chromium binary is already present under PLAYWRIGHT_BROWSERS_PATH.
-    """
-    try:
-        return playwright.chromium.launch()
-    except Exception:
-        pass
-
-    root = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/opt/pw-browsers"))
-    candidates = sorted(root.glob("chromium_headless_shell-*/chrome-linux/headless_shell"))
-    candidates += sorted(root.glob("chromium-*/chrome-linux/chrome"))
-    for candidate in candidates:
-        try:
-            return playwright.chromium.launch(executable_path=str(candidate))
-        except Exception:
-            continue
-    pytest.skip("no usable Chromium build is installed")
-
-
-def test_naive_learner_fails_in_a_real_browser(built):
+def test_naive_learner_fails_in_a_real_browser(built, chromium):
     """Load assessment.html from file://, answer naively, assert failure; then
     answer correctly and assert the pass message.
 
     file:// has no secure context, so this also proves the pure-JS SHA-256
     fallback path works end to end in a real browser.
     """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        pytest.skip("Playwright for Python is not installed")
-
     assessment = built["assessment"]
     url = (built["package_dir"] / "assessment.html").as_uri()
 
-    with sync_playwright() as playwright:
-        browser = _launch_chromium(playwright)
-        try:
-            page = browser.new_page()
+    page = chromium.new_page()
 
-            page.goto(url)
-            for question in assessment.questions:
-                page.locator(
-                    'input[name="q_{0}"]'.format(question.id)).nth(0).check()
-            page.click("#submit-button")
-            page.wait_for_selector("#results.results.fail", timeout=15000)
-            assert "Additional Study Required" in page.inner_text("#results")
+    page.goto(url)
+    for question in assessment.questions:
+        page.locator(
+            'input[name="q_{0}"]'.format(question.id)).nth(0).check()
+    page.click("#submit-button")
+    page.wait_for_selector("#results.results.fail", timeout=15000)
+    assert "Additional Study Required" in page.inner_text("#results")
 
-            page.goto(url)
-            for question in assessment.questions:
-                page.locator('input[name="q_{0}"]'.format(question.id)).nth(
-                    question.correct_answer).check()
-            page.click("#submit-button")
-            page.wait_for_selector("#results.results.pass", timeout=15000)
-            assert "You Passed" in page.inner_text("#results")
-        finally:
-            browser.close()
+    page.goto(url)
+    for question in assessment.questions:
+        page.locator('input[name="q_{0}"]'.format(question.id)).nth(
+            question.correct_answer).check()
+    page.click("#submit-button")
+    page.wait_for_selector("#results.results.pass", timeout=15000)
+    assert "You Passed" in page.inner_text("#results")
 
 
 # ---------------------------------------------------------------------------

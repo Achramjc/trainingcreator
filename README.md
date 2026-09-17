@@ -40,6 +40,15 @@ python app.py
 
 Simply drag and drop your SOP file, configure your preferences, and download your training package!
 
+#### Try it with a sample
+
+Don't have an SOP handy? The web interface includes a gallery of six sample SOPs spanning
+different regulatory regimes (medical device, pharmaceutical, food safety, aerospace, clinical
+laboratory, and general manufacturing) so you can generate a package and try the SME review
+flow without uploading anything. Programmatically, `GET /api/samples` lists the catalog and
+`POST /api/samples/<id>/generate` runs the same pipeline as `/api/upload` against a chosen
+sample.
+
 ### Command Line Interface
 
 #### Installation
