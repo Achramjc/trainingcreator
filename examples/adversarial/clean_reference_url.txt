@@ -1,0 +1,56 @@
+Standard Operating Procedure: Monthly Eyewash Station Inspection
+
+Version: 4.0
+Effective Date: 05/11/2026
+Department: Environmental Health and Safety
+
+PURPOSE:
+This procedure defines the monthly inspection and flushing of plumbed eyewash stations, so that every station delivers clean water at the required flow when it is needed.
+
+SCOPE:
+This procedure applies to all Facilities Technicians and the EHS Coordinator responsible for the plumbed eyewash stations in Buildings A, B and C.
+
+DEFINITIONS:
+Plumbed Eyewash Station: A station permanently connected to the potable water supply, fitted with dust covers and a stay-open valve.
+Stay-Open Valve: The valve that remains open once actuated so the user needs no hands to keep the flow running.
+Flushing: Running a station to clear stagnant water and confirm flow, recorded on the station tag.
+Station Tag: The inspection tag attached to each station, carrying the date and initials of each monthly inspection.
+
+RESPONSIBILITIES:
+- Facilities Technicians: Inspect and flush each station and complete the station tag
+- EHS Coordinator: Review the monthly inspection sheet and raise work orders for failures
+- Area Supervisors: Keep the access path to each station clear
+- Maintenance Planner: Schedule repairs raised against a failed station
+
+SAFETY WARNINGS:
+WARNING: Water from a station that has not been flushed for a month may be scalding or fouled. Stand clear of the bowl when actuating the valve.
+WARNING: A station with an obstructed access path is a failed station, whatever its flow.
+CAUTION: Wet floors around a flushed station are a slip hazard. Place a wet-floor sign before flushing.
+
+PROCEDURE:
+
+Step 1: Confirm the Access Path
+Confirm the path to the station is clear for the full width of the aisle and that the station is visible from the work area it serves.
+
+Step 2: Inspect the Dust Covers and Nozzles
+Remove the dust covers and inspect both nozzles for scale, debris and damage. A blocked nozzle is a failed station.
+
+Step 3: Actuate the Stay-Open Valve
+Actuate the valve and confirm it stays open without being held. The valve must open in one second or less.
+
+Step 4: Flush for Three Minutes
+Flush the station for three minutes and watch the water clear. Water that is still discoloured after three minutes is a failed station.
+
+Step 5: Check the Flow Pattern
+Confirm both streams meet and rise to an equal height. An uneven pattern is recorded on the inspection sheet as a failure.
+
+Step 6: Close the Valve and Refit the Covers
+Close the stay-open valve, dry the bowl and refit both dust covers.
+
+Step 7: Complete the Station Tag and Inspection Sheet
+Date and initial the station tag, then record the result for each station on the monthly inspection sheet. The EHS Coordinator raises a work order for every failed station within one working day.
+
+REFERENCES:
+SOP-EHS-007 Emergency Shower Inspection
+ANSI/ISEA Z358.1 guidance summary, held at https://standards.example.invalid/z358-1-summary
+SOP-FAC-002 Work Order Priorities

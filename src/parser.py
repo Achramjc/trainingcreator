@@ -9,6 +9,8 @@ from pathlib import Path
 
 import markdown
 
+from .injection_scan import scan_document
+
 
 # Section headings recognised in SOP documents. Keys are the normalised
 # (lower-cased, numbering- and colon-stripped) heading text; values are the
@@ -99,6 +101,14 @@ class SOPContent:
         #: *after* format conversion (e.g. markdown stripped to plain text),
         #: which is NOT the same as `self.raw_content` for markdown input.
         self.lines: List[str] = []
+        #: Result of `src.injection_scan.scan_document(self.lines)` as a dict:
+        #: `{"risk": "none"|"low"|"high", "kinds": [...], "findings": [...], ...}`.
+        #: The document is untrusted input; this records what a lexical scan
+        #: found in it (text aimed at a model, hidden characters, URLs) so the
+        #: review page can warn a human and the optional LLM layer can refuse to
+        #: run on a `high`-risk document. Empty dict only for a `SOPContent`
+        #: built by hand rather than parsed. See `docs/SECURITY.md`.
+        self.injection_scan: Dict[str, any] = {}
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization"""
@@ -116,6 +126,7 @@ class SOPContent:
             "raw_content": self.raw_content,
             "provenance": self.provenance,
             "lines": self.lines,
+            "injection_scan": self.injection_scan,
         }
 
     def excerpt(self, span, context: int = 0) -> str:
@@ -329,6 +340,15 @@ class SOPParser:
 
         lines = content.split('\n')
         sop.lines = lines
+
+        # Scan the untrusted document before anything is extracted from it. The
+        # scan is advisory for the deterministic pipeline (regex cannot be talked
+        # into anything, and everything it emits is escaped) and load-bearing for
+        # the optional LLM layer, which `app.py` / `src/cli.py` refuse to run when
+        # the risk is `high`. Scanned against `lines`, not `raw_content`, so the
+        # scan sees exactly the text the model would be shown and the line
+        # numbers in its findings match the ones in every citation.
+        sop.injection_scan = scan_document(lines).to_dict()
 
         # Extract title (usually first non-empty line or line with "SOP" or "Procedure")
         for i, raw_line in enumerate(lines[:10]):

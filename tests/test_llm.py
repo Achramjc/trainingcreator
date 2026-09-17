@@ -590,9 +590,16 @@ def test_enhance_module_keeps_accepted_and_reverts_rejected_objectives(sop, modu
 
 
 def test_section_summary_is_injected_and_html_escaped(sop, module):
-    """Model text is as untrusted as document text (CLAUDE.md invariant)."""
+    """Model text is as untrusted as document text (CLAUDE.md invariant).
+
+    The escaping is belt to the output filter's braces: a summary containing
+    ``<script>`` no longer gets as far as this - it is rejected outright with kind
+    ``output_filter`` (``tests/test_injection.py``) - so this test uses an
+    ampersand, a character that is legitimate in procedure text and still must not
+    reach a page unescaped.
+    """
     sentences = [
-        {"text": "Alert nearby personnel <script>of the emergency situation "
+        {"text": "Alert nearby personnel of the emergency situation "
                  "& determine whether immediate evacuation is required.",
          "span": STEP1_SPAN},
         {"text": "Assess the nature and severity of the emergency before "
@@ -608,9 +615,8 @@ def test_section_summary_is_injected_and_html_escaped(sop, module):
 
     intro = [s for s in enhanced.sections if s["id"] == "intro"][0]
     assert intro["content"].startswith('<p class="summary">')
-    assert "&lt;script&gt;" in intro["content"]
-    assert "<script>" not in intro["content"]
     assert "&amp;" in intro["content"]
+    assert " & " not in intro["content"]
 
     original_intro = [s for s in module.sections if s["id"] == "intro"][0]
     assert "summary" not in original_intro["content"]           # input untouched

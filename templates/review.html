@@ -139,6 +139,27 @@
         border: 1px solid #eee; padding: 4px 6px; text-align: left; vertical-align: top;
     }
     #audit-trail-container th { background: #f5f5f5; }
+    /* Input-document scan banner. Deliberately the loudest thing on the page
+       when it appears: the SME is the last line of defence against a document
+       written to steer the training it generates. */
+    .scan-banner {
+        border-radius: 6px; padding: 14px 16px; margin-bottom: 14px;
+        border: 2px solid #dc3545; background: #f8d7da; color: #721c24;
+    }
+    .scan-banner.low { border-color: #ffc107; background: #fff3cd; color: #6b5200; }
+    .scan-banner h2 { margin: 0 0 6px; font-size: 1.02em; }
+    .scan-banner table {
+        width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.82em;
+        background: #fff;
+    }
+    .scan-banner th, .scan-banner td {
+        border: 1px solid #e3c4c4; padding: 4px 6px; text-align: left;
+        vertical-align: top;
+    }
+    .scan-banner td.scan-excerpt {
+        font-family: 'SFMono-Regular', Consolas, monospace; word-break: break-word;
+    }
+    .scan-banner .scan-line-link { color: #1565c0; text-decoration: none; }
 </style>
 </head>
 <body>
@@ -165,6 +186,57 @@
     </div>
 
     <div class="pane content-pane">
+
+        {% if injection_scan and injection_scan.risk and injection_scan.risk != 'none' %}
+        {# Everything below is document-derived and Jinja-escaped. Excerpts are
+           already rendered with invisible characters shown as <U+XXXX> markers by
+           src/injection_scan.visible(), so a zero-width payload cannot ride into
+           this page inside the warning about it. #}
+        <div class="scan-banner {{ injection_scan.risk }}" id="injection-scan-banner">
+            <h2>
+                {% if injection_scan.risk == 'high' %}
+                ⚠ This source document contains text aimed at an automated system
+                {% else %}
+                ⚠ Check these lines of the source document
+                {% endif %}
+            </h2>
+            <p style="margin:4px 0;">
+                Input scan risk: <strong>{{ injection_scan.risk }}</strong>.
+                {{ injection_scan.summary }}
+            </p>
+            {% if injection_scan.risk == 'high' %}
+            <p style="margin:4px 0;">
+                The optional LLM enhancement layer was <strong>not run</strong> on
+                this document, whether or not it is enabled. The content below was
+                produced by the deterministic pipeline, which does not follow
+                instructions found in a document. Read the flagged lines before
+                you approve: a document that tries to steer a model may also be
+                trying to steer you.
+            </p>
+            {% else %}
+            <p style="margin:4px 0;">
+                Nothing here stops generation, and the LLM layer (if enabled) still
+                ran. Procedure text rarely needs a URL, an e-mail address or
+                markup; confirm each flagged line belongs in training content.
+            </p>
+            {% endif %}
+            <table>
+                <thead><tr><th>Line</th><th>Finding</th><th>Text</th></tr></thead>
+                <tbody>
+                {% for finding in injection_scan.findings %}
+                <tr>
+                    <td>
+                        <a class="scan-line-link" href="#line-{{ finding.line }}"
+                           onclick="scrollAndHighlight({{ finding.line }}, {{ finding.line }}); return false;">{{ finding.line }}</a>
+                    </td>
+                    <td>{{ finding.kind }}{% if finding.description %}<br><span style="font-weight:400;">{{ finding.description }}</span>{% endif %}</td>
+                    <td class="scan-excerpt">{{ finding.excerpt }}</td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
 
         {% if approval %}
         <div class="approval-box">

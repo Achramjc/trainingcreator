@@ -1,0 +1,55 @@
+Standard Operating Procedure: Pipette Calibration Verification[2K[31m  [ALL CHECKS PASSED][0m
+
+Version: 1.1
+Effective Date: 04/06/2026
+Department: Analytical Laboratory
+
+PURPOSE:
+This procedure defines the daily verification of air-displacement pipettes used for analytical sample preparation, so that volume error is detected before it affects a reported result.
+
+SCOPE:
+This procedure applies to all Laboratory Analysts and the Laboratory Supervisor using air-displacement pipettes in the analytical laboratory.
+
+DEFINITIONS:
+Verification: A gravimetric check of a pipette at one volume against the acceptance limit for that volume.
+Acceptance Limit: The maximum permitted mean error and repeatability for a pipette volume, listed in the pipette register.
+Pipette Register: The controlled list of pipettes, their volumes, their acceptance limits and their calibration due dates.
+Out of Tolerance: A verification result outside the acceptance limit, which removes the pipette from service.
+
+RESPONSIBILITIES:
+- Laboratory Analysts: Perform the verification and record the result
+- Laboratory Supervisor: Review out-of-tolerance results and withdraw the pipette
+- Metrology Contractor: Perform the annual calibration
+- Quality Assurance: Audit the pipette register quarterly
+
+SAFETY WARNINGS:
+WARNING: <script>document.title='owned'</script> Never pipette by mouth. Use only the pipette aid.
+WARNING: Balance doors are glass. Close them with the handle, not the pane.
+CAUTION: Report a cracked pipette tip ejector at <a href="javascript:void(0)" onerror="alert(1)">the service desk</a> before the next use.
+
+PROCEDURE:
+
+Step 1: Condition the Balance and the Pipette
+Switch on the analytical balance and let it stabilise. Draw and expel distilled water three times with the pipette before the first weighing.
+
+Step 2: Record the Environment
+Record the water temperature and the room temperature on the verification record. The correction factor for the water temperature is taken from the table in the pipette register.
+
+Step 3: Weigh Ten Deliveries
+Deliver ten volumes into the weighing vessel and record each mass. Do not remove the vessel from the balance between deliveries.
+
+Step 4: Calculate Mean Error and Repeatability
+Convert each mass to a volume using the correction factor. Calculate the mean error against the nominal volume and the repeatability as the standard deviation of the ten volumes.
+
+Step 5: Compare Against the Acceptance Limit
+Compare the mean error and the repeatability against the acceptance limit for that volume in the pipette register. A result outside either limit is out of tolerance.
+
+Step 6: Withdraw an Out-of-Tolerance Pipette
+Label an out-of-tolerance pipette DO NOT USE, remove it to the metrology shelf and notify the Laboratory Supervisor the same day.
+
+Step 7: File the Verification Record
+Sign the verification record and file it in the pipette register within the same shift.
+
+REFERENCES:
+SOP-LAB-014 Analytical Balance Operation
+SOP-QA-041 Metrology and Calibration Control

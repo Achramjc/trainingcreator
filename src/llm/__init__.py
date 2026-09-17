@@ -27,12 +27,14 @@ from .config import (
     live_tests_enabled,
 )
 from .enhance import (
+    REASON_OUTPUT_FILTER,
     EnhancementItem,
     EnhancementReport,
     enhance_assessment,
     enhance_module,
     merge_reports,
     naive_pickers,
+    output_filter_reasons,
     worst_naive_score,
 )
 from .grounding import (
@@ -44,7 +46,17 @@ from .grounding import (
     verify_claim,
     verify_distractor,
 )
-from .prompts import STABLE_SYSTEM_PROMPT, format_document, system_blocks
+from .prompts import (
+    DOCUMENT_CLOSE_TAG,
+    DOCUMENT_OPEN_TAG,
+    STABLE_SYSTEM_PROMPT,
+    TASK_DATA_REMINDER,
+    UNTRUSTED_DATA_STATEMENT,
+    fenced_document,
+    format_document,
+    system_blocks,
+    user_blocks,
+)
 from .provider import (
     AnthropicProvider,
     FakeProvider,
@@ -79,13 +91,21 @@ __all__ = [
     "resolve_span",
     "span_excerpt",
     "STABLE_SYSTEM_PROMPT",
+    "TASK_DATA_REMINDER",
+    "UNTRUSTED_DATA_STATEMENT",
+    "DOCUMENT_OPEN_TAG",
+    "DOCUMENT_CLOSE_TAG",
+    "fenced_document",
     "format_document",
     "system_blocks",
+    "user_blocks",
     "EnhancementItem",
     "EnhancementReport",
     "enhance_module",
     "enhance_assessment",
     "merge_reports",
     "naive_pickers",
+    "output_filter_reasons",
+    "REASON_OUTPUT_FILTER",
     "worst_naive_score",
 ]

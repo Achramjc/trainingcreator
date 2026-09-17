@@ -387,6 +387,7 @@ def generate_transparency_report(sop_content, training_module, assessment, sourc
     """
 
     citation_coverage = _build_citation_coverage(sop_content, training_module, assessment)
+    input_scan = _build_input_scan_block(sop_content)
 
     report = {
         "report_title": "Training Generation Transparency Report",
@@ -427,6 +428,13 @@ def generate_transparency_report(sop_content, training_module, assessment, sourc
 
         "citation_coverage": citation_coverage,
 
+        # What a lexical scan found in the *input* document: text aimed at an
+        # automated system, hidden characters, URLs. An auditor asking "could
+        # this document have steered its own training?" is asking about this
+        # block, and it is also where the record lives that the LLM layer was
+        # gated. src/injection_scan.py, docs/SECURITY.md.
+        "input_document_scan": input_scan,
+
         # Where the training evidence actually lives once the package is
         # imported, and what is deliberately absent from it.
         "lms_record": dict(LMS_RECORD),
@@ -462,6 +470,63 @@ def generate_transparency_report(sop_content, training_module, assessment, sourc
     report["audit_trail"] = _build_audit_trail_block(audit)
 
     return report
+
+
+def _build_input_scan_block(sop_content):
+    """The input document's prompt-injection scan, for the report.
+
+    Read off the parsed SOP (``SOPContent.injection_scan``) rather than
+    re-scanned, so the report shows what the pipeline actually acted on. A
+    ``SOPContent`` built by hand (a unit test, an older job.json) has no scan,
+    and that is reported as ``not_scanned`` rather than as ``none`` - "we did
+    not look" and "we looked and found nothing" are different claims and an
+    audit report must not conflate them.
+    """
+    scan = getattr(sop_content, "injection_scan", None)
+    if not isinstance(scan, dict) or not scan:
+        return {
+            "risk": "not_scanned",
+            "statement": (
+                "This document was not scanned for prompt-injection content "
+                "(the parsed content carries no scan result)."
+            ),
+            "findings": [],
+        }
+
+    risk = str(scan.get("risk", "none"))
+    findings = [f for f in (scan.get("findings") or []) if isinstance(f, dict)]
+    if risk == "high":
+        statement = (
+            "The source document contains text aimed at an automated system, or "
+            "hidden characters. The optional LLM enhancement layer was NOT run on "
+            "this document; the training content was produced by the "
+            "deterministic pipeline, which does not act on instructions found in "
+            "a document. A reviewer must read the flagged lines: a document that "
+            "tries to steer a model may also be trying to steer a human."
+        )
+    elif risk == "low":
+        statement = (
+            "The source document contains URLs, e-mail addresses or markup. This "
+            "does not gate any part of generation; it is flagged so a reviewer "
+            "confirms the flagged lines belong in training content."
+        )
+    else:
+        statement = (
+            "No prompt-injection indicators were found in the source document. "
+            "This is a lexical scan: it cannot recognise an instruction phrased "
+            "in ordinary procedural language (docs/SECURITY.md)."
+        )
+
+    return {
+        "risk": risk,
+        "statement": statement,
+        "scanner": "src/injection_scan.py (lexical, deterministic, no model)",
+        "kinds": list(scan.get("kinds") or []),
+        "counts_by_kind": dict(scan.get("counts_by_kind") or {}),
+        "summary": scan.get("summary", ""),
+        "gated_llm_enhancement": bool(scan.get("gates_llm")),
+        "findings": findings,
+    }
 
 
 def calculate_file_hash(filepath):
@@ -546,6 +611,57 @@ def _render_citation_bucket_html(title, bucket):
         </table>
     </details>
     """
+
+
+def _render_input_scan_html(report_data):
+    """Render the input-document scan block.
+
+    Everything here is document-derived and therefore escaped. The excerpts
+    arrive already rendered with invisible characters shown as ``<U+XXXX>``
+    markers (``src.injection_scan.visible``), so the warning about a zero-width
+    payload cannot itself carry one into this page.
+    """
+    scan = report_data.get("input_document_scan") or {}
+    if not scan:
+        return ""
+
+    risk = str(scan.get("risk", "none"))
+    css = {"high": "scan-high", "low": "scan-low"}.get(risk, "scan-clean")
+    heading = {
+        "high": "⚠ Input Document Scan &mdash; TEXT AIMED AT AN AUTOMATED SYSTEM",
+        "low": "Input Document Scan &mdash; review the flagged lines",
+        "not_scanned": "Input Document Scan &mdash; not scanned",
+    }.get(risk, "Input Document Scan &mdash; clean")
+
+    rows = "\n".join(
+        "<tr><td>{0}</td><td>{1}</td><td>{2}</td></tr>".format(
+            _escape(str(finding.get("line", ""))),
+            _escape(str(finding.get("kind", ""))),
+            _escape(str(finding.get("excerpt", ""))))
+        for finding in scan.get("findings") or [])
+    table = ""
+    if rows:
+        table = """
+        <table>
+            <thead><tr><th>Line</th><th>Finding</th><th>Text</th></tr></thead>
+            <tbody>
+            {rows}
+            </tbody>
+        </table>""".format(rows=rows)
+
+    return """
+    <div class="section {css}">
+        <h2>{heading}</h2>
+        <p><strong>Risk: {risk}</strong> &mdash; {statement}</p>
+        <p>Scanner: {scanner}. LLM enhancement gated by this scan:
+        <strong>{gated}</strong>.</p>
+        {table}
+    </div>
+    """.format(css=css, heading=heading, risk=_escape(risk),
+               statement=_escape(str(scan.get("statement", ""))),
+               scanner=_escape(str(scan.get("scanner", "n/a"))),
+               gated="yes" if scan.get("gated_llm_enhancement") else "no",
+               table=table)
 
 
 def _render_lms_record_html(report_data):
@@ -831,6 +947,17 @@ def create_html_report(report_data, output_path):
         .audit-problems {{
             color: #c62828;
         }}
+        .scan-high {{
+            border-left: 4px solid #dc3545;
+            background: #f8d7da;
+        }}
+        .scan-low {{
+            border-left: 4px solid #ffc107;
+            background: #fff8e1;
+        }}
+        .scan-clean {{
+            border-left: 4px solid #4caf50;
+        }}
     </style>
 </head>
 <body>
@@ -845,16 +972,16 @@ def create_html_report(report_data, output_path):
 
     <div class="section">
         <h2>Source Document Analysis</h2>
-        <pre>{json.dumps(report_data['source_document'], indent=2)}</pre>
+        <pre>{_escape(json.dumps(report_data['source_document'], indent=2))}</pre>
     </div>
 
     <div class="section">
         <h2>Content Generation Process</h2>
         <h3>Training Content</h3>
-        <pre>{json.dumps(report_data['generation_process']['content_generation'], indent=2)}</pre>
+        <pre>{_escape(json.dumps(report_data['generation_process']['content_generation'], indent=2))}</pre>
 
         <h3>Assessment Generation</h3>
-        <pre>{json.dumps(report_data['generation_process']['assessment_generation'], indent=2)}</pre>
+        <pre>{_escape(json.dumps(report_data['generation_process']['assessment_generation'], indent=2))}</pre>
     </div>
 
     <div class="section">
@@ -868,6 +995,8 @@ def create_html_report(report_data, output_path):
         {_render_citation_bucket_html("Section content", report_data['citation_coverage']['sections'])}
         {_render_citation_bucket_html("Assessment questions", report_data['citation_coverage']['assessment_questions'])}
     </div>
+
+    {_render_input_scan_html(report_data)}
 
     {_render_lms_record_html(report_data)}
 

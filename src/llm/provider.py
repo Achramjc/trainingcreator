@@ -62,12 +62,19 @@ class ProviderResult:
 
 @runtime_checkable
 class Provider(Protocol):
-    """Structural type every provider satisfies."""
+    """Structural type every provider satisfies.
+
+    ``user_prompt`` is either a plain string or a list of content blocks.  The
+    enhancement layer passes blocks (:func:`src.llm.prompts.user_blocks`): the
+    source document, fenced and carrying the ``cache_control`` breakpoint, then
+    the task prompt.  The document is deliberately not in ``system_blocks`` -
+    see ``docs/SECURITY.md``.
+    """
 
     name: str
 
     def complete_json(self, system_blocks: Sequence[Dict[str, Any]],
-                      user_prompt: str,
+                      user_prompt: Any,
                       schema: Dict[str, Any]) -> ProviderResult:
         ...                                 # pragma: no cover - protocol
 
@@ -125,15 +132,41 @@ class FakeProvider:
                               error="FakeProvider: unusable script entry "
                                     "{0!r}".format(type(item).__name__))
 
+    # -- test helpers -------------------------------------------------------
+    def call_text(self, index: int = 0) -> str:
+        """All text the model was sent on call ``index``: system, then user.
+
+        The user turn is a list of content blocks now (document, then task), so
+        a test that wants to assert on what was or was not sent needs the blocks
+        flattened.  ``IndexError`` if that call never happened, which is the
+        right failure for a test.
+        """
+        call = self.calls[index]
+        parts: List[str] = []
+        for block in list(call.get("system_blocks") or []):
+            parts.append(block.get("text", "") if isinstance(block, dict)
+                         else str(block))
+        prompt = call.get("user_prompt")
+        if isinstance(prompt, str):
+            parts.append(prompt)
+        else:
+            for block in list(prompt or []):
+                parts.append(block.get("text", "") if isinstance(block, dict)
+                             else str(block))
+        return "\n".join(parts)
+
 
 class AnthropicProvider:
     """Calls the Claude API for structured JSON, and never lets it escape.
 
-    Caching: the caller passes the stable system prompt and the line-numbered
-    SOP as two ``system`` blocks, each marked ``cache_control``.  The three
-    enhancement calls for one document share that prefix, so calls two and
-    three read it from cache.  The client is built once per provider instance
-    so all three calls go through the same connection pool.
+    Caching: the caller passes the stable system prompt as the single ``system``
+    block and, as the first *user* content block, the fenced line-numbered SOP -
+    both marked ``cache_control``.  The three enhancement calls for one document
+    share that prefix, so calls two and three read it from cache.  The document
+    sits in the user turn on purpose: a ``system`` block lends its contents the
+    caller's authority, and the document is untrusted (``docs/SECURITY.md``).
+    The client is built once per provider instance so all three calls go through
+    the same connection pool.
     """
 
     name = "anthropic"
@@ -172,7 +205,8 @@ class AnthropicProvider:
                 model=self.config.model,
                 max_tokens=self.config.max_tokens,
                 system=list(system_blocks),
-                messages=[{"role": "user", "content": user_prompt}],
+                messages=[{"role": "user",
+                           "content": _user_content(user_prompt)}],
                 output_config={"format": {"type": "json_schema",
                                           "schema": schema}},
             )
@@ -239,6 +273,22 @@ class AnthropicProvider:
                     type(data).__name__))
 
         return ProviderResult(data=data, usage=usage)
+
+
+def _user_content(user_prompt):
+    """Normalise the user turn to what the Messages API accepts.
+
+    A string is passed through (the API wraps it itself); a sequence of content
+    blocks - what :func:`src.llm.prompts.user_blocks` returns, so that the
+    document can carry its own ``cache_control`` breakpoint - is copied into a
+    list.  Accepting both keeps every existing caller and test working.
+    """
+    if isinstance(user_prompt, str):
+        return user_prompt
+    if isinstance(user_prompt, Sequence):
+        return [dict(block) if isinstance(block, dict) else block
+                for block in user_prompt]
+    return str(user_prompt)
 
 
 def _status(exc) -> str:
