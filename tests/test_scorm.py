@@ -149,8 +149,92 @@ def test_scorm_api_still_present_and_wired(built):
         assert function in api
     page = built["assessment_html"]
     assert 'src="scorm_api.js"' in page
-    for call in ("setScore(", "setComplete()", "setPassed()", "setFailed()"):
+    for call in ("setScore(", "setComplete()", "setPassed()", "setFailed()",
+                 "finishSCORM()"):
         assert call in page
+
+
+def test_scorm_api_speaks_both_runtime_bindings(built):
+    """One wrapper, two run-time APIs.
+
+    SCORM 1.2 exposes ``API``/``LMSSetValue``/``cmi.core.*``; SCORM 2004
+    exposes ``API_1484_11``/``SetValue``/``cmi.score.scaled``.  The wrapper
+    used to know only the first, so a 2004 LMS recorded nothing at all.  The
+    behaviour is asserted end to end in ``tests/conformance/test_runtime.py``;
+    this is the cheap regression guard that runs without a browser.
+    """
+    api = (built["package_dir"] / "scorm_api.js").read_text(encoding="utf-8")
+    for token in ("API_1484_11", "Initialize", "Terminate", "SetValue",
+                  "cmi.score.scaled", "cmi.completion_status",
+                  "cmi.success_status"):
+        assert token in api, "no SCORM 2004 support: {0} missing".format(token)
+    for token in ("LMSInitialize", "LMSFinish", "LMSSetValue", "LMSCommit",
+                  "cmi.core.lesson_status", "cmi.core.score.raw"):
+        assert token in api, "no SCORM 1.2 support: {0} missing".format(token)
+    # The discovery walk is bounded, as the specification's pseudo-code is.
+    assert "SCORM_MAX_PARENTS = 7" in api
+    assert "window.opener" in api
+
+
+def test_scorm_api_is_identical_in_both_versions(tmp_path, sop):
+    """The wrapper is discovery-driven, so the same file ships in both
+    packages; only the manifest differs by version."""
+    written = {}
+    for version in ("1.2", "2004"):
+        training = TrainingGenerator().generate(sop)
+        assessment = AssessmentGenerator().generate(sop, num_questions=6)
+        SCORMExporter(scorm_version=version).create_package(
+            training, assessment, str(tmp_path / version), PACKAGE_NAME)
+        package = tmp_path / version / PACKAGE_NAME
+        written[version] = (package / "scorm_api.js").read_text(encoding="utf-8")
+    assert written["1.2"] == written["2004"]
+
+
+def test_2004_package_is_a_2004_package(tmp_path, sop):
+    """The regression this exporter needed: asking for 2004 used to produce a
+    SCORM 1.2 manifest with the string "2004" in <schemaversion>."""
+    training = TrainingGenerator().generate(sop)
+    assessment = AssessmentGenerator().generate(sop, num_questions=6)
+    SCORMExporter(scorm_version="2004").create_package(
+        training, assessment, str(tmp_path), PACKAGE_NAME)
+    root = etree.fromstring(
+        (tmp_path / PACKAGE_NAME / "imsmanifest.xml").read_bytes())
+
+    cp = "http://www.imsglobal.org/xsd/imscp_v1p1"
+    adlcp = "http://www.adlnet.org/xsd/adlcp_v1p3"
+    assert root.tag == "{%s}manifest" % cp
+    assert "http://www.imsproject.org/xsd/imscp_rootv1p1p2" not in \
+        set(root.nsmap.values()), "still bound to the SCORM 1.2 namespace"
+
+    version = root.find("{%s}metadata/{%s}schemaversion" % (cp, cp))
+    assert version is not None and version.text == "2004 4th Edition"
+
+    resources = root.findall("{%s}resources/{%s}resource" % (cp, cp))
+    assert resources
+    for resource in resources:
+        # capital T: 2004 renamed the attribute
+        assert resource.get("{%s}scormType" % adlcp) in ("sco", "asset")
+        assert resource.get("{%s}scormtype" % adlcp) is None
+
+
+def test_every_declared_file_is_in_the_package_and_vice_versa(built):
+    """styles.css and scorm_api.js used to be in the zip but declared by no
+    resource.  An LMS that deploys only what the manifest declares then serves
+    a SCO with no API wrapper at all."""
+    root = etree.fromstring(
+        (built["package_dir"] / "imsmanifest.xml").read_bytes())
+    namespace = {"cp": "http://www.imsproject.org/xsd/imscp_rootv1p1p2"}
+
+    declared = {element.get("href")
+                for element in root.iter("{%s}file" % namespace["cp"])}
+    for href in declared:
+        assert (built["package_dir"] / href).exists(), href
+
+    present = {path.name for path in built["package_dir"].iterdir()
+               if path.is_file()} - {"imsmanifest.xml"}
+    assert present <= declared, sorted(present - declared)
+    for asset in ("styles.css", "scorm_api.js", "metadata.json"):
+        assert asset in declared
 
 
 def test_draft_watermark_is_kept(built):

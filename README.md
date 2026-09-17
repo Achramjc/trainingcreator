@@ -19,7 +19,9 @@ and the roadmap to a compliance-grade product.
 - **Automated Content Extraction**: Extracts procedures, steps, and key SOP sections via pattern matching
 - **Training Content Generation**: Creates structured training modules with learning objectives
 - **Assessment Generation**: Automatically generates verification questions and quizzes
-- **SCORM Export**: Outputs SCORM 1.2/2004 packages
+- **SCORM Export**: Outputs SCORM 1.2 and SCORM 2004 4th Edition packages, each
+  validated against the official ADL/IMS schemas and driven against a fake LMS in
+  a real browser in CI ([docs/SCORM_CONFORMANCE.md](docs/SCORM_CONFORMANCE.md))
 
 ## Quick Start
 
@@ -105,8 +107,12 @@ proof — SME approval stays mandatory. Details and limits: `docs/LLM.md`.
 
 ## Output Formats
 
-- **SCORM 1.2**: Maximum compatibility with older LMS platforms
-- **SCORM 2004**: Modern SCORM standard with sequencing support
+- **SCORM 1.2**: the `API` run-time, `cmi.core.lesson_status` and
+  `cmi.core.score.*`, pass mark as `<adlcp:masteryscore>`. The widest LMS support.
+- **SCORM 2004 4th Edition**: the `API_1484_11` run-time, separate
+  `cmi.completion_status` and `cmi.success_status`, `cmi.score.scaled`, and a pass
+  mark expressed as an IMS Simple Sequencing primary objective. The manifest
+  declares `controlMode choice/flow`; no sequencing *rules* are generated.
 - **HTML Package**: A single-file, **read-only preview** of the training content
   and the assessment questions. It lists each question with its options but does
   **not** score answers, does not record completion and is not LMS-tracked — it
@@ -118,9 +124,36 @@ proof — SME approval stays mandatory. Details and limits: `docs/LLM.md`.
 
 ## LMS Compatibility
 
-Produces SCORM 1.2 and SCORM 2004 packages. Import into any SCORM-conformant LMS.
-Automated conformance testing against the ADL test suite is on the roadmap (see
-[GOAL.md](GOAL.md)) — no specific LMS platform has been verified against these packages yet.
+Produces SCORM 1.2 and SCORM 2004 4th Edition packages. Each is a real package in
+its own binding — different manifest namespaces, different `scormtype` spelling,
+different `<schemaversion>` — and a single run-time wrapper that discovers whichever
+API the LMS exposes and speaks that version's data model.
+
+**What is tested, in CI, on every commit** (`tests/conformance/`):
+
+- `imsmanifest.xml` validates against the **official ADL/IMS XSDs** for its version
+  (vendored in the repo, validated offline), for both SCORM versions, both
+  assessment generators and both sample SOPs.
+- The Content Aggregation Model rules a schema cannot express: every
+  `identifierref` resolves to a launchable SCO, every file the manifest declares
+  is in the zip, every file in the zip is declared, and every page's `styles.css`
+  and `scorm_api.js` are declared by the resource that launches it.
+- Run-time behaviour in **headless Chromium against a recording fake LMS**, with
+  the content loaded two frames below the window holding the API so the SCO has to
+  find it the way it would in a real LMS. SCORM 1.2: `LMSInitialize` once and
+  first, `cmi.core.lesson_status` `passed`/`failed` matching the score,
+  `cmi.core.score.raw`/`min`/`max`, `LMSCommit` then `LMSFinish`, nothing set after
+  the session ends. SCORM 2004: `Initialize`, `cmi.score.scaled` consistent with
+  `cmi.score.raw`, `cmi.success_status`, `cmi.completion_status`, `Commit`,
+  `Terminate`. Plus: a relaunch does not erase a recorded pass, and a package
+  opened with no LMS present still scores and renders.
+
+**What is not tested, and so is not claimed:** no package has been imported into
+any real LMS — not Moodle, Canvas, Cornerstone, SuccessFactors, TalentLMS or SCORM
+Cloud — and this is not ADL certification; ADL's own conformance test suites are
+not part of the harness. Sequencing is declared in the 2004 manifest but its
+behaviour is not exercised, and the packages report status and score only, not
+`cmi.interactions`. Details and the full boundary: [docs/SCORM_CONFORMANCE.md](docs/SCORM_CONFORMANCE.md).
 
 ## Project Structure
 

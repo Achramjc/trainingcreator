@@ -15,6 +15,37 @@ from .answer_key import CLIENT_VERIFIER_JS
 from .generator import TrainingModule
 from .assessments import Assessment
 
+# ---------------------------------------------------------------------------
+# Content Aggregation Model namespaces.
+#
+# SCORM 1.2 and SCORM 2004 are *different* binding vocabularies, not one
+# vocabulary with a version string: different namespace URIs, a differently
+# cased scormType attribute, a different schemaversion token, and - in 2004 -
+# the IMS Simple Sequencing and ADL Navigation namespaces on top.  Emitting a
+# 1.2 manifest with "2004" in <schemaversion> produces a package that no 2004
+# LMS will accept, which is exactly what this exporter used to do.
+# ---------------------------------------------------------------------------
+NS_CP_12 = "http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+NS_ADLCP_12 = "http://www.adlnet.org/xsd/adlcp_rootv1p2"
+
+NS_CP_2004 = "http://www.imsglobal.org/xsd/imscp_v1p1"
+NS_ADLCP_2004 = "http://www.adlnet.org/xsd/adlcp_v1p3"
+NS_ADLSEQ_2004 = "http://www.adlnet.org/xsd/adlseq_v1p3"
+NS_ADLNAV_2004 = "http://www.adlnet.org/xsd/adlnav_v1p3"
+NS_IMSSS_2004 = "http://www.imsglobal.org/xsd/imsss"
+
+NS_XSI = "http://www.w3.org/2001/XMLSchema-instance"
+
+#: The exact <schemaversion> token each SCORM version requires.  "2004" on its
+#: own is not a value the specification defines.
+SCHEMA_VERSION_TOKEN = {"1.2": "1.2", "2004": "2004 4th Edition"}
+
+#: Files every page in the package loads.  They have to be declared as
+#: <file> elements on every resource that needs them, or a CAM-conformant LMS
+#: that deploys only declared files serves a SCO with no stylesheet and,
+#: worse, no SCORM API wrapper - so the course silently reports nothing.
+SHARED_FILES = ("styles.css", "scorm_api.js")
+
 
 class SCORMExporter:
     """Export training content to SCORM 1.2/2004 format"""
@@ -81,79 +112,197 @@ class SCORMExporter:
 
     def _create_manifest(self, package_dir: Path, training_module: TrainingModule,
                         assessment: Assessment):
-        """Create imsmanifest.xml file"""
-        # Create manifest root
-        nsmap = {
-            None: "http://www.imsproject.org/xsd/imscp_rootv1p1p2",
-            "adlcp": "http://www.adlnet.org/xsd/adlcp_rootv1p2",
-            "xsi": "http://www.w3.org/2001/XMLSchema-instance"
-        }
+        """Create imsmanifest.xml, in the binding the requested SCORM version
+        actually defines.
 
-        manifest = etree.Element("manifest", nsmap=nsmap)
-        manifest.set("identifier", "MANIFEST-01")
-        manifest.set("version", "1.0")
+        SCORM 1.2 (CAM 1.2) and SCORM 2004 4th Edition (CAM 1.3) share a shape
+        but nothing else: the namespaces, the ``scormtype``/``scormType``
+        spelling and the ``<schemaversion>`` token all differ, and 2004 carries
+        IMS Simple Sequencing.  Both forms are validated against the official
+        XSDs in ``tests/conformance/``.
+        """
+        if self.scorm_version == "2004":
+            manifest = self._manifest_2004(training_module, assessment)
+        else:
+            manifest = self._manifest_12(training_module, assessment)
 
-        # Metadata
-        metadata = etree.SubElement(manifest, "metadata")
-        schema = etree.SubElement(metadata, "schema")
-        schema.text = "ADL SCORM"
-        schemaversion = etree.SubElement(metadata, "schemaversion")
-        schemaversion.text = self.scorm_version
-
-        # Organizations
-        organizations = etree.SubElement(manifest, "organizations")
-        organizations.set("default", "ORG-01")
-
-        organization = etree.SubElement(organizations, "organization")
-        organization.set("identifier", "ORG-01")
-
-        title = etree.SubElement(organization, "title")
-        title.text = training_module.title
-
-        # Add items for each section
-        for idx, section in enumerate(training_module.sections, 1):
-            item = etree.SubElement(organization, "item")
-            item.set("identifier", f"ITEM-{idx}")
-            item.set("identifierref", f"RES-{idx}")
-            item_title = etree.SubElement(item, "title")
-            item_title.text = section.get('title', f"Section {idx}")
-
-        # Add assessment item
-        assessment_item = etree.SubElement(organization, "item")
-        assessment_item.set("identifier", "ITEM-ASSESSMENT")
-        assessment_item.set("identifierref", "RES-ASSESSMENT")
-        assessment_title = etree.SubElement(assessment_item, "title")
-        assessment_title.text = "Assessment"
-
-        # Resources
-        resources = etree.SubElement(manifest, "resources")
-
-        # Add resource for each section
-        for idx, section in enumerate(training_module.sections, 1):
-            resource = etree.SubElement(resources, "resource")
-            resource.set("identifier", f"RES-{idx}")
-            resource.set("type", "webcontent")
-            resource.set("{http://www.adlnet.org/xsd/adlcp_rootv1p2}scormtype", "sco")
-            resource.set("href", f"content_{idx}.html")
-
-            file_elem = etree.SubElement(resource, "file")
-            file_elem.set("href", f"content_{idx}.html")
-
-        # Add assessment resource
-        assessment_resource = etree.SubElement(resources, "resource")
-        assessment_resource.set("identifier", "RES-ASSESSMENT")
-        assessment_resource.set("type", "webcontent")
-        assessment_resource.set("{http://www.adlnet.org/xsd/adlcp_rootv1p2}scormtype", "sco")
-        assessment_resource.set("href", "assessment.html")
-
-        assessment_file = etree.SubElement(assessment_resource, "file")
-        assessment_file.set("href", "assessment.html")
-
-        # Write manifest
         tree = etree.ElementTree(manifest)
         manifest_path = package_dir / "imsmanifest.xml"
         tree.write(str(manifest_path), pretty_print=True, xml_declaration=True,
                   encoding='UTF-8')
+
+    def _section_pages(self, training_module: TrainingModule):
+        """(item id, resource id, page href, title) for every content page."""
+        for idx, section in enumerate(training_module.sections, 1):
+            yield (f"ITEM-{idx}", f"RES-{idx}", f"content_{idx}.html",
+                   section.get('title', f"Section {idx}"))
+
+    @staticmethod
+    def _declare_files(resource, primary: str):
+        """Declare the resource's own page plus the shared assets it loads.
+
+        Every page in the package does ``<link href="styles.css">`` and
+        ``<script src="scorm_api.js">``.  CAM requires a <file> for each, and
+        an LMS is entitled to deploy only what is declared.
+        """
+        for href in (primary,) + SHARED_FILES:
+            element = etree.SubElement(resource, "file")
+            element.set("href", href)
+
+    def _manifest_12(self, training_module: TrainingModule,
+                     assessment: Assessment):
+        """SCORM 1.2 Content Aggregation Model manifest."""
+        nsmap = {None: NS_CP_12, "adlcp": NS_ADLCP_12, "xsi": NS_XSI}
+        manifest = etree.Element("manifest", nsmap=nsmap)
+        manifest.set("identifier", "MANIFEST-01")
+        manifest.set("version", "1.0")
+        manifest.set("{%s}schemaLocation" % NS_XSI, " ".join([
+            NS_CP_12, "imscp_rootv1p1p2.xsd",
+            NS_ADLCP_12, "adlcp_rootv1p2.xsd",
+        ]))
+
+        metadata = etree.SubElement(manifest, "metadata")
+        etree.SubElement(metadata, "schema").text = "ADL SCORM"
+        etree.SubElement(metadata, "schemaversion").text = SCHEMA_VERSION_TOKEN["1.2"]
+
+        organizations = etree.SubElement(manifest, "organizations")
+        organizations.set("default", "ORG-01")
+        organization = etree.SubElement(organizations, "organization")
+        organization.set("identifier", "ORG-01")
+        etree.SubElement(organization, "title").text = training_module.title
+
+        for item_id, res_id, _href, title in self._section_pages(training_module):
+            item = etree.SubElement(organization, "item")
+            item.set("identifier", item_id)
+            item.set("identifierref", res_id)
+            item.set("isvisible", "true")
+            etree.SubElement(item, "title").text = title
+
+        item = etree.SubElement(organization, "item")
+        item.set("identifier", "ITEM-ASSESSMENT")
+        item.set("identifierref", "RES-ASSESSMENT")
+        item.set("isvisible", "true")
+        etree.SubElement(item, "title").text = "Assessment"
+        # The LMS can apply the same pass mark the page applies.
+        mastery = etree.SubElement(item, "{%s}masteryscore" % NS_ADLCP_12)
+        mastery.text = str(assessment.passing_score)
+
+        resources = etree.SubElement(manifest, "resources")
+        for _item_id, res_id, href, _title in self._section_pages(training_module):
+            resource = etree.SubElement(resources, "resource")
+            resource.set("identifier", res_id)
+            resource.set("type", "webcontent")
+            resource.set("{%s}scormtype" % NS_ADLCP_12, "sco")
+            resource.set("href", href)
+            self._declare_files(resource, href)
+
+        resource = etree.SubElement(resources, "resource")
+        resource.set("identifier", "RES-ASSESSMENT")
+        resource.set("type", "webcontent")
+        resource.set("{%s}scormtype" % NS_ADLCP_12, "sco")
+        resource.set("href", "assessment.html")
+        self._declare_files(resource, "assessment.html")
+
+        # The transparency record is part of the deliverable, so it is declared
+        # rather than left to survive on an LMS's goodwill.  It is an asset: no
+        # launchable href, nothing to track.
+        audit = etree.SubElement(resources, "resource")
+        audit.set("identifier", "RES-METADATA")
+        audit.set("type", "webcontent")
+        audit.set("{%s}scormtype" % NS_ADLCP_12, "asset")
+        etree.SubElement(audit, "file").set("href", "metadata.json")
+
+        return manifest
+
+    def _manifest_2004(self, training_module: TrainingModule,
+                       assessment: Assessment):
+        """SCORM 2004 4th Edition Content Aggregation Model manifest."""
+        nsmap = {
+            None: NS_CP_2004,
+            "adlcp": NS_ADLCP_2004,
+            "adlseq": NS_ADLSEQ_2004,
+            "adlnav": NS_ADLNAV_2004,
+            "imsss": NS_IMSSS_2004,
+            "xsi": NS_XSI,
+        }
+        manifest = etree.Element("manifest", nsmap=nsmap)
+        manifest.set("identifier", "MANIFEST-01")
+        manifest.set("version", "1.0")
+        manifest.set("{%s}schemaLocation" % NS_XSI, " ".join([
+            NS_CP_2004, "imscp_v1p1.xsd",
+            NS_ADLCP_2004, "adlcp_v1p3.xsd",
+            NS_ADLSEQ_2004, "adlseq_v1p3.xsd",
+            NS_ADLNAV_2004, "adlnav_v1p3.xsd",
+            NS_IMSSS_2004, "imsss_v1p0.xsd",
+        ]))
+
+        metadata = etree.SubElement(manifest, "metadata")
+        etree.SubElement(metadata, "schema").text = "ADL SCORM"
+        etree.SubElement(metadata, "schemaversion").text = SCHEMA_VERSION_TOKEN["2004"]
+
+        organizations = etree.SubElement(manifest, "organizations")
+        organizations.set("default", "ORG-01")
+        organization = etree.SubElement(organizations, "organization")
+        organization.set("identifier", "ORG-01")
+        etree.SubElement(organization, "title").text = training_module.title
+
+        for item_id, res_id, _href, title in self._section_pages(training_module):
+            item = etree.SubElement(organization, "item")
+            item.set("identifier", item_id)
+            item.set("identifierref", res_id)
+            item.set("isvisible", "true")
+            etree.SubElement(item, "title").text = title
+
+        item = etree.SubElement(organization, "item")
+        item.set("identifier", "ITEM-ASSESSMENT")
+        item.set("identifierref", "RES-ASSESSMENT")
+        item.set("isvisible", "true")
+        etree.SubElement(item, "title").text = "Assessment"
+        # The pass mark, expressed the way 2004 expresses it: satisfaction is
+        # decided by cmi.score.scaled against a normalised measure.  This is
+        # the 2004 equivalent of 1.2's <adlcp:masteryscore>.
+        sequencing = etree.SubElement(item, "{%s}sequencing" % NS_IMSSS_2004)
+        objectives = etree.SubElement(sequencing, "{%s}objectives" % NS_IMSSS_2004)
+        primary = etree.SubElement(objectives,
+                                   "{%s}primaryObjective" % NS_IMSSS_2004)
+        primary.set("objectiveID", "OBJ-ASSESSMENT")
+        primary.set("satisfiedByMeasure", "true")
+        measure = etree.SubElement(primary,
+                                   "{%s}minNormalizedMeasure" % NS_IMSSS_2004)
+        measure.text = "{0:.4f}".format(assessment.passing_score / 100.0)
+
+        # Learners may move between pages freely and the LMS may flow them
+        # through in order; nothing here gates one page behind another.
+        org_sequencing = etree.SubElement(organization,
+                                          "{%s}sequencing" % NS_IMSSS_2004)
+        control = etree.SubElement(org_sequencing,
+                                   "{%s}controlMode" % NS_IMSSS_2004)
+        control.set("choice", "true")
+        control.set("flow", "true")
+
+        resources = etree.SubElement(manifest, "resources")
+        for _item_id, res_id, href, _title in self._section_pages(training_module):
+            resource = etree.SubElement(resources, "resource")
+            resource.set("identifier", res_id)
+            resource.set("type", "webcontent")
+            resource.set("{%s}scormType" % NS_ADLCP_2004, "sco")
+            resource.set("href", href)
+            self._declare_files(resource, href)
+
+        resource = etree.SubElement(resources, "resource")
+        resource.set("identifier", "RES-ASSESSMENT")
+        resource.set("type", "webcontent")
+        resource.set("{%s}scormType" % NS_ADLCP_2004, "sco")
+        resource.set("href", "assessment.html")
+        self._declare_files(resource, "assessment.html")
+
+        audit = etree.SubElement(resources, "resource")
+        audit.set("identifier", "RES-METADATA")
+        audit.set("type", "webcontent")
+        audit.set("{%s}scormType" % NS_ADLCP_2004, "asset")
+        etree.SubElement(audit, "file").set("href", "metadata.json")
+
+        return manifest
 
     def _create_content_files(self, package_dir: Path, training_module: TrainingModule,
                              assessment: Assessment, approval: Optional[dict] = None):
@@ -401,6 +550,12 @@ class SCORMExporter:
             initializeSCORM();
         }};
 
+        /* If the learner navigates away mid-attempt the session still has to
+         * be closed, or an LMS may discard everything committed so far. */
+        window.onbeforeunload = function() {{
+            finishSCORM();
+        }};
+
         function showResults(percentage, missed) {{
             var resultsDiv = document.getElementById('results');
             resultsDiv.style.display = 'block';
@@ -426,8 +581,11 @@ class SCORMExporter:
                 resultsDiv.innerHTML = '<h2>Congratulations! You Passed!</h2>' +
                     '<p>Your score: ' + percentage + '%</p>' +
                     '<p>Passing score: ' + passingScore + '%</p>' + detail;
-                setComplete();
+                /* Success first, then completion: in SCORM 1.2 both live in
+                 * cmi.core.lesson_status, and setComplete() deliberately
+                 * refuses to overwrite a recorded passed/failed. */
                 setPassed();
+                setComplete();
             }} else {{
                 resultsDiv.className = 'results fail';
                 resultsDiv.innerHTML = '<h2>Additional Study Required</h2>' +
@@ -436,6 +594,11 @@ class SCORMExporter:
                     '<p>Please review the material and try again.</p>' + detail;
                 setFailed();
             }}
+
+            /* The attempt is over and everything is recorded: commit and end
+             * the session. Several LMSs discard an attempt that is never
+             * terminated. */
+            finishSCORM();
         }}
 
         function submitAssessment() {{
@@ -503,82 +666,217 @@ class SCORMExporter:
         return page
 
     def _create_api_files(self, package_dir: Path):
-        """Create SCORM API wrapper JavaScript"""
+        """Write ``scorm_api.js``: one wrapper that speaks both run-time APIs.
+
+        A SCO does not get told which SCORM version its LMS implements - it
+        discovers it.  SCORM 1.2 exposes an object called ``API`` with
+        ``LMSInitialize``/``LMSSetValue``/``LMSCommit``/``LMSFinish`` over the
+        ``cmi.core.*`` data model; SCORM 2004 exposes ``API_1484_11`` with
+        ``Initialize``/``SetValue``/``Commit``/``Terminate`` over ``cmi.score.*``,
+        ``cmi.completion_status`` and ``cmi.success_status``.  This wrapper
+        finds whichever is there (walking up to seven frames of ancestors, then
+        the opener's, as the specification's pseudo-code does) and maps the
+        page's calls onto it.  With no LMS at all every entry point is a no-op
+        that returns false, so the page still scores and still renders.
+        """
         api_js = """
-        // SCORM API Wrapper
+        /* SCORM run-time wrapper: SCORM 1.2 (API / cmi.core.*) and
+         * SCORM 2004 (API_1484_11 / cmi.*), discovered at run time.
+         * Exercised against a recording fake LMS in tests/conformance/. */
         var scorm = {
-            version: null,
-            api: null
+            api: null,          /* the LMS-provided API object */
+            version: null,      /* "1.2" | "2004" | null when no LMS is present */
+            initialized: false,
+            terminated: false
         };
 
-        function initializeSCORM() {
-            scorm.api = getAPI();
-            if (scorm.api) {
-                scorm.api.LMSInitialize("");
-                scorm.api.LMSSetValue("cmi.core.lesson_status", "incomplete");
-            }
+        /* The specification's API discovery limit: give up after seven
+         * ancestors rather than climbing a pathological frameset forever. */
+        var SCORM_MAX_PARENTS = 7;
+
+        function findAPIInWindow(win) {
+            /* Cross-origin frames throw on property access; that is a "no API
+             * here", not a failure of the SCO. */
+            try {
+                if (win.API_1484_11) {
+                    return { api: win.API_1484_11, version: "2004" };
+                }
+            } catch (e) { /* cross-origin ancestor */ }
+            try {
+                if (win.API) {
+                    return { api: win.API, version: "1.2" };
+                }
+            } catch (e) { /* cross-origin ancestor */ }
+            return null;
         }
 
-        function finishSCORM() {
-            if (scorm.api) {
-                scorm.api.LMSCommit("");
-                scorm.api.LMSFinish("");
+        function findAPIUpFrom(win) {
+            var current = win;
+            var depth = 0;
+            while (current && depth <= SCORM_MAX_PARENTS) {
+                var found = findAPIInWindow(current);
+                if (found) { return found; }
+                var next = null;
+                try { next = current.parent; } catch (e) { next = null; }
+                if (!next || next === current) { return null; }
+                current = next;
+                depth += 1;
             }
-        }
-
-        function setComplete() {
-            if (scorm.api) {
-                scorm.api.LMSSetValue("cmi.core.lesson_status", "completed");
-                scorm.api.LMSCommit("");
-            }
-        }
-
-        function setPassed() {
-            if (scorm.api) {
-                scorm.api.LMSSetValue("cmi.core.lesson_status", "passed");
-                scorm.api.LMSCommit("");
-            }
-        }
-
-        function setFailed() {
-            if (scorm.api) {
-                scorm.api.LMSSetValue("cmi.core.lesson_status", "failed");
-                scorm.api.LMSCommit("");
-            }
-        }
-
-        function setScore(score) {
-            if (scorm.api) {
-                scorm.api.LMSSetValue("cmi.core.score.raw", score.toString());
-                scorm.api.LMSSetValue("cmi.core.score.min", "0");
-                scorm.api.LMSSetValue("cmi.core.score.max", "100");
-                scorm.api.LMSCommit("");
-            }
+            return null;
         }
 
         function getAPI() {
-            var api = null;
-
-            // Check current window
-            if (window.API) {
-                return window.API;
-            }
-
-            // Check parent windows
-            var parent = window.parent;
-            while (parent && parent != window) {
-                if (parent.API) {
-                    return parent.API;
+            var found = findAPIUpFrom(window);
+            if (!found) {
+                var opener = null;
+                try { opener = window.opener; } catch (e) { opener = null; }
+                if (opener) {
+                    try {
+                        if (!opener.closed) { found = findAPIUpFrom(opener); }
+                    } catch (e) { /* cross-origin opener */ }
                 }
-                parent = parent.parent;
             }
+            scorm.api = found ? found.api : null;
+            scorm.version = found ? found.version : null;
+            return scorm.api;
+        }
 
-            // Check opener
-            if (window.opener && window.opener.API) {
-                return window.opener.API;
+        function scormUsable() {
+            return !!(scorm.api && scorm.initialized && !scorm.terminated);
+        }
+
+        function scormGet(element) {
+            if (!scormUsable()) { return ""; }
+            var value = (scorm.version === "2004")
+                ? scorm.api.GetValue(element)
+                : scorm.api.LMSGetValue(element);
+            return (value === null || value === undefined) ? "" : String(value);
+        }
+
+        function scormSet(element, value) {
+            /* Every value crossing the API boundary is a string: the data model
+             * is CMIString/CMIDecimal, and an LMS handed a JS number may store
+             * "85.00000001" or reject the call outright. */
+            if (!scormUsable()) { return false; }
+            var result = (scorm.version === "2004")
+                ? scorm.api.SetValue(element, String(value))
+                : scorm.api.LMSSetValue(element, String(value));
+            return String(result) === "true";
+        }
+
+        function scormCommit() {
+            if (!scormUsable()) { return false; }
+            var result = (scorm.version === "2004")
+                ? scorm.api.Commit("")
+                : scorm.api.LMSCommit("");
+            return String(result) === "true";
+        }
+
+        function initializeSCORM() {
+            if (scorm.initialized) { return true; }
+            getAPI();
+            if (!scorm.api) { return false; }
+
+            var started = (scorm.version === "2004")
+                ? scorm.api.Initialize("")
+                : scorm.api.LMSInitialize("");
+            if (String(started) !== "true") {
+                scorm.api = null;
+                scorm.version = null;
+                return false;
             }
+            scorm.initialized = true;
+            scorm.terminated = false;
 
-            return null;
+            /* Mark the attempt in progress WITHOUT overwriting a status the
+             * learner already earned.  Setting "incomplete" unconditionally on
+             * every launch - which this wrapper used to do - erases a recorded
+             * pass the moment the learner reopens the module. */
+            if (scorm.version === "2004") {
+                var completion = scormGet("cmi.completion_status");
+                if (completion === "" || completion === "unknown" ||
+                        completion === "not attempted") {
+                    scormSet("cmi.completion_status", "incomplete");
+                }
+            } else {
+                var status = scormGet("cmi.core.lesson_status");
+                if (status === "" || status === "not attempted") {
+                    scormSet("cmi.core.lesson_status", "incomplete");
+                }
+            }
+            scormCommit();
+            return true;
+        }
+
+        function finishSCORM() {
+            if (!scormUsable()) { return false; }
+            scormCommit();
+            /* Set the flag before the call so a re-entrant unload handler
+             * cannot terminate twice. */
+            scorm.terminated = true;
+            var result = (scorm.version === "2004")
+                ? scorm.api.Terminate("")
+                : scorm.api.LMSFinish("");
+            return String(result) === "true";
+        }
+
+        function setComplete() {
+            if (!scormUsable()) { return false; }
+            if (scorm.version === "2004") {
+                scormSet("cmi.completion_status", "completed");
+            } else {
+                /* In SCORM 1.2 one element carries both completion and
+                 * success, so "completed" must never overwrite a
+                 * passed/failed the assessment has already recorded. */
+                var status = scormGet("cmi.core.lesson_status");
+                if (status !== "passed" && status !== "failed") {
+                    scormSet("cmi.core.lesson_status", "completed");
+                }
+            }
+            return scormCommit();
+        }
+
+        function setPassed() {
+            if (!scormUsable()) { return false; }
+            if (scorm.version === "2004") {
+                scormSet("cmi.success_status", "passed");
+                scormSet("cmi.completion_status", "completed");
+            } else {
+                scormSet("cmi.core.lesson_status", "passed");
+            }
+            return scormCommit();
+        }
+
+        function setFailed() {
+            if (!scormUsable()) { return false; }
+            if (scorm.version === "2004") {
+                scormSet("cmi.success_status", "failed");
+                scormSet("cmi.completion_status", "completed");
+            } else {
+                scormSet("cmi.core.lesson_status", "failed");
+            }
+            return scormCommit();
+        }
+
+        function setScore(score) {
+            if (!scormUsable()) { return false; }
+            var raw = Number(score);
+            if (!isFinite(raw)) { raw = 0; }
+            if (raw < 0) { raw = 0; }
+            if (raw > 100) { raw = 100; }
+
+            if (scorm.version === "2004") {
+                scormSet("cmi.score.min", "0");
+                scormSet("cmi.score.max", "100");
+                scormSet("cmi.score.raw", String(raw));
+                /* 2004 rolls up on the normalised measure, not on raw. */
+                scormSet("cmi.score.scaled", String(raw / 100));
+            } else {
+                scormSet("cmi.core.score.min", "0");
+                scormSet("cmi.core.score.max", "100");
+                scormSet("cmi.core.score.raw", String(raw));
+            }
+            return scormCommit();
         }
         """
         (package_dir / "scorm_api.js").write_text(api_js)
