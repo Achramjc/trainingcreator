@@ -22,6 +22,54 @@ REQUIRED_APPROVAL_KEYS = ("approved_by", "role", "approved_at", "notes", "edits_
 
 
 # ---------------------------------------------------------------------------
+# What the LMS record will contain
+#
+# We are not the system of record: the customer's validated LMS is (GOAL.md
+# non-goal 1, 21 CFR 820.25). An auditor reading this report therefore needs to
+# know which evidence lands *there* rather than here, and - just as important -
+# which evidence does not. The SCORM package writes the block below; the exact
+# element names per version are in docs/SCORM_CONFORMANCE.md and the behaviour
+# is pinned by tests/conformance/test_runtime.py against a recording LMS.
+# ---------------------------------------------------------------------------
+LMS_RECORD = {
+    "written_by": "the SCORM package, from the learner's browser, at submission",
+    "score": (
+        "Percentage score: cmi.core.score.raw, .min and .max (SCORM 1.2); "
+        "cmi.score.raw, .min, .max and cmi.score.scaled (SCORM 2004)."
+    ),
+    "status": (
+        "cmi.core.lesson_status passed/failed/completed (SCORM 1.2); "
+        "cmi.success_status plus cmi.completion_status (SCORM 2004)."
+    ),
+    "per_question_evidence": (
+        "One cmi.interactions entry per assessment question, in the order the "
+        "questions were presented: the question id, the interaction type, the "
+        "response the learner selected, whether it was correct, the question's "
+        "weighting, the latency and the time of submission. SCORM 2004 also "
+        "carries the question text and an objective id."
+    ),
+    "session": (
+        "Session time and exit, plus cmi.suspend_data holding "
+        "{attempt, responses} as compact JSON within the 4096-character limit."
+    ),
+    "not_written": (
+        "The answer key. cmi.interactions.n.correct_responses is never written, "
+        "in either version, because the package would have to carry the "
+        "expected answer through the learner's browser to write it. An auditor "
+        "can see what each learner answered and whether it was judged correct; "
+        "the correct answer itself stays in this report and in the SME review "
+        "record, not in the LMS."
+    ),
+    "verification_boundary": (
+        "Scoring is performed by the package in the learner's browser and "
+        "reported to the LMS; it is not independently verified by the LMS or by "
+        "a server. See src/answer_key.py for what that does and does not "
+        "protect against."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Citation resolution
 # ---------------------------------------------------------------------------
 
@@ -248,6 +296,10 @@ def generate_transparency_report(sop_content, training_module, assessment, sourc
 
         "citation_coverage": citation_coverage,
 
+        # Where the training evidence actually lives once the package is
+        # imported, and what is deliberately absent from it.
+        "lms_record": dict(LMS_RECORD),
+
         "review_checklist": {
             "technical_accuracy": "[ ] Subject Matter Expert review required",
             "compliance_alignment": "[ ] Quality Assurance review required",
@@ -360,6 +412,44 @@ def _render_citation_bucket_html(title, bucket):
             </tbody>
         </table>
     </details>
+    """
+
+
+def _render_lms_record_html(report_data):
+    """Render the "LMS record" block: what the package reports to the LMS.
+
+    Everything here is fixed text from this module, but it is escaped anyway -
+    a report that escapes some of its inputs and not others is one refactor
+    away from a hole.
+    """
+    record = report_data.get("lms_record") or {}
+    if not record:
+        return ""
+
+    labels = (
+        ("written_by", "Written by"),
+        ("score", "Score"),
+        ("status", "Completion / success status"),
+        ("per_question_evidence", "Per-question evidence"),
+        ("session", "Session"),
+        ("not_written", "Deliberately NOT written"),
+        ("verification_boundary", "Verification boundary"),
+    )
+    rows = "\n".join(
+        f"<tr><th>{_escape(label)}</th><td>{_escape(str(record.get(key, '')))}</td></tr>"
+        for key, label in labels if record.get(key)
+    )
+    return f"""
+    <div class="section">
+        <h2>LMS Record</h2>
+        <p>This tool is not the system of record. Once the package is imported, the
+        customer's validated LMS holds the training evidence below (21 CFR 820.25).
+        The element names for each SCORM version are listed in
+        <code>docs/SCORM_CONFORMANCE.md</code>.</p>
+        <table>
+            {rows}
+        </table>
+    </div>
     """
 
 
@@ -528,6 +618,8 @@ def create_html_report(report_data, output_path):
         {_render_citation_bucket_html("Section content", report_data['citation_coverage']['sections'])}
         {_render_citation_bucket_html("Assessment questions", report_data['citation_coverage']['assessment_questions'])}
     </div>
+
+    {_render_lms_record_html(report_data)}
 
     <div class="checklist">
         <h2>✓ Required Reviews Before Use</h2>

@@ -11,6 +11,8 @@ as they do in a deployed package.  The browser tests skip cleanly when no
 Chromium is installed, so the plain CI job stays green.
 """
 
+import json
+import math
 import re
 import shutil
 
@@ -89,8 +91,16 @@ def open_sco(chromium, tmp_path):
     return factory
 
 
-def _answer(session, package, correct):
+def _answer(session, package, correct, skip=()):
+    """Play one strategy through the assessment and submit.
+
+    ``skip`` is a set of question ids to leave blank, which is how the
+    "learner never answered this one" branch of the interaction record is
+    reached.
+    """
     for question in package.assessment.questions:
+        if question.id in skip:
+            continue
         index = question.correct_answer if correct else 0
         session.sco.locator(
             'input[name="q_{0}"]'.format(question.id)).nth(index).check()
@@ -221,17 +231,45 @@ def test_scorm12_passing_attempt(package_factory, open_sco):
 
 
 def test_scorm12_uses_only_cmi_core_elements(package_factory, open_sco):
+    """A 1.2 SCO may write cmi.core.*, and the two elements 1.2 keeps outside
+    it: cmi.suspend_data and cmi.interactions.  Nothing else."""
     package = package_factory("1.2")
     with open_sco(package) as session:
         _answer(session, package, correct=True)
         _wait_for_result(session, "pass")
         recording = session.recording()
 
-    written = {call["args"][0] for call in recording.sets()}
-    assert written <= {
+    written = recording.written_keys()
+    allowed_core = {
         "cmi.core.lesson_status", "cmi.core.score.raw",
         "cmi.core.score.min", "cmi.core.score.max",
-    }, written
+        "cmi.core.session_time", "cmi.core.exit",
+    }
+    for element in written:
+        assert (element in allowed_core
+                or element == "cmi.suspend_data"
+                or element.startswith("cmi.interactions.")), element
+    # The 1.2 elements that must be there, and the 2004 spellings that must not.
+    assert allowed_core <= written, allowed_core - written
+    assert not any(element.startswith(("cmi.score.", "cmi.completion_",
+                                       "cmi.success_", "cmi.session_time",
+                                       "cmi.exit"))
+                   for element in written), written
+
+
+def test_scorm12_session_time_and_exit(package_factory, open_sco):
+    package = package_factory("1.2")
+    with open_sco(package) as session:
+        _answer(session, package, correct=True)
+        _wait_for_result(session, "pass")
+        recording = session.recording()
+
+    # CMITimespan: HHHH:MM:SS.SS
+    session_time = recording.last_set("cmi.core.session_time")
+    assert re.fullmatch(r"\d{4}:[0-5]\d:[0-5]\d\.\d{2}", session_time or ""), \
+        session_time
+    # "" is the 1.2 vocabulary for an ordinary end of session.
+    assert recording.last_set("cmi.core.exit") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -293,12 +331,30 @@ def test_scorm2004_uses_only_the_2004_data_model(package_factory, open_sco):
         _wait_for_result(session, "pass")
         recording = session.recording()
 
-    written = {call["args"][0] for call in recording.sets()}
-    assert written <= {
+    written = recording.written_keys()
+    allowed = {
         "cmi.completion_status", "cmi.success_status", "cmi.score.raw",
         "cmi.score.min", "cmi.score.max", "cmi.score.scaled",
-    }, written
+        "cmi.session_time", "cmi.exit", "cmi.suspend_data",
+    }
+    for element in written:
+        assert element in allowed or element.startswith("cmi.interactions."), \
+            element
+    assert allowed <= written, allowed - written
     assert not any(element.startswith("cmi.core.") for element in written)
+
+
+def test_scorm2004_session_time_and_exit(package_factory, open_sco):
+    package = package_factory("2004")
+    with open_sco(package) as session:
+        _answer(session, package, correct=True)
+        _wait_for_result(session, "pass")
+        recording = session.recording()
+
+    # timeinterval(second,10,2): an ISO 8601 duration.
+    session_time = recording.last_set("cmi.session_time")
+    assert re.fullmatch(r"PT\d+H\d+M\d+\.\d{2}S", session_time or ""), session_time
+    assert recording.last_set("cmi.exit") == "normal"
 
 
 # ---------------------------------------------------------------------------
@@ -440,3 +496,245 @@ def test_the_wrapper_speaks_whichever_api_it_finds(package_version,
         assert recording.model["cmi.core.lesson_status"] == "passed"
         assert recording.model["cmi.core.score.raw"] == "100"
     assert not session.errors, session.errors
+
+
+# ---------------------------------------------------------------------------
+# cmi.interactions - per-question evidence in the LMS record
+#
+# Everything below is re-derived from the Python model rather than imported
+# from src/scorm_exporter.py: a test that imports the mapping it is checking
+# cannot fail when the mapping is wrong.  The format rules asserted here are
+# the ones docs/SCORM_CONFORMANCE.md cites - a real LMS enforces them, the fake
+# LMS records whatever it is handed.
+# ---------------------------------------------------------------------------
+OPTION_IDS = "abcdefghijklmnopqrstuvwxyz"
+
+#: 1.2 CMITimespan / 2004 timeinterval, and 1.2 CMITime / 2004 ISO timestamp.
+LATENCY_PATTERN = {
+    "1.2": r"\d{4}:[0-5]\d:[0-5]\d\.\d{2}",
+    "2004": r"PT\d+H\d+M\d+\.\d{2}S",
+}
+WHEN_ELEMENT = {"1.2": "time", "2004": "timestamp"}
+WHEN_PATTERN = {
+    "1.2": r"[0-2]\d:[0-5]\d:[0-5]\d",
+    "2004": r"\d{4}-\d{2}-\d{2}T[0-2]\d:[0-5]\d:[0-5]\dZ",
+}
+RESPONSE_ELEMENT = {"1.2": "student_response", "2004": "learner_response"}
+WRONG = {"1.2": "wrong", "2004": "incorrect"}
+
+INTERACTION_MATRIX = [
+    (version, generator, fixture, strategy)
+    for version in ("1.2", "2004")
+    for generator in ("standard", "medical")
+    for fixture in ("sample", "numbered")
+    for strategy in ("always-first", "all-correct")
+]
+INTERACTION_IDS = ["{0}-{1}-{2}-{3}".format(*case)
+                   for case in INTERACTION_MATRIX]
+
+
+def _expected_interaction_type(question):
+    return "true-false" if question.type == "true_false" else "choice"
+
+
+def _expected_response(question, chosen, version):
+    """The response token the data model expects for *chosen* (an index)."""
+    if question.type == "true_false":
+        truthy = question.options[chosen].strip().lower() == "true"
+        if version == "2004":
+            return "true" if truthy else "false"
+        return "t" if truthy else "f"
+    return OPTION_IDS[chosen]
+
+
+@pytest.mark.parametrize("version,generator,fixture,strategy",
+                         INTERACTION_MATRIX, ids=INTERACTION_IDS)
+def test_interactions_record_every_question(version, generator, fixture,
+                                            strategy, package_factory,
+                                            open_sco):
+    """One interaction per question, matching the Python model for the
+    strategy actually played - and never the answer key."""
+    package = package_factory(version, generator, fixture)
+    questions = package.assessment.questions
+    correct = (strategy == "all-correct")
+    expected_score = (package.perfect_percentage if correct
+                      else package.naive_percentage)
+
+    with open_sco(package) as session:
+        _answer(session, package, correct=correct)
+        _wait_for_result(
+            session,
+            "pass" if expected_score >= package.passing_score else "fail")
+        recording = session.recording()
+    assert not session.errors, session.errors
+
+    interactions = recording.interactions()
+    assert recording.interaction_indices() == list(range(len(questions))), (
+        "expected {0} interactions indexed from 0, got {1}".format(
+            len(questions), sorted(interactions)))
+
+    for index, question in enumerate(questions):
+        written = interactions[index]
+        chosen = question.correct_answer if correct else 0
+
+        assert written["id"] == question.id, written
+        assert written["type"] == _expected_interaction_type(question), written
+        assert written["weighting"] == str(question.points), written
+        assert written[RESPONSE_ELEMENT[version]] == \
+            _expected_response(question, chosen, version), written
+
+        expected_result = ("correct" if chosen == question.correct_answer
+                           else WRONG[version])
+        assert written["result"] == expected_result, (
+            "{0}: the model says {1}, the LMS recorded {2}".format(
+                question.id, expected_result, written["result"]))
+
+        assert re.fullmatch(LATENCY_PATTERN[version], written["latency"]), \
+            written["latency"]
+        when = written[WHEN_ELEMENT[version]]
+        assert re.fullmatch(WHEN_PATTERN[version], when), when
+
+        if version == "2004":
+            description = written["description"]
+            assert len(description) <= 250, len(description)
+            assert description == " ".join(question.text.split())[:250]
+            kind = (question.source_ref or {}).get("kind")
+            if kind:
+                assert written["objectives.0.id"] == kind, written
+        else:
+            # 1.2 defines neither element, and every 1.2 interaction element
+            # is write-only - nothing here reads one back.
+            assert "description" not in written, written
+            assert "timestamp" not in written, written
+
+        # The answer key must never travel to the LMS through the learner's
+        # browser, and correct_responses is exactly that key.
+        assert not any(field.startswith("correct_responses")
+                       for field in written), written
+
+    # suspend_data: parseable, inside the cap, and carrying what was answered -
+    # nothing about which answer was right.
+    suspend = recording.last_set("cmi.suspend_data")
+    assert suspend is not None, recording.pretty()
+    assert len(suspend) <= 4096, len(suspend)
+    parsed = json.loads(suspend)
+    assert set(parsed) == {"attempt", "responses"}, parsed
+    assert parsed["attempt"] == 1, parsed
+    assert parsed["responses"] == {
+        question.id: _expected_response(
+            question, question.correct_answer if correct else 0, version)
+        for question in questions
+    }, parsed
+
+
+@pytest.mark.parametrize("version", ["1.2", "2004"])
+def test_no_interaction_is_written_after_the_session_ends(version,
+                                                          package_factory,
+                                                          open_sco):
+    """Interactions are evidence only if the LMS accepted them.  A write after
+    LMSFinish/Terminate is rejected, and the question then silently disappears
+    from the training record."""
+    package = package_factory(version)
+    finish = "Terminate" if version == "2004" else "LMSFinish"
+
+    with open_sco(package) as session:
+        _answer(session, package, correct=True)
+        _wait_for_result(session, "pass")
+        recording = session.recording()
+
+    finish_at = recording.index_of(finish)
+    assert finish_at is not None, recording.pretty()
+
+    last_interaction = None
+    for position, call in enumerate(recording.calls):
+        if call["fn"] in ("SetValue", "LMSSetValue") and \
+                call["args"][0].startswith("cmi.interactions."):
+            last_interaction = position
+    assert last_interaction is not None, recording.pretty()
+    assert last_interaction < finish_at, (
+        "an interaction was written after the session ended\n"
+        + recording.pretty())
+
+    commit = "Commit" if version == "2004" else "LMSCommit"
+    assert any(call["fn"] == commit
+               for call in recording.calls[last_interaction:]), (
+        "the interactions were never committed\n" + recording.pretty())
+
+    for call in recording.interaction_writes():
+        assert call["ret"] == "true", call
+        assert call["argTypes"] == ["string", "string"], call
+
+
+@pytest.mark.parametrize("version", ["1.2", "2004"])
+def test_an_unanswered_question_is_recorded_as_neutral(version,
+                                                       package_factory,
+                                                       open_sco):
+    """A skipped question is still an interaction: the auditor needs to see
+    that it was put to the learner and left blank."""
+    package = package_factory(version)
+    skipped = package.assessment.questions[1]
+    total = sum(question.points for question in package.assessment.questions)
+    # Math.round, as the page computes it.
+    percentage = int(math.floor(((total - skipped.points) / total) * 100 + 0.5))
+
+    with open_sco(package) as session:
+        _answer(session, package, correct=True, skip={skipped.id})
+        _wait_for_result(
+            session, "pass" if percentage >= package.passing_score else "fail")
+        recording = session.recording()
+
+    interactions = recording.interactions()
+    assert len(interactions) == len(package.assessment.questions)
+
+    written = interactions[1]
+    assert written["id"] == skipped.id
+    assert written["result"] == "neutral", written
+    # No response element at all: "" is not a legal choice/true-false value.
+    assert RESPONSE_ELEMENT[version] not in written, written
+    assert written["weighting"] == str(skipped.points)
+
+    for index in range(len(package.assessment.questions)):
+        if index == 1:
+            continue
+        assert interactions[index]["result"] == "correct", interactions[index]
+
+    parsed = json.loads(recording.last_set("cmi.suspend_data"))
+    assert skipped.id not in parsed["responses"], parsed
+    assert not session.errors, session.errors
+
+
+@pytest.mark.parametrize("version", ["1.2", "2004"])
+def test_no_interactions_are_written_without_an_lms(version, package_factory,
+                                                    open_sco):
+    """No API, no interaction record, no exception - the page still scores."""
+    package = package_factory(version)
+    with open_sco(package, version=None) as session:
+        _answer(session, package, correct=True)
+        _wait_for_result(session, "pass")
+        assert "You Passed" in session.sco.locator("#results").inner_text()
+        assert not session.errors, session.errors
+
+
+@pytest.mark.parametrize("version", ["1.2", "2004"])
+def test_suspend_data_counts_the_attempt(version, package_factory, open_sco):
+    """Relaunching after a recorded attempt increments the counter instead of
+    pretending every submission is the first."""
+    package = package_factory(version)
+    with open_sco(package) as session:
+        _answer(session, package, correct=True)
+        _wait_for_result(session, "pass")
+        assert json.loads(session.recording().last_set(
+            "cmi.suspend_data"))["attempt"] == 1
+
+        session.page.evaluate(
+            "() => { window.__scormState.initialized = false;"
+            " window.__scormState.terminated = false;"
+            " window.__scormCalls = []; }")
+        session.sco.locator("body").evaluate("() => window.location.reload()")
+        session.sco.locator("#submit-button").wait_for(timeout=20000)
+        _answer(session, package, correct=True)
+        _wait_for_result(session, "pass")
+        recording = session.recording()
+
+    assert json.loads(recording.last_set("cmi.suspend_data"))["attempt"] == 2, \
+        recording.pretty()

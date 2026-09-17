@@ -249,7 +249,11 @@ def test_draft_watermark_is_kept(built):
 @pytest.mark.parametrize("filename", LEARNER_FACING)
 def test_no_answer_key_structure_in_learner_files(built, filename):
     blob = (built["package_dir"] / filename).read_text(encoding="utf-8")
-    for token in ("correct_answer", "correctAnswer", "explanation", "to_dict"):
+    for token in ("correct_answer", "correctAnswer", "explanation", "to_dict",
+                  # cmi.interactions.n.correct_responses.0.pattern IS the key.
+                  # The package reports what was answered, never what was
+                  # expected - see docs/SCORM_CONFORMANCE.md.
+                  "correct_responses", "correctResponses"):
         assert token not in blob, (
             "{0} still mentions {1!r} - the key structure must not ship".format(
                 filename, token))
@@ -584,3 +588,373 @@ def test_naive_learner_fails_in_a_real_browser(built):
             assert "You Passed" in page.inner_text("#results")
         finally:
             browser.close()
+
+
+# ---------------------------------------------------------------------------
+# cmi.interactions - per-question evidence for the LMS record
+#
+# The run-time behaviour is asserted in tests/conformance/test_runtime.py,
+# against a real browser and a recording LMS.  What is checked here is the
+# Python half (the metadata the page is built with) and the two properties
+# that must hold whatever an LMS does: the answer key is not in the payload,
+# and the page is still reproducible.
+# ---------------------------------------------------------------------------
+#: The answer key, in each of the spellings it could reach a learner-facing
+#: file by.  ``correct_responses`` is the SCORM element that states the
+#: expected answer pattern - writing it would hand the key to anyone with the
+#: browser's network tab, which is the same defect as Defect 2.
+FORBIDDEN_IN_LEARNER_FILES = ("correct_responses", "correct_answer",
+                              "explanation")
+
+
+@pytest.mark.parametrize("version", ["1.2", "2004"])
+@pytest.mark.parametrize("generator", [AssessmentGenerator,
+                                       MedicalDeviceAssessmentGenerator])
+def test_key_bearing_strings_appear_in_no_learner_file(tmp_path, sop, version,
+                                                       generator):
+    """Grep, deliberately: no parsing, no interpretation, just "is this string
+    anywhere in the two files the learner's browser downloads"."""
+    training = TrainingGenerator().generate(sop)
+    assessment = generator().generate(sop, num_questions=8)
+    root = tmp_path / version / generator.__name__
+    SCORMExporter(scorm_version=version).create_package(
+        training, assessment, str(root), PACKAGE_NAME)
+    package = root / PACKAGE_NAME
+
+    for filename in ("assessment.html", "scorm_api.js"):
+        blob = (package / filename).read_text(encoding="utf-8")
+        for token in FORBIDDEN_IN_LEARNER_FILES:
+            assert token not in blob, "{0} contains {1!r}".format(filename, token)
+
+
+def shipped_interaction_metadata(assessment_html):
+    """The interaction metadata as the browser sees it."""
+    match = re.search(r"var interactionMeta = (\[.*?\]);\s*\n",
+                      assessment_html, re.S)
+    assert match, "interaction metadata not found in assessment.html"
+    return json.loads(match.group(1).replace("\\u003c", "<")
+                      .replace("\\u003e", ">").replace("\\u0026", "&"))
+
+
+def test_interaction_metadata_has_one_entry_per_question(built):
+    meta = shipped_interaction_metadata(built["assessment_html"])
+    questions = built["assessment"].questions
+    assert len(meta) == len(questions)
+    assert [entry["id"] for entry in meta] == [q.id for q in questions]
+
+
+def test_interaction_metadata_types_and_weighting(built):
+    meta = shipped_interaction_metadata(built["assessment_html"])
+    for entry, question in zip(meta, built["assessment"].questions):
+        expected = "true-false" if question.type == "true_false" else "choice"
+        assert entry["type"] == expected, question.id
+        assert entry["weighting"] == str(question.points), question.id
+
+
+def test_interaction_metadata_response_tokens_are_per_version(built):
+    """1.2 wants CMIFeedback ("a"/"t"), 2004 wants a choice identifier or the
+    literal "true"/"false".  One table per version, both by rendered
+    position, so an option's token cannot drift from what the learner saw."""
+    meta = shipped_interaction_metadata(built["assessment_html"])
+    for entry, question in zip(meta, built["assessment"].questions):
+        assert len(entry["responses12"]) == len(question.options), question.id
+        assert len(entry["responses2004"]) == len(question.options), question.id
+        if question.type == "true_false":
+            for index, option in enumerate(question.options):
+                truthy = option.strip().lower() == "true"
+                assert entry["responses12"][index] == ("t" if truthy else "f")
+                assert entry["responses2004"][index] == \
+                    ("true" if truthy else "false")
+        else:
+            expected = list("abcdefghijklmnopqrstuvwxyz"[:len(question.options)])
+            assert entry["responses12"] == expected, question.id
+            assert entry["responses2004"] == expected, question.id
+
+
+def test_interaction_metadata_carries_no_answer_key(built):
+    """The metadata is derived from the question, never from its key: nothing
+    in it distinguishes the correct option from a distractor."""
+    meta = shipped_interaction_metadata(built["assessment_html"])
+    for entry, question in zip(meta, built["assessment"].questions):
+        assert set(entry) == {"id", "type", "weighting", "description",
+                              "objective", "responses12", "responses2004"}
+        blob = json.dumps(entry)
+        if question.type == "true_false":
+            # Both truth values are present, for both positions, so which one
+            # is right cannot be read off the entry.
+            assert sorted(entry["responses2004"]) == ["false", "true"]
+            assert sorted(entry["responses12"]) == ["f", "t"]
+        else:
+            # A choice question's option text appears nowhere in the entry.
+            for option in question.options:
+                assert option not in blob, question.id
+        if len(question.explanation) > 25:
+            assert question.explanation not in blob, question.id
+
+
+def test_interaction_description_is_the_prompt_clipped_to_the_spm(built):
+    """SCORM 2004 caps cmi.interactions.n.description at 250 characters."""
+    from src.scorm_exporter import INTERACTION_DESCRIPTION_MAX
+
+    assert INTERACTION_DESCRIPTION_MAX == 250
+    meta = shipped_interaction_metadata(built["assessment_html"])
+    for entry, question in zip(meta, built["assessment"].questions):
+        assert len(entry["description"]) <= 250, question.id
+        assert entry["description"] == " ".join(question.text.split())[:250]
+        assert "\n" not in entry["description"]
+
+
+def test_interaction_objective_comes_from_the_source_ref(built):
+    meta = shipped_interaction_metadata(built["assessment_html"])
+    for entry, question in zip(meta, built["assessment"].questions):
+        kind = (question.source_ref or {}).get("kind")
+        if kind:
+            assert entry["objective"] == kind, question.id
+        assert " " not in entry["objective"], question.id
+
+
+def test_interaction_objective_falls_back_to_a_slugged_topic():
+    """A question with no source_ref kind still rolls up to something, and
+    that something is a legal identifier rather than a sentence."""
+    from src.scorm_exporter import _interaction_objective_id
+
+    class _Q:
+        source_ref = {}
+        topic = "Safety warnings"
+
+    assert _interaction_objective_id(_Q()) == "safety_warnings"
+
+    class _Empty:
+        source_ref = None
+        topic = ""
+
+    assert _interaction_objective_id(_Empty()) == ""
+
+
+def test_the_page_writes_interactions_before_it_ends_the_session(built):
+    """Order is the whole point: an interaction written after LMSFinish is
+    rejected and the evidence is lost."""
+    page = built["assessment_html"]
+    record_at = page.index("recordInteractions(interactionMeta")
+    finish_at = page.index("finishSCORM();", record_at)
+    assert record_at < page.index("setScore(percentage)") < finish_at
+
+
+def test_scorm_api_writes_the_interaction_data_model(built):
+    api = (built["package_dir"] / "scorm_api.js").read_text(encoding="utf-8")
+    for token in ("cmi.interactions.", "student_response", "learner_response",
+                  "objectives.0.id", "cmi.suspend_data",
+                  "cmi.core.session_time", "cmi.session_time",
+                  "cmi.core.exit", "cmi.exit", "recordInteractions"):
+        assert token in api, token
+    from src.scorm_exporter import SUSPEND_DATA_MAX
+
+    assert SUSPEND_DATA_MAX == 4096
+    assert "SCORM_SUSPEND_DATA_MAX = 4096" in api
+    assert "__SUSPEND_DATA_MAX__" not in api
+
+
+def test_interaction_metadata_is_reproducible(tmp_path, sop):
+    pages = []
+    for run in range(2):
+        training = TrainingGenerator().generate(sop)
+        assessment = AssessmentGenerator().generate(sop, num_questions=8)
+        SCORMExporter().create_package(
+            training, assessment, str(tmp_path / str(run)), PACKAGE_NAME)
+        page = (tmp_path / str(run) / PACKAGE_NAME / "assessment.html").read_text(
+            encoding="utf-8")
+        pages.append(shipped_interaction_metadata(page))
+    assert pages[0] == pages[1]
+
+
+# ---------------------------------------------------------------------------
+# The shipped wrapper, run for real under node
+# ---------------------------------------------------------------------------
+_INTERACTION_RUNNER = r"""
+const fs = require('fs');
+const vm = require('vm');
+
+const sandbox = { console: console };
+sandbox.window = sandbox;
+sandbox.self = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), sandbox);
+
+const spec = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const model = {};
+const written = [];
+const api = {};
+const get = k => (Object.prototype.hasOwnProperty.call(model, k) ? model[k] : "");
+const set = (k, v) => { model[k] = v; written.push([k, v]); return "true"; };
+if (spec.version === "2004") {
+    api.GetValue = get; api.SetValue = set;
+    api.Commit = () => "true"; api.Terminate = () => "true";
+} else {
+    api.LMSGetValue = get; api.LMSSetValue = set;
+    api.LMSCommit = () => "true"; api.LMSFinish = () => "true";
+}
+sandbox.scorm.api = api;
+sandbox.scorm.version = spec.version;
+sandbox.scorm.initialized = true;
+sandbox.scorm.terminated = false;
+
+Object.keys(spec.preset || {}).forEach(k => { model[k] = spec.preset[k]; });
+
+sandbox.recordInteractions(spec.meta, spec.outcomes);
+sandbox.finishSCORM();
+
+process.stdout.write(JSON.stringify({ model: model, written: written }));
+"""
+
+
+def _run_wrapper_under_node(tmp_path, api_js, spec):
+    (tmp_path / "scorm_api.js").write_text(api_js, encoding="utf-8")
+    (tmp_path / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+    (tmp_path / "runner.js").write_text(_INTERACTION_RUNNER, encoding="utf-8")
+    result = subprocess.run(
+        ["node", str(tmp_path / "runner.js"), str(tmp_path / "scorm_api.js"),
+         str(tmp_path / "spec.json")],
+        capture_output=True, text=True, timeout=120, cwd=str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _wide_spec(version, count=400):
+    """Enough answered questions that the 4096-character cap actually bites."""
+    meta = []
+    outcomes = []
+    for index in range(count):
+        meta.append({
+            "id": "question_with_a_deliberately_long_identifier_{0:04d}".format(index),
+            "type": "choice",
+            "weighting": "2",
+            "description": "prompt {0}".format(index),
+            "objective": "step",
+            "responses12": ["a", "b", "c", "d"],
+            "responses2004": ["a", "b", "c", "d"],
+        })
+        outcomes.append({"answered": True, "option": index % 4, "right": True})
+    return {"version": version, "meta": meta, "outcomes": outcomes}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not available")
+@pytest.mark.parametrize("version", ["1.2", "2004"])
+def test_suspend_data_is_truncated_to_the_cap(built, tmp_path, version):
+    """4096 characters is a hard limit in both bindings.  The page has to fit
+    inside it itself: an LMS that rejects the write loses the whole record,
+    and several accept it and silently store a prefix."""
+    api_js = (built["package_dir"] / "scorm_api.js").read_text(encoding="utf-8")
+    spec = _wide_spec(version)
+    result = _run_wrapper_under_node(tmp_path, api_js, spec)
+
+    suspend = result["model"]["cmi.suspend_data"]
+    assert len(suspend) <= 4096, len(suspend)
+    parsed = json.loads(suspend)
+    assert parsed["attempt"] == 1
+    # Responses were dropped from the end, and the ones kept are a prefix of
+    # what was answered - not an arbitrary subset.
+    kept = list(parsed["responses"])
+    assert kept, "the cap must not empty the record entirely"
+    assert kept == [entry["id"] for entry in spec["meta"][:len(kept)]]
+    assert len(kept) < len(spec["meta"]), "this case is meant to overflow"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not available")
+@pytest.mark.parametrize("version", ["1.2", "2004"])
+def test_the_wrapper_writes_the_documented_elements_and_no_others(built,
+                                                                  tmp_path,
+                                                                  version):
+    """Run the shipped wrapper for real and read back the exact element names
+    it puts on the wire, including the version-specific time formats."""
+    api_js = (built["package_dir"] / "scorm_api.js").read_text(encoding="utf-8")
+    spec = {
+        "version": version,
+        "meta": [
+            {"id": "step_mc_2", "type": "choice", "weighting": "2",
+             "description": "According to Step 2, what must be done?",
+             "objective": "step",
+             "responses12": ["a", "b", "c", "d"],
+             "responses2004": ["a", "b", "c", "d"]},
+            {"id": "safety_tf_1", "type": "true-false", "weighting": "1",
+             "description": "True or False: the guard may be removed.",
+             "objective": "safety",
+             "responses12": ["t", "f"], "responses2004": ["true", "false"]},
+            {"id": "md_req_1", "type": "choice", "weighting": "4",
+             "description": "Who do you notify?", "objective": "md_required",
+             "responses12": ["a", "b"], "responses2004": ["a", "b"]},
+        ],
+        "outcomes": [
+            {"answered": True, "option": 1, "right": False},
+            {"answered": True, "option": 1, "right": True},
+            {"answered": False, "option": -1, "right": False},
+        ],
+    }
+    result = _run_wrapper_under_node(tmp_path, api_js, spec)
+    model = result["model"]
+
+    if version == "2004":
+        response, when = "learner_response", "timestamp"
+        assert model["cmi.interactions.0.result"] == "incorrect"
+        assert model["cmi.interactions.1." + response] == "false"
+        assert model["cmi.interactions.0.description"] == \
+            spec["meta"][0]["description"]
+        assert model["cmi.interactions.2.objectives.0.id"] == "md_required"
+        assert re.fullmatch(r"PT\d+H\d+M\d+\.\d{2}S",
+                            model["cmi.interactions.0.latency"])
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T[0-2]\d:[0-5]\d:[0-5]\dZ",
+                            model["cmi.interactions.0." + when])
+        assert re.fullmatch(r"PT\d+H\d+M\d+\.\d{2}S", model["cmi.session_time"])
+        assert model["cmi.exit"] == "normal"
+    else:
+        response, when = "student_response", "time"
+        assert model["cmi.interactions.0.result"] == "wrong"
+        assert model["cmi.interactions.1." + response] == "f"
+        assert "cmi.interactions.0.description" not in model
+        assert "cmi.interactions.0.objectives.0.id" not in model
+        assert re.fullmatch(r"\d{4}:[0-5]\d:[0-5]\d\.\d{2}",
+                            model["cmi.interactions.0.latency"])
+        assert re.fullmatch(r"[0-2]\d:[0-5]\d:[0-5]\d",
+                            model["cmi.interactions.0." + when])
+        assert re.fullmatch(r"\d{4}:[0-5]\d:[0-5]\d\.\d{2}",
+                            model["cmi.core.session_time"])
+        assert model["cmi.core.exit"] == ""
+
+    assert model["cmi.interactions.0.id"] == "step_mc_2"
+    assert model["cmi.interactions.0." + response] == "b"
+    assert model["cmi.interactions.0.weighting"] == "2"
+    assert model["cmi.interactions.1.type"] == "true-false"
+    assert model["cmi.interactions.1.result"] == "correct"
+    # The unanswered one: recorded, weighted, and explicitly neutral.
+    assert model["cmi.interactions.2.result"] == "neutral"
+    assert model["cmi.interactions.2.weighting"] == "4"
+    assert "cmi.interactions.2." + response not in model
+
+    assert json.loads(model["cmi.suspend_data"]) == {
+        "attempt": 1, "responses": {"step_mc_2": "b",
+                                    "safety_tf_1": spec["meta"][1][
+                                        "responses2004" if version == "2004"
+                                        else "responses12"][1]},
+    }
+    assert not any(element.startswith("correct_responses")
+                   or ".correct_responses" in element for element in model)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not available")
+@pytest.mark.parametrize("version", ["1.2", "2004"])
+def test_suspend_data_increments_the_attempt_counter(built, tmp_path, version):
+    api_js = (built["package_dir"] / "scorm_api.js").read_text(encoding="utf-8")
+    spec = {
+        "version": version,
+        "preset": {"cmi.suspend_data": json.dumps(
+            {"attempt": 3, "responses": {"step_mc_2": "a"}})},
+        "meta": [{"id": "step_mc_2", "type": "choice", "weighting": "2",
+                  "description": "d", "objective": "step",
+                  "responses12": ["a", "b"], "responses2004": ["a", "b"]}],
+        "outcomes": [{"answered": True, "option": 0, "right": True}],
+    }
+    result = _run_wrapper_under_node(tmp_path, api_js, spec)
+    assert json.loads(result["model"]["cmi.suspend_data"])["attempt"] == 4
+
+    spec["preset"] = {"cmi.suspend_data": "not json at all"}
+    result = _run_wrapper_under_node(tmp_path, api_js, spec)
+    assert json.loads(result["model"]["cmi.suspend_data"])["attempt"] == 1

@@ -277,6 +277,42 @@ class Recording:
         matching = self.set_calls_for(element)
         return matching[-1]["args"][1] if matching else default
 
+    # -- cmi.interactions ---------------------------------------------------
+    #
+    # Indexed collections arrive as flat element names
+    # ("cmi.interactions.3.result"), because that is literally what a SCO puts
+    # on the wire.  The service stores them verbatim - it does NOT validate
+    # them, so a passing test here means "the package wrote this", never "a
+    # real LMS would accept this".  The format rules are asserted separately.
+
+    def written_keys(self):
+        """Every data-model element the SCO wrote, as a set."""
+        return {call["args"][0] for call in self.sets()}
+
+    def interaction_writes(self):
+        """The cmi.interactions.N.* SetValue calls, in call order."""
+        return [call for call in self.sets()
+                if call["args"][0].startswith("cmi.interactions.")]
+
+    def interactions(self):
+        """``{n: {field: value}}`` for every interaction the SCO wrote.
+
+        ``field`` keeps everything after ``cmi.interactions.<n>.``, so a
+        sub-collection element such as ``objectives.0.id`` stays visible rather
+        than being flattened away.  The last write wins, as it would in an LMS.
+        """
+        collected = {}
+        for call in self.interaction_writes():
+            element, value = call["args"][0], call["args"][1]
+            parts = element.split(".", 3)   # cmi | interactions | n | field
+            if len(parts) != 4 or not parts[2].isdigit() or not parts[3]:
+                continue
+            collected.setdefault(int(parts[2]), {})[parts[3]] = value
+        return collected
+
+    def interaction_indices(self):
+        return sorted(self.interactions())
+
     def index_of(self, *names):
         """Index of the first call to any of *names*, or ``None``."""
         for index, call in enumerate(self.calls):

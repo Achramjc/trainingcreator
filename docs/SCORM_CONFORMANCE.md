@@ -26,7 +26,9 @@ The browser tests `pytest.skip` when no Chromium is installed, so the ordinary
 
 ## What the audit found
 
-Every row below was measured against the tree at `0e7e999`, not inferred.
+Rows 1–11 were measured against the tree at `0e7e999`, not inferred. Row 12 is
+the gap that audit left open and a later pass closed; it was measured the same
+way, against the run-time harness.
 
 | # | Area | What the exporter did before | Consequence | Now |
 |---|---|---|---|---|
@@ -41,6 +43,7 @@ Every row below was measured against the tree at `0e7e999`, not inferred.
 | 9 | 2004 status model | Only `cmi.core.lesson_status` existed. | 2004 splits completion from success; a single lesson status has no meaning in it. | `cmi.completion_status` = `completed` and `cmi.success_status` = `passed`/`failed`. |
 | 10 | `xsi:schemaLocation` | The `xsi` prefix was declared and then never used. | Cosmetic, but it is the one hint an LMS or validator has about which bindings the manifest claims. | Present, mapping every declared namespace. |
 | 11 | Pass mark in the manifest | Not expressed at all. | The LMS had no way to apply the same pass mark the page applies. | `<adlcp:masteryscore>` for 1.2; an `imsss` primary objective with `satisfiedByMeasure` and `minNormalizedMeasure` for 2004 — and the run-time test asserts the score reported actually clears it. |
+| 12 | Per-question evidence | The package reported a score and a status and nothing else. `cmi.interactions`, `cmi.suspend_data`, session time and exit were never written. | An auditor asking "which emergency-stop question did this operator get wrong, and what did they answer?" got a percentage. For a regulated buyer that is the difference between a training record and a number. | One `cmi.interactions` entry per question, in the version-appropriate data model, written after every hash resolves and before the commit that ends the attempt — plus session time, exit and a compact `cmi.suspend_data`. Detailed below. |
 
 Two things the audit **cleared**: the SCORM 1.2 manifest was already valid
 against the official 1.2 XSD (its defects were rows 3 and 10, neither of which
@@ -52,9 +55,14 @@ and the manifest's position at the archive root were all already correct.
 The manifest layer runs over the full matrix — both SCORM versions × both
 assessment generators (`AssessmentGenerator`,
 `MedicalDeviceAssessmentGenerator`) × both shipped SOP fixtures, eight real
-packages built per run. The run-time layer drives one package per version,
-because what it exercises is `scorm_api.js` and the page's call sequence, which
-do not vary with the generator or the fixture.
+packages built per run. The run-time layer drives one package per version for
+the API-discovery and status checks, because what those exercise is
+`scorm_api.js` and the page's call sequence, which do not vary with the
+generator or the fixture. The `cmi.interactions` checks do run the full matrix
+— both versions × both generators × both fixtures × two answering strategies
+(always-first, all-correct) — because what they assert *is* per question: the
+ids, types, weightings and per-question results have to match whatever the
+generator produced.
 
 ### Manifest, both versions
 
@@ -99,6 +107,9 @@ window holding the API:
   `incomplete`.
 - A content page's "Mark as Complete" sets `cmi.core.lesson_status =
   "completed"` and commits.
+- Only `cmi.core.*`, `cmi.suspend_data` and `cmi.interactions.n.*` are written
+  — the three places 1.2 puts a SCO's data. `cmi.core.session_time` is a
+  `CMITimespan` and `cmi.core.exit` is `""`.
 
 ### Run-time, SCORM 2004 (`API_1484_11`, `cmi.*`)
 
@@ -108,6 +119,99 @@ The same properties, on the 2004 surface: `Initialize("")` once and first;
 `completed`; `Commit` then exactly one `Terminate` with nothing set after it;
 no `cmi.core.*` element written; `scaled` clears the manifest's
 `minNormalizedMeasure`; "Mark as Complete" sets `cmi.completion_status`.
+`cmi.session_time` is an ISO 8601 duration and `cmi.exit` is `normal`.
+
+### Per-question evidence (`cmi.interactions`)
+
+This is the block a quality auditor reads. On submission — after every answer
+hash has resolved, before the commit that closes the attempt, and never after
+`LMSFinish`/`Terminate` — the page writes one interaction per question, with
+index *n* matching the order the questions were presented in. If no API was
+found the whole thing is skipped silently and the package still renders and
+still scores.
+
+**SCORM 1.2** (`cmi.interactions.n.*` — every element in this collection is
+*write-only* in 1.2, and nothing in the package reads one back):
+
+| Element | Value |
+|---|---|
+| `id` | the question id from the Python model, e.g. `step_mc_2` |
+| `type` | `choice` for `multiple_choice` and `sequence`, `true-false` for `true_false` |
+| `student_response` | `CMIFeedback`. Choice: the selected option's identifier, `a`/`b`/`c`/`d` **by rendered position**. True-false: `t` or `f`. Omitted entirely when the learner did not answer — `""` is not a legal value for either format |
+| `result` | `correct`, `wrong`, or `neutral` when unanswered |
+| `weighting` | the question's points, as a string |
+| `latency` | `CMITimespan`, `HHHH:MM:SS.SS` |
+| `time` | `CMITime`, `HH:MM:SS`, local |
+
+Plus `cmi.core.session_time` (`CMITimespan`), `cmi.core.exit` (`""` — the 1.2
+vocabulary for an ordinary end of session, as opposed to `suspend`, `logout` or
+`time-out`) and `cmi.suspend_data`.
+
+**SCORM 2004 4th Edition** (`cmi.interactions.n.*`):
+
+| Element | Value |
+|---|---|
+| `id` | the question id, as above |
+| `type` | `choice` / `true-false` |
+| `learner_response` | Choice: the option identifier (`a`, `b`, …) by rendered position. True-false: the literal `true` or `false`. Omitted when unanswered |
+| `result` | `correct`, `incorrect`, or `neutral` when unanswered |
+| `weighting` | the question's points, as a string |
+| `latency` | `timeinterval(second,10,2)` — an ISO 8601 duration, `PT0H1M23.45S` |
+| `timestamp` | `time(second,10,0)` — ISO 8601, UTC, e.g. `2026-09-17T09:41:02Z` |
+| `description` | the question text, whitespace-collapsed and clipped to 250 characters (the SPM for `localized_string_type`) |
+| `objectives.0.id` | the question's `source_ref["kind"]` (`step`, `safety`, `sequence`, `purpose`, `definition`, `md_required`, …), or a slugged `topic` when there is no kind |
+
+Plus `cmi.session_time` (ISO 8601 duration), `cmi.exit` = `normal` and
+`cmi.suspend_data`.
+
+**`cmi.suspend_data`**, in both versions, is compact JSON:
+
+```json
+{"attempt": 2, "responses": {"step_mc_2": "b", "safety_tf_1": "f"}}
+```
+
+`attempt` is read back from the previous `cmi.suspend_data` and incremented, so
+a relaunch counts rather than pretending to be the first attempt. `responses`
+holds the same token that was written as the response for that version, keyed by
+question id; unanswered questions are absent. Both bindings cap the element at
+4096 characters, so the page enforces the cap itself — responses are dropped
+from the end until the JSON fits, rather than letting an LMS reject or silently
+truncate the write.
+
+The **latency is one figure for the whole attempt** — page load to submit —
+repeated on every interaction, not a per-question dwell time. The page does not
+time individual questions, and pretending otherwise in a training record would
+be worse than being coarse about it.
+
+**What is deliberately not written: `correct_responses`.**
+`cmi.interactions.n.correct_responses.0.pattern` is the element that states the
+expected answer. Writing it would mean the package carries the answer key into
+the learner's browser and hands it to the network tab — precisely the defect
+CLAUDE.md invariant 2 and GOAL.md criterion 3 exist to prevent. It is therefore
+never written, in either version. The trade-off, stated plainly because a buyer
+will ask: **an auditor can see which question each learner was asked, what they
+answered, and whether it was judged correct — but not what the correct answer
+was.** The correct answers live in the SME review record and in the transparency
+report (`src/transparency_report.py`, the "LMS record" block says exactly this),
+which are controlled documents on the customer's side, not content served to
+learners. When server-side scoring lands (M2) the grader holds the key and can
+report `correct_responses` from a place the learner cannot read.
+
+Two more honest limits on this block:
+
+- **The fake LMS accepts writes it does not validate.** It stores whatever
+  string it is handed and answers `"true"`. A green run therefore proves *the
+  package wrote this element with this value in this order*, not *a real LMS
+  would accept it*. The formats above are the ones the specifications require —
+  SCORM 1.2's `CMIFeedback` for `student_response` (a choice identifier, `t`/`f`
+  for true-false), `CMITimespan` `HHHH:MM:SS.SS` and `CMITime` `HH:MM:SS`; SCORM
+  2004's `choice` and `true-false` `learner_response` formats, ISO 8601 for
+  `latency` and `timestamp` — and the run-time tests assert them with regular
+  expressions rather than trusting the service. Real LMSs *do* enforce them, and
+  several are stricter than the specification.
+- **Nothing reads the interactions back.** In 1.2 that is not allowed; in 2004
+  it would be, but the package has no reason to. So there is no test that an LMS
+  stored what it was told, only that it was told.
 
 ### Both, and neither
 
@@ -143,11 +247,18 @@ Be blunt about this when talking to a customer.
 - **SCORM 2004 3rd Edition is not emitted.** The exporter targets 4th Edition;
   `"2004 3rd Edition"` is accepted by the checker but never produced.
 - **The data model is exercised narrowly.** Only the elements the pages write:
-  status, success, completion, score. `cmi.suspend_data`,
-  `cmi.location`/`cmi.core.lesson_location`, `cmi.interactions`,
-  `cmi.session_time` and `cmi.exit` are not written and not tested. A learner's
-  answers are therefore not reported to the LMS as interactions — an auditor
-  who wants per-question evidence will not find it in the LMS record.
+  status, success, completion, score, `cmi.interactions`, `cmi.suspend_data`,
+  session time and exit. `cmi.location`/`cmi.core.lesson_location`,
+  `cmi.comments`, `cmi.objectives` at the SCO level, `cmi.progress_measure`,
+  `cmi.max_time_allowed` and the whole of `adl.nav` are not written and not
+  tested — the package has no bookmarking, no resume and no navigation
+  requests.
+- **The interaction record has a hole in it, by design.**
+  `cmi.interactions.n.correct_responses` is never written, because the package
+  would have to carry the answer key through the learner's browser to write it.
+  An auditor gets what was answered and whether it was right, not what the
+  right answer was; see "Per-question evidence" above for why, and where the
+  answers do live.
 - **Scoring is still client-side.** The package computes its own score and
   tells the LMS the answer. Server-verified scoring is M2; the limitation is
   documented in `src/answer_key.py` and disclosed in the package's

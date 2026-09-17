@@ -11,7 +11,7 @@ from typing import Optional
 from datetime import datetime
 from lxml import etree
 
-from .answer_key import CLIENT_VERIFIER_JS
+from .answer_key import CLIENT_VERIFIER_JS, normalize_option_text
 from .generator import TrainingModule
 from .assessments import Assessment
 
@@ -45,6 +45,124 @@ SCHEMA_VERSION_TOKEN = {"1.2": "1.2", "2004": "2004 4th Edition"}
 #: that deploys only declared files serves a SCO with no stylesheet and,
 #: worse, no SCORM API wrapper - so the course silently reports nothing.
 SHARED_FILES = ("styles.css", "scorm_api.js")
+
+# ---------------------------------------------------------------------------
+# cmi.interactions - per-question evidence in the LMS record.
+#
+# The LMS owns the training record (GOAL.md: "not an LMS" is an explicit
+# non-goal).  Reporting only a score and a status leaves an auditor with "70%",
+# not "which question about the emergency stop did this operator get wrong".
+# These constants describe the shape of that evidence; the run-time half is
+# recordInteractions() in scorm_api.js, and docs/SCORM_CONFORMANCE.md states
+# the format rules each version imposes.
+#
+# What is deliberately NOT written, in either version: the element that would
+# carry the expected answer pattern.  That element *is* the answer key, and
+# CLAUDE.md invariant 2 says the key never travels through the learner's
+# browser.  The cost is stated plainly in the docs - an auditor can see what
+# was answered and whether it was right, but not what the right answer was.
+# ---------------------------------------------------------------------------
+
+#: Stable per-option identifier, by *rendered* position.  Option order is baked
+#: into ``Question.options`` at generation time and the renderer emits them in
+#: that order, so "b" means "the second option as the learner saw it" and keeps
+#: that meaning for as long as the package exists.
+INTERACTION_OPTION_IDS = "abcdefghijklmnopqrstuvwxyz"
+
+#: SCORM interaction type per generated question type.  A "sequence" question
+#: renders as a single-select list of step titles, so to the data model it is a
+#: ``choice``, not an ``ordering`` (ordering expects a whole permutation).
+INTERACTION_TYPES = {
+    "multiple_choice": "choice",
+    "sequence": "choice",
+    "true_false": "true-false",
+}
+
+#: SCORM 2004 caps ``cmi.interactions.n.description`` at 250 characters (the
+#: SPM for localized_string_type).  Longer prompts are cut rather than risk a
+#: rejected write on a strict LMS.
+INTERACTION_DESCRIPTION_MAX = 250
+
+#: SCORM 1.2 caps ``cmi.suspend_data`` at 4096 characters and 2004 keeps the
+#: same SPM.  The page enforces it itself instead of discovering it as a
+#: "false" return from an LMS that silently drops the write.
+SUSPEND_DATA_MAX = 4096
+
+
+def _interaction_objective_id(question) -> str:
+    """The objective an interaction rolls up to, or "" when there is none.
+
+    SCORM 2004's ``cmi.interactions.n.objectives.0.id`` is a long identifier,
+    so the question's ``source_ref["kind"]`` ("step", "safety", "sequence",
+    "md_required", ...) is used in preference to its human ``topic``; the topic
+    is slugified as a fallback.  Neither reveals anything about the answer -
+    both are already visible to the learner in the post-submission feedback.
+    """
+    source_ref = getattr(question, "source_ref", None) or {}
+    kind = str(source_ref.get("kind") or "").strip()
+    if kind:
+        return kind[:255]
+    topic = str(getattr(question, "topic", "") or "").strip().lower()
+    slug = "".join(ch if ch.isalnum() else "_" for ch in topic).strip("_")
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return slug[:255]
+
+
+def _interaction_description(text: str) -> str:
+    """The question prompt, flattened to one line and clipped to the SPM."""
+    collapsed = " ".join(str(text or "").split())
+    return collapsed[:INTERACTION_DESCRIPTION_MAX]
+
+
+def build_interaction_metadata(assessment: Assessment) -> list:
+    """Per-question metadata the page needs to write ``cmi.interactions``.
+
+    One entry per question, in the order the questions are rendered, so entry
+    *n* becomes ``cmi.interactions.n.*``.  Everything here is either already on
+    the page (the prompt, the option count) or a non-revealing label; nothing
+    derived from ``correct_answer`` is present, which is why this can be
+    serialised into the learner's browser at all.
+
+    ``responses_12`` and ``responses_2004`` map a *rendered option index* to the
+    response token that version's data model expects:
+
+    * choice - the option identifier by position ("a", "b", "c", "d"); both
+      versions use a bare identifier, 1.2 as ``CMIFeedback`` and 2004 as a
+      ``choice`` ``learner_response``.
+    * true-false - 1.2 wants ``CMIFeedback`` ``"t"``/``"f"``; 2004 wants
+      ``"true"``/``"false"``.  Which rendered option is which is decided by
+      normalising the option text, so a package that ever renders False first
+      still reports the truth value the learner picked, not its position.
+    """
+    metadata = []
+    for question in assessment.questions:
+        options = list(getattr(question, "options", None) or [])
+        interaction_type = INTERACTION_TYPES.get(question.type, "choice")
+
+        if interaction_type == "true-false":
+            responses_12 = []
+            responses_2004 = []
+            for option in options:
+                truthy = normalize_option_text(option) == "true"
+                responses_12.append("t" if truthy else "f")
+                responses_2004.append("true" if truthy else "false")
+        else:
+            responses_12 = [INTERACTION_OPTION_IDS[index]
+                            if index < len(INTERACTION_OPTION_IDS) else ""
+                            for index in range(len(options))]
+            responses_2004 = list(responses_12)
+
+        metadata.append({
+            "id": question.id,
+            "type": interaction_type,
+            "weighting": str(question.points),
+            "description": _interaction_description(question.text),
+            "objective": _interaction_objective_id(question),
+            "responses12": responses_12,
+            "responses2004": responses_2004,
+        })
+    return metadata
 
 
 class SCORMExporter:
@@ -522,12 +640,16 @@ class SCORMExporter:
         # Escape the characters that could close the surrounding <script> tag.
         # \u003c etc. are valid JSON and valid JavaScript, so a step body that
         # literally contains "</script>" cannot break out of the payload.
-        questions_json = (
-            json.dumps(learner_payload["questions"])
-            .replace("<", "\\u003c")
-            .replace(">", "\\u003e")
-            .replace("&", "\\u0026")
-        )
+        def _payload_json(value):
+            return (
+                json.dumps(value)
+                .replace("<", "\\u003c")
+                .replace(">", "\\u003e")
+                .replace("&", "\\u0026")
+            )
+
+        questions_json = _payload_json(learner_payload["questions"])
+        interactions_json = _payload_json(build_interaction_metadata(assessment))
 
         page = f"""<!DOCTYPE html>
 <html>
@@ -546,6 +668,12 @@ class SCORMExporter:
         var questions = {questions_json};
         var passingScore = {assessment.passing_score};
 
+        /* Per-question metadata for the LMS interaction record, entry n ->
+         * cmi.interactions.n.*.  Prompt, weighting, interaction type and the
+         * response token each rendered option maps to - no answer key, and no
+         * expected-response pattern, which is why it can live here at all. */
+        var interactionMeta = {interactions_json};
+
         window.onload = function() {{
             initializeSCORM();
         }};
@@ -556,9 +684,16 @@ class SCORMExporter:
             finishSCORM();
         }};
 
-        function showResults(percentage, missed) {{
+        function showResults(percentage, missed, outcomes) {{
             var resultsDiv = document.getElementById('results');
             resultsDiv.style.display = 'block';
+
+            /* Per-question evidence goes in FIRST: every hash has resolved by
+             * the time showResults runs, and the interactions have to be on
+             * the wire before the commit that ends the attempt.  With no LMS
+             * present this is a silent no-op and the page still renders. */
+            recordInteractions(interactionMeta, outcomes || []);
+
             setScore(percentage);
 
             var detail = '';
@@ -610,31 +745,42 @@ class SCORMExporter:
                 totalPoints += questions[i].points;
             }}
             if (!questions.length || !totalPoints) {{
-                showResults(0, []);
+                showResults(0, [], []);
                 return;
             }}
 
             var score = 0;
             var missed = [];
             var resolved = 0;
+            /* One slot per question, filled as its hash resolves.  This is
+             * what becomes the LMS interaction record, so it carries the
+             * rendered position the learner picked and nothing else. */
+            var outcomes = new Array(questions.length);
 
             function settle() {{
                 resolved += 1;
                 if (resolved < questions.length) {{ return; }}
                 var percentage = Math.round((score / totalPoints) * 100);
-                showResults(percentage, missed);
+                showResults(percentage, missed, outcomes);
             }}
 
             questions.forEach(function (q, index) {{
                 var selected = document.querySelector(
                     'input[name="q_' + q.id + '"]:checked');
                 if (!selected) {{
+                    outcomes[index] = {{ answered: false, option: -1, right: false }};
                     missed.push({{ number: index + 1, topic: q.topic }});
                     settle();
                     return;
                 }}
+                var position = parseInt(selected.value, 10);
                 var chosen = selected.getAttribute('data-option');
                 AnswerKey.verify(q.salt, chosen, q.answer_hash, function (correct) {{
+                    outcomes[index] = {{
+                        answered: true,
+                        option: isFinite(position) ? position : -1,
+                        right: !!correct
+                    }};
                     if (correct) {{
                         score += q.points;
                     }} else {{
@@ -693,6 +839,13 @@ class SCORMExporter:
         /* The specification's API discovery limit: give up after seven
          * ancestors rather than climbing a pathological frameset forever. */
         var SCORM_MAX_PARENTS = 7;
+
+        /* Page load.  Every interaction's latency and the session time are
+         * measured from here, so one attempt reports one elapsed figure. */
+        var SCORM_STARTED_AT = new Date();
+
+        /* cmi.suspend_data is capped at 4096 characters in both bindings. */
+        var SCORM_SUSPEND_DATA_MAX = __SUSPEND_DATA_MAX__;
 
         function findAPIInWindow(win) {
             /* Cross-origin frames throw on property access; that is a "no API
@@ -808,8 +961,188 @@ class SCORMExporter:
             return true;
         }
 
+        /* ------------------------------------------------------------------
+         * Time formats.  The two bindings disagree about every one of them,
+         * and an LMS that type-checks will reject the other version's spelling
+         * outright, so each is built explicitly rather than reused.
+         * ---------------------------------------------------------------- */
+        function scormPad(value, width) {
+            var text = String(value);
+            while (text.length < width) { text = "0" + text; }
+            return text;
+        }
+
+        function scormElapsedSeconds() {
+            var elapsed = (new Date().getTime() - SCORM_STARTED_AT.getTime()) / 1000;
+            return (isFinite(elapsed) && elapsed > 0) ? elapsed : 0;
+        }
+
+        /* SCORM 1.2 CMITimespan: HHHH:MM:SS.SS, hours zero-padded to four so
+         * the field is the same width whatever the attempt took. */
+        function scormTimespan12(seconds) {
+            var cs = Math.floor(seconds * 100);
+            if (!isFinite(cs) || cs < 0) { cs = 0; }
+            if (cs > 3599999999) { cs = 3599999999; }
+            return scormPad(Math.floor(cs / 360000), 4) + ":" +
+                   scormPad(Math.floor((cs % 360000) / 6000), 2) + ":" +
+                   scormPad(Math.floor((cs % 6000) / 100), 2) + "." +
+                   scormPad(cs % 100, 2);
+        }
+
+        /* SCORM 2004 timeinterval(second,10,2): an ISO 8601 duration.  All
+         * three components are always emitted so the string is unambiguous
+         * and always ends in "S". */
+        function scormDuration2004(seconds) {
+            var cs = Math.floor(seconds * 100);
+            if (!isFinite(cs) || cs < 0) { cs = 0; }
+            return "PT" + Math.floor(cs / 360000) + "H" +
+                   Math.floor((cs % 360000) / 6000) + "M" +
+                   ((cs % 6000) / 100).toFixed(2) + "S";
+        }
+
+        /* SCORM 1.2 CMITime: HH:MM:SS, the learner's local wall clock. */
+        function scormClock12(when) {
+            return scormPad(when.getHours(), 2) + ":" +
+                   scormPad(when.getMinutes(), 2) + ":" +
+                   scormPad(when.getSeconds(), 2);
+        }
+
+        /* SCORM 2004 time(second,10,0): ISO 8601, UTC, no sub-second part. */
+        function scormTimestamp2004(when) {
+            try {
+                return when.toISOString().replace(/\.[0-9]+Z$/, "Z");
+            } catch (e) {
+                return "";
+            }
+        }
+
+        /* ------------------------------------------------------------------
+         * Per-question evidence.
+         *
+         * cmi.interactions is what turns "this learner scored 75%" into "this
+         * learner answered b to the emergency-stop question and it was wrong",
+         * which is the record a regulated buyer's auditor asks for.
+         *
+         * One element is deliberately absent in both bindings: the one that
+         * states the expected answer pattern.  Writing it would mean shipping
+         * the key through the learner's browser, which this package does not
+         * do (see src/answer_key.py).  The trade-off is written down in
+         * docs/SCORM_CONFORMANCE.md rather than left to be discovered.
+         * ---------------------------------------------------------------- */
+        function scormSuspendAttempt() {
+            var raw = scormGet("cmi.suspend_data");
+            if (!raw) { return 1; }
+            try {
+                var previous = JSON.parse(raw);
+                var n = parseInt(previous.attempt, 10);
+                return (isFinite(n) && n > 0) ? n + 1 : 1;
+            } catch (e) {
+                return 1;
+            }
+        }
+
+        /* {attempt: n, responses: {question id: response token}}, clipped to
+         * the 4096-character cap by dropping responses from the end - a short
+         * record the LMS accepts beats a long one it silently refuses. */
+        function scormWriteSuspendData(pairs) {
+            var payload = { attempt: scormSuspendAttempt(), responses: {} };
+            var kept = [];
+            var i;
+            for (i = 0; i < pairs.length; i++) {
+                payload.responses[pairs[i][0]] = pairs[i][1];
+                kept.push(pairs[i][0]);
+            }
+            var text = JSON.stringify(payload);
+            while (text.length > SCORM_SUSPEND_DATA_MAX && kept.length) {
+                delete payload.responses[kept.pop()];
+                text = JSON.stringify(payload);
+            }
+            if (text.length > SCORM_SUSPEND_DATA_MAX) { return false; }
+            return scormSet("cmi.suspend_data", text);
+        }
+
+        function recordInteractions(meta, outcomes) {
+            if (!scormUsable()) { return false; }
+            if (!meta || !meta.length) { return false; }
+
+            var is2004 = (scorm.version === "2004");
+            var now = new Date();
+            var latency = is2004 ? scormDuration2004(scormElapsedSeconds())
+                                 : scormTimespan12(scormElapsedSeconds());
+            var when = is2004 ? scormTimestamp2004(now) : scormClock12(now);
+            var pairs = [];
+
+            for (var i = 0; i < meta.length; i++) {
+                var item = meta[i];
+                var outcome = (outcomes && outcomes[i]) ? outcomes[i] : null;
+                var base = "cmi.interactions." + i + ".";
+                /* id first: an LMS creates the interaction on that write. */
+                scormSet(base + "id", item.id);
+                scormSet(base + "type", item.type);
+
+                var table = is2004 ? item.responses2004 : item.responses12;
+                var response = "";
+                if (outcome && outcome.answered && table &&
+                        outcome.option >= 0 && outcome.option < table.length) {
+                    response = table[outcome.option];
+                }
+
+                var result;
+                if (!outcome || !outcome.answered) {
+                    result = "neutral";
+                } else if (outcome.right) {
+                    result = "correct";
+                } else {
+                    /* 1.2 spells it "wrong"; 2004 spells it "incorrect". */
+                    result = is2004 ? "incorrect" : "wrong";
+                }
+
+                /* An unanswered question gets no response element at all: the
+                 * empty string is not a legal choice/true-false response, and
+                 * result "neutral" already says the learner skipped it. */
+                if (response !== "") {
+                    scormSet(base + (is2004 ? "learner_response"
+                                            : "student_response"), response);
+                    pairs.push([item.id, response]);
+                }
+                scormSet(base + "result", result);
+                scormSet(base + "weighting", item.weighting);
+                scormSet(base + "latency", latency);
+
+                if (is2004) {
+                    scormSet(base + "timestamp", when);
+                    if (item.description) {
+                        scormSet(base + "description", item.description);
+                    }
+                    if (item.objective) {
+                        scormSet(base + "objectives.0.id", item.objective);
+                    }
+                } else {
+                    /* 1.2 has no description and no timestamp - only "time",
+                     * and every interaction element in 1.2 is write-only. */
+                    scormSet(base + "time", when);
+                }
+            }
+
+            scormWriteSuspendData(pairs);
+            return true;
+        }
+
         function finishSCORM() {
             if (!scormUsable()) { return false; }
+            /* How long the learner had the SCO open, in this version's
+             * spelling, before the attempt is closed. */
+            if (scorm.version === "2004") {
+                scormSet("cmi.session_time",
+                         scormDuration2004(scormElapsedSeconds()));
+                scormSet("cmi.exit", "normal");
+            } else {
+                scormSet("cmi.core.session_time",
+                         scormTimespan12(scormElapsedSeconds()));
+                /* "" is the 1.2 vocabulary for an ordinary end of session -
+                 * not a suspend, not a time-out, not a logout. */
+                scormSet("cmi.core.exit", "");
+            }
             scormCommit();
             /* Set the flag before the call so a re-entrant unload handler
              * cannot terminate twice. */
@@ -879,6 +1212,7 @@ class SCORMExporter:
             return scormCommit();
         }
         """
+        api_js = api_js.replace("__SUSPEND_DATA_MAX__", str(SUSPEND_DATA_MAX))
         (package_dir / "scorm_api.js").write_text(api_js)
 
     def _create_zip(self, source_dir: Path, output_zip: Path):

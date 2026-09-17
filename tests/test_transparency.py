@@ -276,3 +276,107 @@ class TestReportOutput:
         create_html_report(report, str(html_path))
         content = html_path.read_text(encoding="utf-8")
         assert "<script>alert(1)</script>" not in content
+
+
+# ---------------------------------------------------------------------------
+# The LMS record block
+#
+# The SCORM package writes per-question evidence to the LMS (cmi.interactions),
+# and deliberately does not write the answer key. An auditor reading only this
+# report has to be able to tell which is which without opening the package.
+# ---------------------------------------------------------------------------
+class TestLMSRecordBlock:
+    REQUIRED_KEYS = ("written_by", "score", "status", "per_question_evidence",
+                     "session", "not_written", "verification_boundary")
+
+    def test_block_is_present_and_complete(self, sop, training, assessment,
+                                           sample_sop_path):
+        record = _report(sop, training, assessment, sample_sop_path)["lms_record"]
+        for key in self.REQUIRED_KEYS:
+            assert key in record, key
+            assert record[key].strip(), key
+
+    def test_it_names_the_interaction_evidence(self, sop, training, assessment,
+                                               sample_sop_path):
+        record = _report(sop, training, assessment, sample_sop_path)["lms_record"]
+        assert "cmi.interactions" in record["per_question_evidence"]
+        assert "cmi.suspend_data" in record["session"]
+        for element in ("cmi.core.score.raw", "cmi.score.scaled"):
+            assert element in record["score"], element
+        for element in ("cmi.core.lesson_status", "cmi.success_status",
+                        "cmi.completion_status"):
+            assert element in record["status"], element
+
+    def test_it_states_that_the_key_is_not_written(self, sop, training,
+                                                   assessment, sample_sop_path):
+        """The trade-off has to be stated, not implied: an auditor who expects
+        correct_responses in the LMS record must find out here that it is
+        absent, and why."""
+        record = _report(sop, training, assessment, sample_sop_path)["lms_record"]
+        assert "correct_responses" in record["not_written"]
+        assert "never written" in record["not_written"]
+        assert "answer key" in record["not_written"].lower()
+        assert "not independently verified" in record["verification_boundary"] \
+            or "not " in record["verification_boundary"]
+
+    def test_the_block_is_not_mutated_between_reports(self, sop, training,
+                                                      assessment,
+                                                      sample_sop_path):
+        from src.transparency_report import LMS_RECORD
+
+        report = _report(sop, training, assessment, sample_sop_path)
+        report["lms_record"]["score"] = "tampered"
+        again = _report(sop, training, assessment, sample_sop_path)
+        assert again["lms_record"]["score"] == LMS_RECORD["score"]
+
+    def test_html_renders_the_block(self, tmp_path, sop, training, assessment,
+                                    sample_sop_path):
+        report = _report(sop, training, assessment, sample_sop_path)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert "LMS Record" in content
+        assert "Per-question evidence" in content
+        assert "Deliberately NOT written" in content
+        assert "cmi.interactions" in content
+
+    def test_json_round_trips_the_block(self, tmp_path, sop, training,
+                                        assessment, sample_sop_path):
+        report = _report(sop, training, assessment, sample_sop_path)
+        path = tmp_path / "report.json"
+        create_json_report(report, str(path))
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        assert loaded["lms_record"] == report["lms_record"]
+
+    def test_html_escapes_the_block(self, tmp_path, sop, training, assessment,
+                                    sample_sop_path):
+        """Fixed text today, but the renderer must escape it regardless."""
+        report = _report(sop, training, assessment, sample_sop_path)
+        report["lms_record"]["score"] = "<script>alert(1)</script>"
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert "<script>alert(1)</script>" not in content
+        assert "&lt;script&gt;" in content
+
+    def test_it_matches_what_the_package_actually_writes(self, tmp_path, sop,
+                                                         training, assessment,
+                                                         sample_sop_path):
+        """The report describes the package, so it must not describe a package
+        we do not build: the elements it names are in the shipped wrapper, and
+        the element it says is absent really is."""
+        from src.scorm_exporter import SCORMExporter
+
+        SCORMExporter().create_package(training, assessment, str(tmp_path),
+                                       "lms_record_package")
+        api = (tmp_path / "lms_record_package" / "scorm_api.js").read_text(
+            encoding="utf-8")
+        record = _report(sop, training, assessment, sample_sop_path)["lms_record"]
+
+        for element in ("cmi.interactions", "cmi.suspend_data",
+                        "cmi.core.score.raw", "cmi.score.scaled",
+                        "cmi.core.lesson_status", "cmi.success_status",
+                        "cmi.completion_status"):
+            assert element in api, element
+        assert "correct_responses" not in api
+        assert "correct_responses" in record["not_written"]
