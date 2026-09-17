@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Not an ADL/IMS file.  A wrapper that pulls the vendored SCORM 1.2 CAM
+     schemas into a single lxml XMLSchema so a whole imsmanifest.xml (which
+     mixes the imscp and adlcp namespaces) can be validated in one pass.
+     See SOURCES.md for the provenance of the files it imports. -->
+<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <xsd:import namespace="http://www.imsproject.org/xsd/imscp_rootv1p1p2"
+              schemaLocation="imscp_rootv1p1p2.xsd"/>
+  <xsd:import namespace="http://www.adlnet.org/xsd/adlcp_rootv1p2"
+              schemaLocation="adlcp_rootv1p2.xsd"/>
+</xsd:schema>
