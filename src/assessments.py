@@ -1,29 +1,345 @@
 """
-Assessment Generator - Create verification questions and quizzes from SOP content
+Assessment Generator - Create verification questions and quizzes from SOP content.
+
+ASSESSMENT INTEGRITY DESIGN (M0)
+--------------------------------
+Everything in this module exists to make one statement true: *a learner who has
+not read the SOP fails the quiz*.  Four properties deliver that.
+
+1. Deterministic shuffling with a balanced key.
+   Every seed descends from ``document_key(title, version)`` so the same SOP
+   revision always yields byte-identical output (reproducible builds are part of
+   the validation story).  Distractor arrangement is seeded from
+   sha256(doc_key | question_id), as required.
+
+   The correct answer's *position* is not an independent per-question draw:
+   independent draws are uniform only in expectation, and a three-question quiz
+   can easily land every answer on option A.  Instead questions are grouped by
+   option count, dealt cyclic positions inside each group, and the per-group
+   offsets are chosen jointly - every combination is scored against the
+   strategies a learner can actually execute ("always option 1", ..., "always the
+   last option", plus whatever the fixed true/false answers contribute) and one
+   of the combinations holding all of them at or below NAIVE_SCORE_CEILING is
+   picked by document digest.  Filtering and then picking at random, rather than
+   always taking the best, keeps the aggregate distribution uniform.
+   See ``_assign_answer_positions``.
+
+2. The answer key never reaches the learner as plaintext.
+   The Python model holds the correct index after shuffling.  The learner payload
+   (``to_learner_dict``) carries only a per-question salt and
+   sha256(salt | normalised correct option text).  See ``src/answer_key.py`` for
+   the honest limits of that - a static package can be brute-forced over 2-4
+   options by anyone with dev tools, and server-side scoring is the M2 fix.
+
+3. Distractors come from the source document.
+   Wrong answers are other steps, other definitions, scope/responsibility
+   sentences, or *altered* safety warnings ("Never" -> "Always", "must" ->
+   "may optionally").  Same register, same length band, drawn from the same SOP.
+   Any candidate that normalises to the correct answer, contains it, or is
+   >= 88% similar to it is rejected.  There is no absurd filler: if a document
+   cannot support four options we ship three, then two, and never invent
+   nonsense.
+
+4. Coverage is a deterministic blueprint, not random.sample().
+   Priority: medical-device required questions, then >=1 safety question when
+   warnings exist, then >=1 sequence question when there are >=3 steps, then
+   step content spread across the procedure (midpoint bisection order, not the
+   first N steps), then purpose/scope, then definitions.
+
+True/false questions are kept but roughly half of the selected ones are *false*
+statements (an altered warning or a definition attached to the wrong term), so
+"always True" fails too.  The broken ``ordering`` question type is gone: it
+emitted a list of step numbers as ``correct_answer`` while the renderer compared
+a single radio value, so it was unanswerable.  It is replaced by a ``sequence``
+question ("which action comes immediately after Step 3?") whose options are step
+*titles* with the numbers stripped, so the answer cannot be read off the labels.
 """
 
-import random
 import re
-from typing import Dict, List, Optional
+from difflib import SequenceMatcher
+from itertools import product
+from random import Random
+from typing import Dict, List, Optional, Tuple
+
+from .answer_key import (
+    answer_hash as _hash_answer,
+    document_key,
+    make_salt,
+    normalize_option_text,
+    question_digest,
+    seed_from_digest,
+)
 from .parser import SOPContent
 
+# Option shaping -------------------------------------------------------------
+MAX_OPTION_CHARS = 180
+MAX_OPTIONS = 4
+MIN_OPTIONS = 2
+#: A distractor at or above this similarity to the correct answer is discarded.
+NEAR_IDENTICAL_RATIO = 0.88
+#: Ceiling on the fraction of the available points any single fixed answering
+#: strategy ("always option 1", "always the last option", ...) may collect.
+#: Well under any realistic passing score, so a naive learner fails with margin.
+NAIVE_SCORE_CEILING = 0.65
 
+#: Statement flips used to build *false* variants of real document sentences.
+#: Order matters - longer / more specific patterns first, and the negative forms
+#: ("must not") must be tried before the positive ones ("must").
+_STATEMENT_FLIPS: Tuple[Tuple[str, str], ...] = (
+    ("must not", "must"),
+    ("shall not", "shall"),
+    ("may not", "may"),
+    ("do not", "you may"),
+    ("does not", "does"),
+    ("is not", "is"),
+    ("never", "always"),
+    ("always", "never"),
+    ("must", "may optionally"),
+    ("shall", "may optionally"),
+    ("is required", "is optional"),
+    ("are required", "are optional"),
+    ("required", "optional"),
+    ("prohibited", "permitted"),
+    ("applies to all", "applies only to some"),
+    ("all personnel", "only supervisors"),
+    ("every", "any single"),
+    ("prior to", "after"),
+    ("before", "after"),
+    ("at least", "at most"),
+    ("all", "some"),
+    ("may", "must never"),
+)
+
+
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+def _clean(text) -> str:
+    """Collapse whitespace; tolerate None and non-strings."""
+    if text is None:
+        return ""
+    return re.sub(r"\s+", " ", str(text)).strip()
+
+
+def clip_option(text, limit: int = MAX_OPTION_CHARS) -> str:
+    """Clip an option to the shared length band, on a word boundary."""
+    t = _clean(text)
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    space = cut.rfind(" ")
+    if space > limit * 0.6:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.-") + "..."
+
+
+def _sentences(text, min_len: int = 20) -> List[str]:
+    """Split prose into sentences long enough to stand alone as an option."""
+    t = _clean(text)
+    if not t:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", t)
+    return [p.strip() for p in parts if len(p.strip()) >= min_len]
+
+
+def alter_statement(text) -> Optional[str]:
+    """Return a *false* variant of a true statement, or None if we cannot make
+    one honestly.
+
+    Used for safety distractors and for false true/false items.  Only the first
+    matching flip is applied, so the result stays close to the original in
+    register and length - the learner has to know the content, not spot the odd
+    sentence out.  Returning None (rather than inventing filler) is deliberate:
+    a statement we cannot reliably negate is simply not used.
+    """
+    t = _clean(text)
+    if not t:
+        return None
+    for old, new in _STATEMENT_FLIPS:
+        match = re.search(r"\b" + re.escape(old) + r"\b", t, re.IGNORECASE)
+        if not match:
+            continue
+        found = match.group(0)
+        replacement = new
+        if found[:1].isupper():
+            replacement = replacement[:1].upper() + replacement[1:]
+        return t[: match.start()] + replacement + t[match.end():]
+    return None
+
+
+def _similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def pick_distractors(correct: str, candidates, rng: Random,
+                     limit: int = MAX_OPTIONS - 1) -> List[str]:
+    """Choose up to ``limit`` distractors for ``correct`` from ``candidates``.
+
+    Rejects anything empty, duplicated, identical or near-identical to the
+    correct answer, or that contains / is contained by it.  Survivors are ranked
+    by closeness in length to the correct answer (same length band = no
+    "the long one is the right one" tell) and a deterministic subset of that
+    band is taken.
+    """
+    correct_clean = clip_option(correct)
+    correct_norm = normalize_option_text(correct_clean)
+    if not correct_norm:
+        return []
+
+    seen = {correct_norm}
+    pool: List[str] = []
+    for raw in candidates:
+        cand = clip_option(raw)
+        norm = normalize_option_text(cand)
+        if not norm or norm in seen:
+            continue
+        if norm in correct_norm or correct_norm in norm:
+            continue
+        if _similarity(norm, correct_norm) >= NEAR_IDENTICAL_RATIO:
+            continue
+        seen.add(norm)
+        pool.append(cand)
+
+    if not pool:
+        return []
+
+    target_len = len(correct_clean)
+    pool.sort(key=lambda c: (abs(len(c) - target_len), normalize_option_text(c)))
+    band = pool[: max(limit * 2, limit)]
+    rng.shuffle(band)
+    return band[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Procedure-step helpers
+#
+# The parser contract grew ``title`` / ``body`` / ``source_lines`` and ``content``
+# became the FULL step text.  These helpers prefer the new keys and degrade
+# cleanly to the old "content is just the heading" shape, so the generator works
+# against either parser.
+# ---------------------------------------------------------------------------
+def step_number(proc: Dict) -> str:
+    return _clean(proc.get("step_number", ""))
+
+
+def step_title(proc: Dict) -> str:
+    """Heading text of a step."""
+    title = _clean(proc.get("title"))
+    if title:
+        return title
+    content = str(proc.get("content", "") or "")
+    return _clean(content.split("\n", 1)[0])
+
+
+def step_body(proc: Dict) -> str:
+    """Instruction text underneath the heading; "" when the SOP has none."""
+    body = proc.get("body")
+    if body is not None:
+        return _clean(body)
+    content = str(proc.get("content", "") or "")
+    if "\n" in content:
+        return _clean(content.split("\n", 1)[1])
+    return ""
+
+
+def step_sort_key(proc: Dict, doc_index: int):
+    """Natural sort key for a step number.
+
+    Step numbers are not integers.  Numbered-convention SOPs legitimately use
+    "4.1", "4.2", ... "4.10", and "4.10" must sort after "4.9", not next to
+    "4.1".  Anything we cannot read as a dotted number keeps document order
+    instead of raising - the old ``int(x.get('step_number', 0))`` blew up with
+    ValueError on the first "4.3" it saw.
+    """
+    raw = step_number(proc)
+    parts = [p for p in re.split(r"[.\-_]", raw) if p != ""]
+    segments = []
+    for part in parts:
+        match = re.match(r"^(\d+)([A-Za-z]*)$", part.strip())
+        if not match:
+            return (1, (), doc_index)
+        segments.append((int(match.group(1)), match.group(2).lower()))
+    if not segments:
+        return (1, (), doc_index)
+    return (0, tuple(segments), doc_index)
+
+
+def ordered_steps(procedures) -> List[Dict]:
+    """Procedure steps in execution order (natural step-number order)."""
+    items = list(procedures or [])
+    return [p for _, p in sorted(
+        ((step_sort_key(p, i), p) for i, p in enumerate(items)),
+        key=lambda pair: pair[0],
+    )]
+
+
+def _step_option_text(proc: Dict) -> str:
+    """The text that represents a step as an answer option.
+
+    Never includes the step number: "Which action comes after Step 3?" with
+    options labelled "Step 4: ..." would be answerable from the labels alone.
+    """
+    return clip_option(step_title(proc) or step_body(proc))
+
+
+def _step_answer_text(proc: Dict) -> str:
+    """Text describing what a step requires - the body when we have one."""
+    return clip_option(step_body(proc) or step_title(proc))
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
 class Question:
-    """Represents a single assessment question"""
+    """Represents a single assessment question.
+
+    ``correct_answer`` is the index of the correct option *after* shuffling.  It
+    is part of the SME/author-facing export (``to_dict``) and is deliberately
+    absent from the learner-facing export (``to_learner_dict``).
+    """
 
     def __init__(self, question_id: str, question_type: str, question_text: str,
                  options: List[str] = None, correct_answer: any = None,
-                 explanation: str = "", points: int = 1):
+                 explanation: str = "", points: int = 1,
+                 salt: str = "", source_ref: Optional[Dict] = None,
+                 topic: str = ""):
         self.id = question_id
-        self.type = question_type  # multiple_choice, true_false, fill_blank, ordering
+        self.type = question_type  # multiple_choice, true_false, sequence
         self.text = question_text
         self.options = options or []
         self.correct_answer = correct_answer
         self.explanation = explanation
         self.points = points
+        #: Public, per-question salt shipped with the package.
+        self.salt = salt
+        #: Provenance back to the source document (traceability, SME review).
+        self.source_ref = source_ref or {}
+        #: Non-revealing label shown in post-submission feedback.
+        self.topic = topic
+
+    @property
+    def correct_option_text(self) -> str:
+        """Text of the correct option, or "" if the key is not a valid index."""
+        if isinstance(self.correct_answer, int) and not isinstance(self.correct_answer, bool):
+            if 0 <= self.correct_answer < len(self.options):
+                return self.options[self.correct_answer]
+        return ""
+
+    @property
+    def answer_hash(self) -> str:
+        """sha256(salt | normalised correct option). "" when unavailable."""
+        text = self.correct_option_text
+        if not self.salt or not text:
+            return ""
+        return _hash_answer(self.salt, text)
 
     def to_dict(self) -> Dict:
-        """Convert to dictionary for serialization"""
+        """Author/SME-facing serialisation.
+
+        MAY include answers - ``app.py`` and ``src/cli.py`` dump this as review
+        JSON for subject-matter experts.  It must never be handed to a learner;
+        use :meth:`to_learner_dict` for that.
+        """
         return {
             "id": self.id,
             "type": self.type,
@@ -31,8 +347,32 @@ class Question:
             "options": self.options,
             "correct_answer": self.correct_answer,
             "explanation": self.explanation,
-            "points": self.points
+            "points": self.points,
+            "salt": self.salt,
+            "answer_hash": self.answer_hash,
+            "source_ref": self.source_ref,
+            "topic": self.topic,
         }
+
+    def to_learner_dict(self) -> Dict:
+        """Learner-facing payload: no correct_answer, no explanation.
+
+        Verification is by salted hash of the normalised option text.  See
+        ``src/answer_key.py`` for what this does and does not protect against.
+        """
+        return {
+            "id": self.id,
+            "type": self.type,
+            "text": self.text,
+            "options": list(self.options),
+            "points": self.points,
+            "salt": self.salt,
+            "answer_hash": self.answer_hash,
+            "topic": self.topic,
+        }
+
+    #: Alias - some callers speak of the "client payload".
+    to_client_payload = to_learner_dict
 
 
 class Assessment:
@@ -45,10 +385,20 @@ class Assessment:
         self.passing_score: int = 70  # Percentage
         self.time_limit: Optional[int] = None  # Minutes
         self.randomize_questions: bool = False
+        #: Option order is randomised deterministically at *generation* time and
+        #: baked into ``Question.options``; the renderer emits them as stored.
+        #: Kept for backward compatibility and to record that it happened.
         self.randomize_options: bool = True
+        #: How many questions the caller asked for.  ``len(questions)`` is what
+        #: the source document could actually support.
+        self.requested_questions: int = 0
+
+    @property
+    def total_points(self) -> int:
+        return sum(q.points for q in self.questions)
 
     def to_dict(self) -> Dict:
-        """Convert to dictionary for serialization"""
+        """Author/SME-facing serialisation (may include answers)."""
         return {
             "title": self.title,
             "description": self.description,
@@ -56,246 +406,758 @@ class Assessment:
             "passing_score": self.passing_score,
             "time_limit": self.time_limit,
             "randomize_questions": self.randomize_questions,
-            "randomize_options": self.randomize_options
+            "randomize_options": self.randomize_options,
+            "requested_questions": self.requested_questions,
         }
+
+    def to_learner_dict(self) -> Dict:
+        """Learner-facing payload.  The SCORM exporter uses only this."""
+        return {
+            "title": self.title,
+            "description": self.description,
+            "questions": [q.to_learner_dict() for q in self.questions],
+            "passing_score": self.passing_score,
+            "time_limit": self.time_limit,
+        }
+
+    to_client_payload = to_learner_dict
+
+
+# ---------------------------------------------------------------------------
+# Question candidates
+#
+# Generation happens in two phases.  Builders produce *candidates* in canonical
+# form (correct answer first, true/false carrying both a true and a false
+# variant).  Only after the coverage blueprint has chosen which candidates to
+# use are truth values balanced and option positions assigned, because both of
+# those are properties of the assessment as a whole rather than of one question.
+# ---------------------------------------------------------------------------
+class _Candidate:
+    __slots__ = ("category", "order", "kind", "qid", "points", "topic",
+                 "source_ref", "prompt", "correct", "distractors", "explanation",
+                 "true_text", "false_text", "explanation_true", "explanation_false")
+
+    def __init__(self, category, order, kind, qid, points=1, topic="", source_ref=None):
+        self.category = category
+        self.order = order
+        self.kind = kind            # "mc" | "sequence" | "tf"
+        self.qid = qid
+        self.points = points
+        self.topic = topic
+        self.source_ref = source_ref or {}
+        self.prompt = ""
+        self.correct = ""
+        self.distractors: List[str] = []
+        self.explanation = ""
+        self.true_text = ""
+        self.false_text: Optional[str] = None
+        self.explanation_true = ""
+        self.explanation_false = ""
+
+    @classmethod
+    def choice(cls, category, order, qid, prompt, correct, distractors,
+               explanation, kind="mc", points=1, topic="", source_ref=None):
+        cand = cls(category, order, kind, qid, points, topic, source_ref)
+        cand.prompt = prompt
+        cand.correct = correct
+        cand.distractors = list(distractors)
+        cand.explanation = explanation
+        return cand
+
+    @classmethod
+    def true_false(cls, category, order, qid, true_text, false_text,
+                   explanation_true, explanation_false, points=1, topic="",
+                   source_ref=None):
+        cand = cls(category, order, "tf", qid, points, topic, source_ref)
+        cand.true_text = true_text
+        cand.false_text = false_text
+        cand.explanation_true = explanation_true
+        cand.explanation_false = explanation_false
+        return cand
+
+    @property
+    def truth_is_fixed(self) -> bool:
+        """True when no honest false variant exists, so the answer must be True."""
+        return self.kind == "tf" and not self.false_text
+
+    def materialize(self, doc_key: str, truth: Optional[bool] = None) -> Question:
+        salt = make_salt(doc_key, self.qid)
+        if self.kind == "tf":
+            is_true = True if truth is None else bool(truth)
+            if not self.false_text:
+                is_true = True
+            text = self.true_text if is_true else self.false_text
+            source_ref = dict(self.source_ref)
+            source_ref["statement_is_true"] = is_true
+            return Question(
+                question_id=self.qid,
+                question_type="true_false",
+                question_text=text,
+                options=["True", "False"],
+                correct_answer=0 if is_true else 1,
+                explanation=self.explanation_true if is_true else self.explanation_false,
+                points=self.points,
+                salt=salt,
+                source_ref=source_ref,
+                topic=self.topic,
+            )
+
+        q_type = "sequence" if self.kind == "sequence" else "multiple_choice"
+        # Canonical form: correct option first.  _assign_answer_positions moves it.
+        return Question(
+            question_id=self.qid,
+            question_type=q_type,
+            question_text=self.prompt,
+            options=[self.correct] + list(self.distractors),
+            correct_answer=0,
+            explanation=self.explanation,
+            points=self.points,
+            salt=salt,
+            source_ref=dict(self.source_ref),
+            topic=self.topic,
+        )
+
+
+def _assign_truth_values(candidates: List[_Candidate]) -> List[Optional[bool]]:
+    """Balance true/false statements across the *selected* true/false questions.
+
+    "Always True" has to fail as surely as "always option A", so at least half of
+    the true/false items a learner sees are false statements.  Items whose truth
+    is fixed (no honest negation available, or a compliance question whose answer
+    must be True) are counted first and the flexible ones compensate.
+    """
+    truths: List[Optional[bool]] = [None] * len(candidates)
+    true_count = false_count = 0
+
+    for idx, cand in enumerate(candidates):
+        if cand.kind == "tf" and cand.truth_is_fixed:
+            truths[idx] = True
+            true_count += 1
+
+    for idx, cand in enumerate(candidates):
+        if cand.kind != "tf" or cand.truth_is_fixed:
+            continue
+        if false_count <= true_count:
+            truths[idx] = False
+            false_count += 1
+        else:
+            truths[idx] = True
+            true_count += 1
+    return truths
+
+
+def _strategy_loads(group_offsets, groups, option_counts, base_index_load,
+                    base_last_load):
+    """Points a fixed-index / always-last learner would collect, per strategy."""
+    index_load = dict(base_index_load)
+    last_load = base_last_load
+    for option_count, offset in zip(option_counts, group_offsets):
+        for rank, question in enumerate(groups[option_count]):
+            position = (offset + rank) % option_count
+            index_load[position] = index_load.get(position, 0) + question.points
+            if position == option_count - 1:
+                last_load += question.points
+    return index_load, last_load
+
+
+def _assign_answer_positions(questions: List[Question], doc_key: str) -> None:
+    """Place the correct option and shuffle the distractors, deterministically.
+
+    Distractor arrangement is seeded from sha256(doc_key | question_id), as the
+    M0 contract requires, so the same SOP revision always produces the same
+    package.
+
+    The correct answer's *position* is not drawn independently per question.
+    Independent draws are uniform only in expectation, and a three question quiz
+    can easily land every answer on option A - which is the defect being fixed.
+    Instead:
+
+      * questions are grouped by option count and, within a group, the correct
+        positions are dealt as a cycle (offset, offset+1, ... mod k).  A cycle is
+        perfectly balanced, so inside a group no position can hold more than
+        ceil(n/k) of the answers;
+      * the per-group offsets are then chosen *together*.  Every combination is
+        scored against the naive strategies a learner can actually execute -
+        "always option 1", "always option 2", ..., "always the last option", plus
+        whatever the fixed true/false answers already contribute - and the
+        combinations that hold every strategy at or below NAIVE_SCORE_CEILING are
+        kept.  One of those survivors is picked by document digest.
+
+    Choosing uniformly among the survivors rather than taking the single best is
+    deliberate.  Always minimising would push the answer towards the middle
+    positions of small assessments and skew the aggregate distribution; filtering
+    then picking at random keeps four-option answers near 25% per position while
+    still ruling out the gameable layouts.  When a document is so thin that no
+    combination clears the ceiling (one or two questions, nothing to balance
+    against) the least-bad combinations are used instead - and the naive learner
+    tests document what that floor actually is.
+
+    True/false questions keep their natural "True, False" order; their integrity
+    comes from balancing the statements' truth values (see _assign_truth_values).
+    """
+    shuffled = [q for q in questions
+                if q.type != "true_false" and len(q.options) >= MIN_OPTIONS]
+    if not shuffled:
+        return
+
+    groups: Dict[int, List[Question]] = {}
+    for question in shuffled:
+        groups.setdefault(len(question.options), []).append(question)
+    for group in groups.values():
+        group.sort(key=lambda q: question_digest(doc_key, q.id))
+    option_counts = sorted(groups)
+
+    # True/false answers are already fixed, so they are part of what a naive
+    # learner collects and the multiple-choice layout has to work around them.
+    base_index_load: Dict[int, int] = {}
+    base_last_load = 0
+    for question in questions:
+        if question.type != "true_false":
+            continue
+        index = question.correct_answer
+        if not isinstance(index, int):
+            continue
+        base_index_load[index] = base_index_load.get(index, 0) + question.points
+        if index == len(question.options) - 1:
+            base_last_load += question.points
+
+    total_points = sum(q.points for q in questions) or 1
+
+    scored: List[Tuple[float, Tuple[int, ...]]] = []
+    for combination in product(*(range(k) for k in option_counts)):
+        index_load, last_load = _strategy_loads(
+            combination, groups, option_counts, base_index_load, base_last_load)
+        worst = max(max(index_load.values()), last_load) / float(total_points)
+        scored.append((worst, combination))
+
+    survivors = [combo for worst, combo in scored if worst <= NAIVE_SCORE_CEILING]
+    if not survivors:
+        floor = min(worst for worst, _ in scored)
+        survivors = [combo for worst, combo in scored if worst == floor]
+
+    selector = int(question_digest(doc_key, "answer-positions")[:8], 16)
+    chosen = survivors[selector % len(survivors)]
+
+    for option_count, offset in zip(option_counts, chosen):
+        for rank, question in enumerate(groups[option_count]):
+            position = (offset + rank) % option_count
+            rng = Random(seed_from_digest(question_digest(doc_key, question.id)))
+            correct_text = question.options[0]
+            distractors = list(question.options[1:])
+            rng.shuffle(distractors)
+            question.options = (
+                distractors[:position] + [correct_text] + distractors[position:]
+            )
+            question.correct_answer = position
+
+
+def _spread_indices(count: int) -> List[int]:
+    """Indices in midpoint-bisection order, so any prefix is spread out.
+
+    Used to pick step-content questions: taking the first three steps of a nine
+    step SOP tests the opening and nothing else.
+    """
+    if count <= 0:
+        return []
+    result: List[int] = []
+    queue = [(0, count - 1)]
+    while queue:
+        low, high = queue.pop(0)
+        if low > high:
+            continue
+        mid = (low + high) // 2
+        result.append(mid)
+        queue.append((low, mid - 1))
+        queue.append((mid + 1, high))
+    return result
+
+
+def _interleave(primary: List, secondary: List) -> List:
+    """Alternate two ordered lists, primary first."""
+    out = []
+    for i in range(max(len(primary), len(secondary))):
+        if i < len(primary):
+            out.append(primary[i])
+        if i < len(secondary):
+            out.append(secondary[i])
+    return out
 
 
 class AssessmentGenerator:
     """Generate assessment questions from SOP content"""
 
+    #: Order in which the blueprint tops up an assessment once the mandatory
+    #: coverage is in place.  "step" appears repeatedly because step content is
+    #: the bulk of any SOP.
+    FILL_CYCLE = ("step", "purpose_scope", "safety", "step", "definition",
+                  "sequence", "step")
+
+    #: Order questions are presented in (document order, compliance last).
+    PRESENTATION_RANK = {
+        "purpose_scope": 0,
+        "definition": 1,
+        "step": 2,
+        "sequence": 3,
+        "safety": 4,
+        "md_required": 5,
+    }
+
     def __init__(self):
         self.question_templates = self._load_question_templates()
 
+    # -- public API ---------------------------------------------------------
     def generate(self, sop_content: SOPContent, num_questions: int = 5,
                  passing_score: int = 70) -> Assessment:
         """
-        Generate an assessment from SOP content
+        Generate an assessment from SOP content.
+
+        Deterministic: the same SOPContent and num_questions always produce an
+        identical Assessment (``to_dict()`` compares equal).
 
         Args:
             sop_content: Parsed SOP content
-            num_questions: Number of questions to generate
+            num_questions: Number of questions to generate.  Honoured exactly
+                when the document supports it; otherwise the whole pool is
+                returned and ``assessment.requested_questions`` records the ask.
             passing_score: Minimum passing score percentage
 
         Returns:
             Assessment object with generated questions
         """
+        num_questions = max(1, int(num_questions))
+        doc_key = document_key(
+            getattr(sop_content, "title", "") or "",
+            getattr(sop_content, "version", "") or "",
+        )
+
         assessment = Assessment()
-        assessment.title = f"{sop_content.title} - Verification Assessment"
-        assessment.description = "Complete this assessment to verify your understanding of the procedure."
+        assessment.title = "{0} - Verification Assessment".format(
+            getattr(sop_content, "title", "") or "Procedure"
+        )
+        assessment.description = (
+            "Complete this assessment to verify your understanding of the procedure."
+        )
         assessment.passing_score = passing_score
+        assessment.requested_questions = num_questions
 
-        # Generate different types of questions
-        questions = []
+        pool = self._build_pool(sop_content, doc_key)
+        chosen = self._select_by_blueprint(pool, num_questions)
+        chosen.sort(key=lambda c: (self.PRESENTATION_RANK.get(c.category, 9),
+                                   c.order, c.qid))
 
-        # Generate questions from purpose and scope
-        if sop_content.purpose:
-            questions.extend(self._generate_purpose_questions(sop_content))
-
-        # Generate questions from procedures
-        if sop_content.procedures:
-            questions.extend(self._generate_procedure_questions(sop_content))
-
-        # Generate questions from safety warnings
-        if sop_content.safety_warnings:
-            questions.extend(self._generate_safety_questions(sop_content))
-
-        # Generate questions from definitions
-        if sop_content.definitions:
-            questions.extend(self._generate_definition_questions(sop_content))
-
-        # Select the requested number of questions
-        if len(questions) > num_questions:
-            questions = random.sample(questions, num_questions)
+        truths = _assign_truth_values(chosen)
+        questions = [cand.materialize(doc_key, truths[i])
+                     for i, cand in enumerate(chosen)]
+        _assign_answer_positions(questions, doc_key)
 
         assessment.questions = questions
-
         return assessment
 
-    def _load_question_templates(self) -> Dict:
-        """Load question generation templates"""
+    # -- blueprint ----------------------------------------------------------
+    def _select_by_blueprint(self, pool: List[_Candidate],
+                             num_questions: int) -> List[_Candidate]:
+        """Deterministic coverage blueprint - never random.sample().
+
+        Priority: medical-device required questions, one safety question, one
+        sequence question, then a repeating fill cycle.  Exhausted categories are
+        skipped; if the whole pool is smaller than the request we return all of
+        it and let ``requested_questions`` tell the caller.
+        """
+        buckets: Dict[str, List[_Candidate]] = {}
+        for cand in pool:
+            buckets.setdefault(cand.category, []).append(cand)
+        cursors = {key: 0 for key in buckets}
+        chosen: List[_Candidate] = []
+
+        def take(category: str) -> bool:
+            items = buckets.get(category)
+            if not items:
+                return False
+            index = cursors[category]
+            if index >= len(items):
+                return False
+            cursors[category] = index + 1
+            chosen.append(items[index])
+            return True
+
+        # (1) every medical-device required question
+        while len(chosen) < num_questions and take("md_required"):
+            pass
+        # (2) at least one safety question when warnings exist
+        if len(chosen) < num_questions:
+            take("safety")
+        # (3) at least one sequence question when the procedure has >= 3 steps
+        if len(chosen) < num_questions:
+            take("sequence")
+
+        # (4-6) top up: step content, purpose/scope, definitions
+        cycle_index = 0
+        while len(chosen) < num_questions:
+            category = self.FILL_CYCLE[cycle_index % len(self.FILL_CYCLE)]
+            cycle_index += 1
+            if take(category):
+                continue
+            if all(cursors[key] >= len(buckets[key]) for key in buckets):
+                break
+        return chosen
+
+    # -- pool ---------------------------------------------------------------
+    def _build_pool(self, sop_content: SOPContent, doc_key: str) -> List[_Candidate]:
+        """Every question this document can honestly support, in a stable order."""
+        pool: List[_Candidate] = []
+        pool.extend(self._purpose_scope_candidates(sop_content, doc_key))
+        pool.extend(self._definition_candidates(sop_content, doc_key))
+        pool.extend(self._step_candidates(sop_content, doc_key))
+        pool.extend(self._sequence_candidates(sop_content, doc_key))
+        pool.extend(self._safety_candidates(sop_content, doc_key))
+        return pool
+
+    # -- shared material ----------------------------------------------------
+    def _document_material(self, sop_content: SOPContent) -> Dict[str, List[str]]:
+        """Reusable distractor material, all of it verbatim from the SOP."""
+        steps = ordered_steps(getattr(sop_content, "procedures", None))
         return {
-            "purpose": [
-                "What is the primary purpose of this procedure?",
-                "Why is this procedure important?",
-                "What does this procedure aim to accomplish?"
+            "purpose": _sentences(getattr(sop_content, "purpose", "")),
+            "scope": _sentences(getattr(sop_content, "scope", "")),
+            "responsibilities": [
+                _clean(r) for r in (getattr(sop_content, "responsibilities", None) or [])
+                if len(_clean(r)) >= 15
             ],
-            "scope": [
-                "When should this procedure be applied?",
-                "What situations does this procedure cover?",
-                "Who is responsible for following this procedure?"
+            "definitions": [
+                _clean(v) for v in (getattr(sop_content, "definitions", None) or {}).values()
+                if len(_clean(v)) >= 15
             ],
-            "procedure": [
-                "What is the correct order of steps?",
-                "What should you do in step {step_num}?",
-                "Which step involves {action}?"
-            ],
-            "safety": [
-                "Which of the following is a safety warning for this procedure?",
-                "What precautions should be taken during this procedure?",
-                "True or False: {warning}"
-            ]
+            "step_answers": [_step_answer_text(s) for s in steps],
+            "step_titles": [_step_option_text(s) for s in steps],
         }
 
-    def _generate_purpose_questions(self, sop_content: SOPContent) -> List[Question]:
-        """Generate questions about the purpose and scope"""
-        questions = []
-        q_id = 1
+    # -- purpose / scope ----------------------------------------------------
+    def _purpose_scope_candidates(self, sop_content, doc_key) -> List[_Candidate]:
+        material = self._document_material(sop_content)
+        purpose = material["purpose"]
+        scope = material["scope"]
+        multiple_choice: List[_Candidate] = []
+        true_false: List[_Candidate] = []
 
-        if sop_content.purpose:
-            # Multiple choice question about purpose
-            question = Question(
-                question_id=f"q{q_id}",
-                question_type="multiple_choice",
-                question_text="What is the primary purpose of this procedure?",
-                options=[
-                    sop_content.purpose[:100],
-                    "To ensure compliance with regulatory requirements only",
-                    "To document historical processes",
-                    "To increase paperwork requirements"
-                ],
-                correct_answer=0,
-                explanation=f"The stated purpose is: {sop_content.purpose}",
-                points=1
+        if purpose:
+            qid = "purpose_mc_1"
+            rng = Random(seed_from_digest(question_digest(doc_key, qid)))
+            # Distractors: what the SOP says about *other* things - scope,
+            # responsibilities, definitions.  Same document, same register,
+            # simply not the purpose.
+            distractors = pick_distractors(
+                purpose[0],
+                scope + material["responsibilities"] + material["definitions"]
+                + material["step_answers"],
+                rng,
             )
-            questions.append(question)
-            q_id += 1
+            if len(distractors) >= MIN_OPTIONS - 1:
+                multiple_choice.append(_Candidate.choice(
+                    "purpose_scope", 0, qid,
+                    "What is the primary purpose of this procedure, as stated in the SOP?",
+                    clip_option(purpose[0]), distractors,
+                    "The SOP purpose section states: {0}".format(purpose[0]),
+                    topic="Purpose",
+                    source_ref={"kind": "purpose", "section": "PURPOSE"},
+                ))
 
-        if sop_content.scope:
-            # True/False question about scope
-            question = Question(
-                question_id=f"q{q_id}",
-                question_type="true_false",
-                question_text=f"This procedure applies in the following context: {sop_content.scope[:100]}",
-                options=["True", "False"],
-                correct_answer=0,
-                explanation=f"The scope of this procedure is: {sop_content.scope}",
-                points=1
+        if scope:
+            qid = "scope_mc_1"
+            rng = Random(seed_from_digest(question_digest(doc_key, qid)))
+            distractors = pick_distractors(
+                scope[0],
+                purpose + material["responsibilities"] + material["definitions"]
+                + material["step_answers"],
+                rng,
             )
-            questions.append(question)
-            q_id += 1
+            if len(distractors) >= MIN_OPTIONS - 1:
+                multiple_choice.append(_Candidate.choice(
+                    "purpose_scope", 1, qid,
+                    "According to the SOP, where and to whom does this procedure apply?",
+                    clip_option(scope[0]), distractors,
+                    "The SOP scope section states: {0}".format(scope[0]),
+                    topic="Scope",
+                    source_ref={"kind": "scope", "section": "SCOPE"},
+                ))
 
-        return questions
+            altered = alter_statement(scope[0])
+            true_false.append(_Candidate.true_false(
+                "purpose_scope", 2, "scope_tf_1",
+                "True or False: this procedure applies as follows - {0}".format(
+                    clip_option(scope[0])),
+                ("True or False: this procedure applies as follows - {0}".format(
+                    clip_option(altered)) if altered else None),
+                "The SOP scope section states: {0}".format(scope[0]),
+                "That statement contradicts the SOP scope section, which states: {0}".format(scope[0]),
+                topic="Scope",
+                source_ref={"kind": "scope", "section": "SCOPE"},
+            ))
 
-    def _generate_procedure_questions(self, sop_content: SOPContent) -> List[Question]:
-        """Generate questions about procedure steps"""
-        questions = []
-        q_id = len([q for q in questions]) + 1
+        if purpose:
+            altered = alter_statement(purpose[0])
+            true_false.append(_Candidate.true_false(
+                "purpose_scope", 3, "purpose_tf_1",
+                "True or False: the SOP states this purpose - {0}".format(
+                    clip_option(purpose[0])),
+                ("True or False: the SOP states this purpose - {0}".format(
+                    clip_option(altered)) if altered else None),
+                "The SOP purpose section states: {0}".format(purpose[0]),
+                "That statement contradicts the SOP purpose section, which states: {0}".format(purpose[0]),
+                topic="Purpose",
+                source_ref={"kind": "purpose", "section": "PURPOSE"},
+            ))
 
-        if len(sop_content.procedures) >= 2:
-            # Question about step ordering
-            steps_sample = random.sample(sop_content.procedures, min(4, len(sop_content.procedures)))
-            correct_order = sorted(steps_sample, key=lambda x: int(x.get('step_number', 0)))
+        return _interleave(multiple_choice, true_false)
 
-            question = Question(
-                question_id=f"q{q_id}",
-                question_type="ordering",
-                question_text="What is the correct order of these procedure steps?",
-                options=[f"Step {s.get('step_number')}: {s.get('content', '')[:60]}..." for s in steps_sample],
-                correct_answer=[int(s.get('step_number', 0)) for s in correct_order],
-                explanation="Steps must be performed in the specified sequence.",
-                points=2
+    # -- definitions --------------------------------------------------------
+    def _definition_candidates(self, sop_content, doc_key) -> List[_Candidate]:
+        definitions = getattr(sop_content, "definitions", None) or {}
+        terms = [(_clean(t), _clean(d)) for t, d in definitions.items()
+                 if _clean(t) and len(_clean(d)) >= 10]
+        if not terms:
+            return []
+
+        material = self._document_material(sop_content)
+        multiple_choice: List[_Candidate] = []
+        true_false: List[_Candidate] = []
+
+        for index, (term, definition) in enumerate(terms):
+            others = [d for t, d in terms if t != term]
+
+            qid = "def_mc_{0}".format(index + 1)
+            rng = Random(seed_from_digest(question_digest(doc_key, qid)))
+            distractors = pick_distractors(
+                definition,
+                others + material["purpose"] + material["scope"]
+                + material["step_answers"],
+                rng,
             )
-            questions.append(question)
-            q_id += 1
+            if len(distractors) >= MIN_OPTIONS - 1:
+                multiple_choice.append(_Candidate.choice(
+                    "definition", index, qid,
+                    'As defined in this SOP, what does "{0}" mean?'.format(term),
+                    clip_option(definition), distractors,
+                    '"{0}" is defined as: {1}'.format(term, definition),
+                    topic="Definitions",
+                    source_ref={"kind": "definition", "term": term},
+                ))
 
-        # Generate questions about specific steps
-        for proc in random.sample(sop_content.procedures, min(3, len(sop_content.procedures))):
-            step_num = proc.get('step_number', '')
-            content = proc.get('content', '')
+            if others:
+                qid_tf = "def_tf_{0}".format(index + 1)
+                rng_tf = Random(seed_from_digest(question_digest(doc_key, qid_tf)))
+                wrong = rng_tf.choice(sorted(others))
+                true_false.append(_Candidate.true_false(
+                    "definition", index, qid_tf,
+                    'True or False: in this SOP, "{0}" is defined as - {1}'.format(
+                        term, clip_option(definition)),
+                    'True or False: in this SOP, "{0}" is defined as - {1}'.format(
+                        term, clip_option(wrong)),
+                    '"{0}" is defined as: {1}'.format(term, definition),
+                    'That is another term\'s definition. "{0}" is defined as: {1}'.format(
+                        term, definition),
+                    topic="Definitions",
+                    source_ref={"kind": "definition", "term": term},
+                ))
 
-            if len(content) > 20:
-                # Multiple choice question about what happens in this step
-                question = Question(
-                    question_id=f"q{q_id}",
-                    question_type="multiple_choice",
-                    question_text=f"What should be done in Step {step_num}?",
-                    options=[
-                        content[:100],
-                        "Skip this step if time is limited",
-                        "Contact supervisor and wait",
-                        "Document the issue and move to next step"
-                    ],
-                    correct_answer=0,
-                    explanation=f"Step {step_num} requires: {content}",
-                    points=1
-                )
-                questions.append(question)
-                q_id += 1
+        return _interleave(multiple_choice, true_false)
 
-        return questions
+    # -- step content -------------------------------------------------------
+    def _step_candidates(self, sop_content, doc_key) -> List[_Candidate]:
+        steps = ordered_steps(getattr(sop_content, "procedures", None))
+        if len(steps) < 2:
+            return []
 
-    def _generate_safety_questions(self, sop_content: SOPContent) -> List[Question]:
-        """Generate questions about safety warnings"""
-        questions = []
-        q_id = 100  # Start at 100 to avoid conflicts
+        material = self._document_material(sop_content)
+        candidates: List[_Candidate] = []
 
-        for idx, warning in enumerate(sop_content.safety_warnings[:3], 1):
-            # True/False questions about safety
-            question = Question(
-                question_id=f"q{q_id}",
-                question_type="true_false",
-                question_text=f"Safety Warning: {warning}",
-                options=["True - This is a valid safety warning", "False - This is not a concern"],
-                correct_answer=0,
-                explanation="All stated safety warnings must be followed.",
-                points=2  # Safety questions worth more points
-            )
-            questions.append(question)
-            q_id += 1
+        # Midpoint-bisection order so a short quiz samples across the whole
+        # procedure instead of clustering on the first few steps.
+        for order, index in enumerate(_spread_indices(len(steps))):
+            proc = steps[index]
+            number = step_number(proc) or str(index + 1)
+            title = step_title(proc)
+            body = step_body(proc)
 
-        if len(sop_content.safety_warnings) >= 2:
-            # Multiple choice about which is NOT a safety warning
-            fake_warnings = [
-                "Wearing safety equipment is optional",
-                "Speed is more important than accuracy",
-                "Safety checks can be skipped if in a hurry"
-            ]
+            if body:
+                # Full step text available: ask what the step requires and use
+                # other steps' instructions as distractors.
+                prompt = 'According to Step {0} ("{1}"), what must be done?'.format(
+                    number, title)
+                correct = clip_option(body)
+                sources = [_step_answer_text(s) for i, s in enumerate(steps) if i != index]
+            else:
+                # Heading-only parse: the title IS the answer, so it must not
+                # appear in the prompt.
+                prompt = "What action does Step {0} of this procedure require?".format(number)
+                correct = clip_option(title)
+                sources = [_step_option_text(s) for i, s in enumerate(steps) if i != index]
 
-            selected_fake = random.choice(fake_warnings)
-            options = sop_content.safety_warnings[:3] + [selected_fake]
-            random.shuffle(options)
+            sources = sources + material["definitions"] + material["scope"]
+            qid = "step_mc_{0}".format(re.sub(r"[^0-9A-Za-z]+", "_", number) or str(index + 1))
+            rng = Random(seed_from_digest(question_digest(doc_key, qid)))
+            distractors = pick_distractors(correct, sources, rng)
+            if len(distractors) < MIN_OPTIONS - 1:
+                continue
 
-            correct_idx = options.index(selected_fake)
+            candidates.append(_Candidate.choice(
+                "step", order, qid, prompt, correct, distractors,
+                "Step {0} states: {1}".format(number, body or title),
+                topic="Step {0}".format(number),
+                source_ref={"kind": "step", "step_number": number,
+                            "source_lines": proc.get("source_lines")},
+            ))
+        return candidates
 
-            question = Question(
-                question_id=f"q{q_id}",
-                question_type="multiple_choice",
-                question_text="Which of the following is NOT a valid safety warning for this procedure?",
-                options=options,
-                correct_answer=correct_idx,
-                explanation="Always follow all safety warnings and never take shortcuts.",
-                points=2
-            )
-            questions.append(question)
-            q_id += 1
+    # -- step sequence ------------------------------------------------------
+    def _sequence_candidates(self, sop_content, doc_key) -> List[_Candidate]:
+        """Replacement for the broken ``ordering`` question type.
 
-        return questions
+        The old type put a list of step numbers in ``correct_answer`` while the
+        renderer compared a single radio value against it, so it could never be
+        answered correctly.  This asks which action comes immediately after a
+        given step and offers other steps' *titles* - numbers stripped, so the
+        answer cannot be read off the labels.
+        """
+        steps = ordered_steps(getattr(sop_content, "procedures", None))
+        if len(steps) < 3:
+            return []
 
-    def _generate_definition_questions(self, sop_content: SOPContent) -> List[Question]:
-        """Generate questions about terminology and definitions"""
-        questions = []
-        q_id = 200  # Start at 200 to avoid conflicts
+        candidates: List[_Candidate] = []
+        positions = [i for i in _spread_indices(len(steps)) if i < len(steps) - 1]
+        for order, index in enumerate(positions):
+            current, following = steps[index], steps[index + 1]
+            number = step_number(current) or str(index + 1)
+            next_number = step_number(following) or str(index + 2)
+            correct = _step_option_text(following)
+            if not correct:
+                continue
 
-        for term, definition in list(sop_content.definitions.items())[:3]:
-            # Fill in the blank or multiple choice about definitions
-            question = Question(
-                question_id=f"q{q_id}",
-                question_type="multiple_choice",
-                question_text=f"What is the definition of '{term}'?",
-                options=[
-                    definition,
-                    "A general industry term",
-                    "Not defined in this procedure",
-                    "Optional terminology"
-                ],
-                correct_answer=0,
-                explanation=f"{term} is defined as: {definition}",
-                points=1
-            )
-            questions.append(question)
-            q_id += 1
+            sources = [_step_option_text(s) for i, s in enumerate(steps)
+                       if i not in (index, index + 1)]
+            qid = "seq_{0}".format(re.sub(r"[^0-9A-Za-z]+", "_", number) or str(index + 1))
+            rng = Random(seed_from_digest(question_digest(doc_key, qid)))
+            distractors = pick_distractors(correct, sources, rng)
+            if not distractors:
+                continue
+            if len(distractors) < 2:
+                # Short procedure: one plausible meta-option rather than filler.
+                distractors = distractors + ["No further action - the procedure ends here."]
 
-        return questions
+            candidates.append(_Candidate.choice(
+                "sequence", order, qid,
+                'Which action is performed immediately after Step {0} ("{1}")?'.format(
+                    number, step_title(current)),
+                correct, distractors,
+                "Step {0} is followed by Step {1}: {2}".format(
+                    number, next_number, step_title(following)),
+                kind="sequence",
+                topic="Step sequence",
+                source_ref={"kind": "sequence", "after_step": number,
+                            "answer_step": next_number},
+            ))
+        return candidates
+
+    # -- safety -------------------------------------------------------------
+    def _safety_candidates(self, sop_content, doc_key) -> List[_Candidate]:
+        warnings: List[str] = []
+        seen = set()
+        for raw in (getattr(sop_content, "safety_warnings", None) or []):
+            warning = _clean(raw)
+            norm = normalize_option_text(warning)
+            if len(warning) < 15 or norm in seen:
+                continue
+            seen.add(norm)
+            warnings.append(warning)
+        if not warnings:
+            return []
+
+        altered = [alter_statement(w) for w in warnings]
+        multiple_choice: List[_Candidate] = []
+        true_false: List[_Candidate] = []
+
+        for index, warning in enumerate(warnings):
+            # "Which of these is a warning stated in this SOP?"  Distractors are
+            # altered forms of the *other* real warnings - never another real
+            # warning, which would make two options correct.
+            sources = [a for j, a in enumerate(altered) if j != index and a]
+            if sources:
+                qid = "safety_mc_{0}".format(index + 1)
+                rng = Random(seed_from_digest(question_digest(doc_key, qid)))
+                distractors = pick_distractors(warning, sources, rng)
+                if len(distractors) >= MIN_OPTIONS - 1:
+                    multiple_choice.append(_Candidate.choice(
+                        "safety", index * 2, qid,
+                        "Which of the following safety warnings is stated in this SOP?",
+                        clip_option(warning), distractors,
+                        "The SOP states: {0}".format(warning),
+                        points=2, topic="Safety warnings",
+                        source_ref={"kind": "safety", "warning_index": index},
+                    ))
+
+            true_false.append(_Candidate.true_false(
+                "safety", index * 2 + 1, "safety_tf_{0}".format(index + 1),
+                "True or False: this SOP requires the following - {0}".format(
+                    clip_option(warning)),
+                ("True or False: this SOP requires the following - {0}".format(
+                    clip_option(altered[index])) if altered[index] else None),
+                "The SOP states: {0}".format(warning),
+                "That contradicts the SOP, which states: {0}".format(warning),
+                points=2, topic="Safety warnings",
+                source_ref={"kind": "safety", "warning_index": index},
+            ))
+
+        # "Which statement contradicts a warning?" - correct answer is the
+        # altered warning, distractors are real warnings.  Needs >= 3 warnings so
+        # there are two genuine non-contradicting options.
+        if len(warnings) >= 3:
+            for index, alt in enumerate(altered[:2]):
+                if not alt:
+                    continue
+                qid = "safety_neg_{0}".format(index + 1)
+                rng = Random(seed_from_digest(question_digest(doc_key, qid)))
+                distractors = pick_distractors(
+                    alt, [w for j, w in enumerate(warnings) if j != index], rng)
+                if len(distractors) >= 2:
+                    multiple_choice.append(_Candidate.choice(
+                        "safety", 100 + index, qid,
+                        "Which of the following statements CONTRADICTS a safety "
+                        "warning in this SOP?",
+                        clip_option(alt), distractors,
+                        "The SOP states: {0}".format(warnings[index]),
+                        points=2, topic="Safety warnings",
+                        source_ref={"kind": "safety_contradiction",
+                                    "warning_index": index},
+                    ))
+
+        return _interleave(multiple_choice, true_false)
+
+    # -- legacy -------------------------------------------------------------
+    def _load_question_templates(self) -> Dict:
+        """Question phrasing reference.
+
+        Retained for backward compatibility with callers that inspect it; the
+        generator builds its prompts inline so each one can name the step,
+        term or section it is about.
+        """
+        return {
+            "purpose": [
+                "What is the primary purpose of this procedure, as stated in the SOP?",
+            ],
+            "scope": [
+                "According to the SOP, where and to whom does this procedure apply?",
+            ],
+            "procedure": [
+                "According to Step {step_num}, what must be done?",
+                'Which action is performed immediately after Step {step_num}?',
+            ],
+            "safety": [
+                "Which of the following safety warnings is stated in this SOP?",
+                "Which of the following statements CONTRADICTS a safety warning in this SOP?",
+            ],
+            "definition": [
+                'As defined in this SOP, what does "{term}" mean?',
+            ],
+        }
 
 
 class MedicalDeviceAssessmentGenerator(AssessmentGenerator):
@@ -307,75 +1169,91 @@ class MedicalDeviceAssessmentGenerator(AssessmentGenerator):
 
     def generate(self, sop_content, num_questions=5, passing_score=80):
         """
-        Generate assessment with medical device specific questions
+        Generate assessment with medical device specific questions.
+
+        ``num_questions`` is the TOTAL, including the two required compliance
+        questions.  The old implementation asked the base generator for
+        ``num_questions - 2`` and then appended two more, but the base only
+        trimmed when the pool was larger than the request, so the returned count
+        rarely matched what was asked for.  The required questions are now part
+        of the candidate pool and sit at the top of the coverage blueprint, so
+        the count is exact and they are never crowded out.
 
         Args:
             sop_content: Parsed SOP content
-            num_questions: Total number of questions (includes 2 required medical device questions)
-            passing_score: Minimum passing score (will be raised to 80 if lower)
+            num_questions: Total number of questions
+            passing_score: Minimum passing score (raised to 80 if lower)
 
         Returns:
             Assessment object with medical device compliance questions
         """
-
-        # Get base assessment (request fewer to make room for required questions)
-        assessment = super().generate(sop_content, max(1, num_questions - 2), passing_score)
-
-        # Add required medical device questions
-        assessment.questions.extend(self._add_required_medical_questions())
-
-        # Ensure minimum passing score for medical device training
-        if assessment.passing_score < 80:
-            assessment.passing_score = 80
-
-        # Update description to indicate medical device compliance
-        assessment.description = "Complete this assessment to verify your understanding of the procedure. " + \
-                               "This assessment includes compliance questions required for medical device manufacturing."
-
+        assessment = super().generate(
+            sop_content, num_questions, max(int(passing_score), self.min_passing)
+        )
+        if assessment.passing_score < self.min_passing:
+            assessment.passing_score = self.min_passing
+        assessment.description = (
+            "Complete this assessment to verify your understanding of the procedure. "
+            "This assessment includes compliance questions required for medical "
+            "device manufacturing."
+        )
         return assessment
 
-    def _add_required_medical_questions(self):
-        """
-        Add questions that FDA expects to see in all medical device training
+    def _build_pool(self, sop_content, doc_key):
+        return self._required_medical_candidates() + super()._build_pool(
+            sop_content, doc_key)
 
-        These questions ensure that trainees understand:
-        1. Proper deviation handling per 21 CFR 820.70
+    def _required_medical_candidates(self) -> List[_Candidate]:
+        """Questions FDA expects to see in all medical device training.
+
+        Sourced from ``MEDICAL_DEVICE_CONFIG['required_questions']`` so the
+        wording lives in one place.  The distractors there are plausible
+        real-world wrong behaviours (proceed on judgement, follow the version you
+        were trained on, ask a colleague) rather than self-evidently absurd
+        options.
+
+        1. Deviation handling per 21 CFR 820.70
         2. Impact awareness per 21 CFR 820.25
-
-        Returns:
-            List of required Question objects
         """
-        required = []
+        from .medical_device_config import MEDICAL_DEVICE_CONFIG
 
-        # Deviation handling question (21 CFR 820.70 - Production and Process Controls)
-        q1 = Question(
-            question_id="md_req_1",
-            question_type="multiple_choice",
-            question_text="What should you do if you cannot follow this procedure as written?",
-            options=[
-                "Stop work and notify supervisor/QA for deviation approval",
-                "Continue with best judgment and document later",
-                "Skip the step if it seems unnecessary",
-                "Ask a coworker what they would do"
-            ],
-            correct_answer=0,
-            explanation="All deviations must be approved and documented per 21 CFR 820.70. "
-                       "Unauthorized deviations can compromise product quality and patient safety.",
-            points=2
-        )
-        required.append(q1)
+        candidates: List[_Candidate] = []
+        for index, spec in enumerate(MEDICAL_DEVICE_CONFIG.get("required_questions", [])):
+            qid = spec.get("id") or "md_req_{0}".format(index + 1)
+            if spec.get("type") == "true_false":
+                candidates.append(_Candidate.true_false(
+                    "md_required", index, qid,
+                    spec["text"],
+                    None,  # a compliance statement whose answer must be True
+                    spec.get("explanation", ""),
+                    "",
+                    points=spec.get("points", 2),
+                    topic="Regulatory compliance",
+                    source_ref={"kind": "md_required",
+                                "reference": spec.get("reference", "")},
+                ))
+            else:
+                candidates.append(_Candidate.choice(
+                    "md_required", index, qid,
+                    spec["text"],
+                    clip_option(spec["correct"]),
+                    [clip_option(d) for d in spec.get("distractors", [])],
+                    spec.get("explanation", ""),
+                    points=spec.get("points", 2),
+                    topic="Regulatory compliance",
+                    source_ref={"kind": "md_required",
+                                "reference": spec.get("reference", "")},
+                ))
+        return candidates
 
-        # Quality impact question (21 CFR 820.25 - Personnel requirements)
-        q2 = Question(
-            question_id="md_req_2",
-            question_type="true_false",
-            question_text="Deviations from this procedure could potentially impact product quality or patient safety.",
-            options=["True", "False"],
-            correct_answer=0,
-            explanation="All procedures in a Quality Management System can impact product quality. "
-                       "Per 21 CFR 820.25, personnel must be trained to understand how their work affects quality.",
-            points=2
-        )
-        required.append(q2)
+    def _add_required_medical_questions(self) -> List[Question]:
+        """Backward-compatible helper returning the required questions as
+        ``Question`` objects in canonical (unshuffled) order.
 
-        return required
+        ``generate()`` no longer calls this - the required questions enter
+        through the candidate pool so the blueprint can order and shuffle them
+        with everything else.
+        """
+        doc_key = document_key("", "")
+        return [cand.materialize(doc_key, True)
+                for cand in self._required_medical_candidates()]
