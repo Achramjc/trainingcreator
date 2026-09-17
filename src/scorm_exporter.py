@@ -2,14 +2,16 @@
 SCORM Exporter - Export training content to SCORM-compliant packages
 """
 
-import os
+import html
 import json
+import os
 import zipfile
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 from lxml import etree
 
+from .answer_key import CLIENT_VERIFIER_JS
 from .generator import TrainingModule
 from .assessments import Assessment
 
@@ -279,11 +281,11 @@ class SCORMExporter:
         # Add watermark to content
         content_with_watermark = self._add_draft_watermark(section.get('content', ''))
 
-        html = f"""<!DOCTYPE html>
+        page = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>{title} - {section.get('title', '')}</title>
+    <title>{html.escape(title)} - {html.escape(section.get('title', ''))}</title>
     <link rel="stylesheet" href="styles.css">
     <script src="scorm_api.js"></script>
     <script>
@@ -303,7 +305,7 @@ class SCORMExporter:
 </head>
 <body>
     <div class="container">
-        <h1>{title}</h1>
+        <h1>{html.escape(title)}</h1>
         {content_with_watermark}
 
         <div class="navigation">
@@ -312,25 +314,43 @@ class SCORMExporter:
     </div>
 </body>
 </html>"""
-        return html
+        return page
 
     def _create_assessment_html(self, assessment: Assessment, title: str) -> str:
-        """Create HTML for assessment"""
+        """Create HTML for assessment.
+
+        INTEGRITY: this page is built from ``assessment.to_learner_dict()`` only.
+        The correct-answer index and the explanation never reach the learner.
+        Each question carries a public salt and
+        sha256(salt + "|" + normalise(correct option text)); the page hashes the
+        option the learner selected and compares.  ``src/answer_key.py`` documents
+        exactly what that protects against and what it does not - in short, it
+        defeats "view source" but not a determined learner with dev tools, and
+        server-verified scoring is the M2 fix.
+
+        Options are emitted in the order the Python model holds them, which is
+        already deterministically shuffled at generation time with the correct
+        answer's position balanced across the assessment.
+        """
         # Add watermark
         watermark = self._add_draft_watermark("")
 
+        learner_payload = assessment.to_learner_dict()
+
         questions_html = ""
-        for q in assessment.questions:
+        for number, q in enumerate(assessment.questions, 1):
             questions_html += f"""
-            <div class="question">
-                <p><strong>Question {assessment.questions.index(q) + 1}:</strong> {q.text}</p>
+            <div class="question" id="question-{number}">
+                <p><strong>Question {number}:</strong> {html.escape(q.text)}</p>
                 <div class="options">
             """
             for idx, option in enumerate(q.options):
+                safe_option = html.escape(option)
                 questions_html += f"""
                     <label class="option">
-                        <input type="radio" name="q{q.id}" value="{idx}">
-                        {option}
+                        <input type="radio" name="q_{html.escape(q.id)}" value="{idx}"
+                               data-option="{safe_option}">
+                        {safe_option}
                     </label>
                 """
             questions_html += """
@@ -338,70 +358,137 @@ class SCORMExporter:
             </div>
             """
 
-        html = f"""<!DOCTYPE html>
+        # Escape the characters that could close the surrounding <script> tag.
+        # \u003c etc. are valid JSON and valid JavaScript, so a step body that
+        # literally contains "</script>" cannot break out of the payload.
+        questions_json = (
+            json.dumps(learner_payload["questions"])
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+        )
+
+        page = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>{title} - Assessment</title>
+    <title>{html.escape(title)} - Assessment</title>
     <link rel="stylesheet" href="styles.css">
     <script src="scorm_api.js"></script>
     <script>
-        const questions = {json.dumps([q.to_dict() for q in assessment.questions])};
-        const passingScore = {assessment.passing_score};
+{CLIENT_VERIFIER_JS}
+    </script>
+    <script>
+        /* Learner payload. Deliberately carries no answer key and no SME
+         * rationale - only the public salt and the salted hash of the right
+         * option's normalised text. */
+        var questions = {questions_json};
+        var passingScore = {assessment.passing_score};
 
         window.onload = function() {{
             initializeSCORM();
         }};
 
-        function submitAssessment() {{
-            let score = 0;
-            let totalPoints = 0;
-
-            questions.forEach((q, index) => {{
-                totalPoints += q.points;
-                const selected = document.querySelector('input[name="q' + q.id + '"]:checked');
-                if (selected && parseInt(selected.value) === q.correct_answer) {{
-                    score += q.points;
-                }}
-            }});
-
-            const percentage = Math.round((score / totalPoints) * 100);
+        function showResults(percentage, missed) {{
+            var resultsDiv = document.getElementById('results');
+            resultsDiv.style.display = 'block';
             setScore(percentage);
 
-            const resultsDiv = document.getElementById('results');
-            resultsDiv.style.display = 'block';
+            var detail = '';
+            if (missed.length) {{
+                missed.sort(function(a, b) {{ return a.number - b.number; }});
+                var items = '';
+                for (var i = 0; i < missed.length; i++) {{
+                    var topic = missed[i].topic ? ' &ndash; ' + missed[i].topic : '';
+                    items += '<li>Question ' + missed[i].number + topic + '</li>';
+                }}
+                /* Which questions were missed, so the learner knows what to
+                 * re-read. Not the correct answers: this assessment can be
+                 * retaken, and handing over the key here would defeat that. */
+                detail = '<p>Review the procedure for these questions before ' +
+                         'retaking the assessment:</p><ul>' + items + '</ul>';
+            }}
 
             if (percentage >= passingScore) {{
                 resultsDiv.className = 'results pass';
-                resultsDiv.innerHTML = '<h2>Congratulations! You Passed!</h2><p>Your score: ' + percentage + '%</p><p>Passing score: ' + passingScore + '%</p>';
+                resultsDiv.innerHTML = '<h2>Congratulations! You Passed!</h2>' +
+                    '<p>Your score: ' + percentage + '%</p>' +
+                    '<p>Passing score: ' + passingScore + '%</p>' + detail;
                 setComplete();
                 setPassed();
             }} else {{
                 resultsDiv.className = 'results fail';
-                resultsDiv.innerHTML = '<h2>Additional Study Required</h2><p>Your score: ' + percentage + '%</p><p>Passing score: ' + passingScore + '%</p><p>Please review the material and try again.</p>';
+                resultsDiv.innerHTML = '<h2>Additional Study Required</h2>' +
+                    '<p>Your score: ' + percentage + '%</p>' +
+                    '<p>Passing score: ' + passingScore + '%</p>' +
+                    '<p>Please review the material and try again.</p>' + detail;
                 setFailed();
             }}
+        }}
+
+        function submitAssessment() {{
+            var button = document.getElementById('submit-button');
+            if (button) {{ button.disabled = true; }}
+
+            var totalPoints = 0;
+            for (var i = 0; i < questions.length; i++) {{
+                totalPoints += questions[i].points;
+            }}
+            if (!questions.length || !totalPoints) {{
+                showResults(0, []);
+                return;
+            }}
+
+            var score = 0;
+            var missed = [];
+            var resolved = 0;
+
+            function settle() {{
+                resolved += 1;
+                if (resolved < questions.length) {{ return; }}
+                var percentage = Math.round((score / totalPoints) * 100);
+                showResults(percentage, missed);
+            }}
+
+            questions.forEach(function (q, index) {{
+                var selected = document.querySelector(
+                    'input[name="q_' + q.id + '"]:checked');
+                if (!selected) {{
+                    missed.push({{ number: index + 1, topic: q.topic }});
+                    settle();
+                    return;
+                }}
+                var chosen = selected.getAttribute('data-option');
+                AnswerKey.verify(q.salt, chosen, q.answer_hash, function (correct) {{
+                    if (correct) {{
+                        score += q.points;
+                    }} else {{
+                        missed.push({{ number: index + 1, topic: q.topic }});
+                    }}
+                    settle();
+                }});
+            }});
         }}
     </script>
 </head>
 <body>
     <div class="container">
-        <h1>{assessment.title}</h1>
-        <p>{assessment.description}</p>
+        <h1>{html.escape(assessment.title)}</h1>
+        <p>{html.escape(assessment.description)}</p>
 
         {watermark}
 
         {questions_html}
 
         <div class="navigation">
-            <button class="btn" onclick="submitAssessment()">Submit Assessment</button>
+            <button class="btn" id="submit-button" onclick="submitAssessment()">Submit Assessment</button>
         </div>
 
         <div id="results" class="results"></div>
     </div>
 </body>
 </html>"""
-        return html
+        return page
 
     def _create_api_files(self, package_dir: Path):
         """Create SCORM API wrapper JavaScript"""
@@ -555,9 +642,15 @@ class SCORMExporter:
                 "content_created": {
                     "training_sections": len(training_module.sections),
                     "assessment_questions": len(assessment.questions),
+                    "assessment_questions_requested": getattr(
+                        assessment, "requested_questions", len(assessment.questions)),
                     "passing_score": assessment.passing_score,
                     "estimated_duration_minutes": training_module.estimated_duration
                 },
+                # Stated up front so an auditor reads it here rather than
+                # discovering it. See src/answer_key.py.
+                "assessment_integrity": MEDICAL_DEVICE_CONFIG.get(
+                    "assessment_integrity", {}),
                 "review_status": "DRAFT - Requires SME Review",
                 "lms_notes": "Import to validated LMS for training record management per 21 CFR 820.25",
                 "generated_timestamp": datetime.now().isoformat(),
