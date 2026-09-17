@@ -5,10 +5,11 @@
 2. [Quick Start](#quick-start)
 3. [Input Formats](#input-formats)
 4. [Output Formats](#output-formats)
-5. [Advanced Usage](#advanced-usage)
-6. [LMS Upload Instructions](#lms-upload-instructions)
-7. [Customization](#customization)
-8. [Troubleshooting](#troubleshooting)
+5. [SME Review and Approval (Web App)](#sme-review-and-approval-web-app)
+6. [Advanced Usage](#advanced-usage)
+7. [LMS Upload Instructions](#lms-upload-instructions)
+8. [Customization](#customization)
+9. [Troubleshooting](#troubleshooting)
 
 ## Installation
 
@@ -162,6 +163,76 @@ python -m src.cli -i sop.txt -o ./output -f json
 - For custom integrations
 - Contains parsed SOP, training content, and assessments
 - Easy to process programmatically
+
+## SME Review and Approval (Web App)
+
+`app.py` (`python3 app.py`) generates a package immediately, exactly as the CLI
+does - but nothing generated this way is ready for learners until a named
+human reviews and approves it. Every `/api/upload` response now includes a
+`review_url` alongside `download_url`:
+
+```json
+{
+  "success": true,
+  "job_id": "…",
+  "download_url": "/api/download/<job_id>/<package>.zip?t=<token>",
+  "review_url": "/review/<job_id>?t=<token>",
+  "...": "..."
+}
+```
+
+The `download_url` in that first response is still a **DRAFT** package,
+watermarked as such on every page - useful for a quick look, but not for
+publishing to an LMS.
+
+### 1. Review
+
+Open `review_url` in a browser. The left column shows the source SOP with
+line numbers; the right column shows the generated module (title, learning
+objectives, section content) and assessment (passing score, one block per
+question with its options, correct-answer radio, and explanation). Where a
+question was generated from a specific place in the SOP, a **Show source**
+link scrolls the left column to and highlights those lines.
+
+Everything on the right is editable in place:
+- Add/remove learning objectives.
+- Edit any section's HTML content directly.
+- Edit question text, options (2-4 per question, no duplicates), which
+  option is correct, and the explanation.
+
+Click **Save edits** to submit `POST /api/review/<job_id>?t=<token>` with the
+edited module and assessment. The server validates strictly (non-empty text,
+2-4 options per question, a valid correct-answer index, no duplicate options,
+at least 5 questions) and returns `400` with a precise message on failure. On
+success it rebuilds the real content objects, regenerates the package and
+transparency report, and reports `edits_count` - how many fields differ from
+the *original, untouched* generation (not from the last save), so it stays a
+meaningful measure of how much the model got wrong even across several
+rounds of edits.
+
+### 2. Approve
+
+Once the content is right, an SME (or QA, or Training Manager - whoever your
+process requires) fills in their name, role, and optional notes, and clicks
+**Approve**. This calls `POST /api/approve/<job_id>?t=<token>` with
+`{"approved_by", "role", "notes"}`; `approved_by` and `role` are required.
+
+Approving:
+- Writes an immutable `approval.json` record next to the job's other files:
+  `{"approved_by", "role", "approved_at", "notes", "edits_count"}`.
+- Regenerates the package with the DRAFT watermark on every page replaced by
+  an "Approved by `<name>` (`<role>`) on `<date>`" banner, and `approval`
+  embedded in `metadata.json` for the audit trail.
+- Uses whatever content was last saved (edited or original) - approving after
+  an edit approves the *edited* version.
+
+A job can only be approved once; approving an already-approved job returns
+`409`. Editing an approved job's content clears its approval status, since
+the thing being reviewed has changed - it needs a fresh sign-off.
+
+The review and approval endpoints reuse the same signed, expiring token as
+downloads (`DOWNLOAD_TTL_SECONDS`), so a review link works for exactly as
+long as a download link does.
 
 ## Advanced Usage
 

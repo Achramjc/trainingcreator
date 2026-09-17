@@ -8,9 +8,10 @@ import logging
 import os
 import secrets
 import shutil
+import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, request, render_template, jsonify, send_from_directory
@@ -29,6 +30,7 @@ from src.assessments import (
 from src.scorm_exporter import SCORMExporter
 from src.transparency_report import generate_transparency_report, create_html_report, create_json_report
 from src.medical_device_config import MEDICAL_DEVICE_CONFIG
+from src.serialization import sop_from_dict, module_from_dict, assessment_from_dict
 
 app = Flask(__name__)
 
@@ -154,6 +156,210 @@ def _is_safe_path_component(value):
     return True
 
 
+def _verify_job_token(job_id):
+    """Validate the ``t`` query-string token against ``job_id``.
+
+    Shared by downloads, the review page and the review/approve APIs, so a
+    single signed link (minted once per job, at generation time) authorizes
+    all of them under the same rules: present, unexpired, and signed for this
+    exact job_id.
+
+    Returns ``None`` if the token checks out, otherwise an
+    ``(error_message, status_code)`` pair.
+    """
+    token = request.args.get('t')
+    if not token:
+        return ('Missing download token', 403)
+
+    ttl = int(app.config.get('DOWNLOAD_TTL_SECONDS', 24 * 60 * 60))
+    try:
+        token_job_id = _serializer().loads(token, max_age=ttl)
+    except SignatureExpired:
+        return ('Download link has expired', 403)
+    except BadSignature:
+        return ('Invalid download token', 403)
+
+    if token_job_id != job_id:
+        return ('Invalid download token', 403)
+
+    return None
+
+
+# --- Job persistence (draft / edited / approved) ----------------------------
+# `job.json` is the current state of a job (regenerated on every edit and on
+# approval). `draft.json` is a one-time snapshot of the *untouched* generated
+# content, written the first time a job is edited, so `edits_count` is always
+# measured against what the model actually produced - not against the last
+# edit. `approval.json` is the immutable approval record. All three are
+# written through `_atomic_write_json`, which never leaves a half-written
+# file for a concurrent reader to see.
+
+def _job_dir(job_id):
+    return Path(app.config['OUTPUT_FOLDER']) / job_id
+
+
+def _job_json_path(job_id):
+    return _job_dir(job_id) / 'job.json'
+
+
+def _draft_json_path(job_id):
+    return _job_dir(job_id) / 'draft.json'
+
+
+def _approval_json_path(job_id):
+    return _job_dir(job_id) / 'approval.json'
+
+
+def _utcnow_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _atomic_write_json(path, data):
+    """Write JSON to `path` via a temp file + os.replace, so a reader never
+    sees a partially-written file and a crash mid-write can't corrupt it."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix='.tmp-job-', suffix='.json')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_name, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _read_job_json(job_id):
+    """Load job.json for job_id, or None if the job doesn't exist / is unreadable."""
+    path = _job_json_path(job_id)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+_ABSENT = object()
+
+
+def _count_edits(original, edited):
+    """Count leaf-level differences between two JSON-like structures.
+
+    Used to compute `edits_count`: how much a reviewer changed relative to
+    the untouched generation. Dicts are compared key-by-key (union of keys on
+    both sides), lists element-by-element by position; anything else is one
+    diff if the values aren't equal. Not a semantic diff (an inserted item
+    shifts every later index and looks like N changes) - it doesn't need to
+    be exact, only representative of how much was touched.
+    """
+    if isinstance(original, dict) and isinstance(edited, dict):
+        keys = set(original) | set(edited)
+        return sum(_count_edits(original.get(k), edited.get(k)) for k in keys)
+    if isinstance(original, list) and isinstance(edited, list):
+        total = 0
+        for i in range(max(len(original), len(edited))):
+            o = original[i] if i < len(original) else _ABSENT
+            e = edited[i] if i < len(edited) else _ABSENT
+            total += _count_edits(o, e)
+        return total
+    return 0 if original == edited else 1
+
+
+def _validate_module_dict(data):
+    """Strictly validate an edited TrainingModule dict (the shape of
+    TrainingModule.to_dict()). Raises ValueError with a precise message."""
+    if not isinstance(data, dict):
+        raise ValueError('module must be a JSON object')
+
+    title = data.get('title')
+    if not isinstance(title, str) or not title.strip():
+        raise ValueError('module.title must be a non-empty string')
+
+    objectives = data.get('learning_objectives')
+    if not isinstance(objectives, list) or not objectives:
+        raise ValueError('module.learning_objectives must be a non-empty list')
+    for i, obj in enumerate(objectives):
+        if not isinstance(obj, str) or not obj.strip():
+            raise ValueError(f'module.learning_objectives[{i}] must be a non-empty string')
+
+    sections = data.get('sections')
+    if not isinstance(sections, list) or not sections:
+        raise ValueError('module.sections must be a non-empty list')
+    for i, section in enumerate(sections):
+        if not isinstance(section, dict):
+            raise ValueError(f'module.sections[{i}] must be an object')
+        if not isinstance(section.get('id'), str) or not section['id']:
+            raise ValueError(f'module.sections[{i}] must have a non-empty id')
+        if not isinstance(section.get('content'), str):
+            raise ValueError(f'module.sections[{i}].content must be a string')
+
+    if not isinstance(data.get('estimated_duration', 0), int):
+        raise ValueError('module.estimated_duration must be an integer')
+
+
+def _validate_assessment_dict(data):
+    """Strictly validate an edited Assessment dict (the shape of
+    Assessment.to_dict()). Raises ValueError with a precise message."""
+    if not isinstance(data, dict):
+        raise ValueError('assessment must be a JSON object')
+
+    passing_score = data.get('passing_score')
+    if not isinstance(passing_score, int) or isinstance(passing_score, bool) \
+            or not (0 < passing_score <= 100):
+        raise ValueError('assessment.passing_score must be an integer between 1 and 100')
+
+    questions = data.get('questions')
+    if not isinstance(questions, list):
+        raise ValueError('assessment.questions must be a list')
+    if len(questions) < MIN_ASSESSMENT_QUESTIONS:
+        raise ValueError(
+            f'assessment must have at least {MIN_ASSESSMENT_QUESTIONS} questions '
+            f'(has {len(questions)})')
+
+    seen_ids = set()
+    for i, q in enumerate(questions):
+        label = f'assessment.questions[{i}]'
+        if not isinstance(q, dict):
+            raise ValueError(f'{label} must be an object')
+
+        qid = q.get('id')
+        if not isinstance(qid, str) or not qid:
+            raise ValueError(f'{label}.id must be a non-empty string')
+        if qid in seen_ids:
+            raise ValueError(f'{label}.id "{qid}" is used by more than one question')
+        seen_ids.add(qid)
+
+        text = q.get('text')
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f'{label}.text must be a non-empty string')
+
+        options = q.get('options')
+        if not isinstance(options, list) or not (2 <= len(options) <= 4):
+            raise ValueError(f'{label}.options must be a list of 2 to 4 items')
+        for j, opt in enumerate(options):
+            if not isinstance(opt, str) or not opt.strip():
+                raise ValueError(f'{label}.options[{j}] must be a non-empty string')
+        normalized = [opt.strip().lower() for opt in options]
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f'{label}.options must not contain duplicate options')
+
+        correct = q.get('correct_answer')
+        if isinstance(correct, bool) or not isinstance(correct, int) \
+                or not (0 <= correct < len(options)):
+            raise ValueError(
+                f'{label}.correct_answer must be an integer index into options '
+                f'(0..{len(options) - 1})')
+
+        explanation = q.get('explanation', '')
+        if not isinstance(explanation, str):
+            raise ValueError(f'{label}.explanation must be a string')
+
+
 @app.route('/')
 def index():
     """Serve the main application page"""
@@ -271,67 +477,51 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
         output_dir = Path(app.config['OUTPUT_FOLDER']) / job_id
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate transparency report for medical device compliance
-        transparency_report = generate_transparency_report(
-            sop_content,
-            training_module,
-            assessment,
-            file_path
+        package_name = secure_filename(sop_content.title.replace(' ', '_')[:50])
+        source_filename = Path(file_path).name
+
+        # Persist the draft *before* exporting, so a job.json always exists
+        # once generation has started - this is the SME review record, and it
+        # legitimately carries the answer key (SOPContent/TrainingModule/
+        # Assessment .to_dict()), same as the existing SME JSON export.
+        now = _utcnow_iso()
+        job_record = {
+            'job_id': job_id,
+            'status': 'draft',
+            'created_at': now,
+            'updated_at': now,
+            'source_filename': source_filename,
+            'package_name': package_name,
+            'request': {
+                'num_questions': num_questions,
+                'passing_score': passing_score,
+                'scorm_version': scorm_version,
+                'output_format': output_format,
+            },
+            'sop_content': sop_content.to_dict(),
+            'training_module': training_module.to_dict(),
+            'assessment': assessment.to_dict(),
+            'edits_count': 0,
+            'approval': None,
+        }
+        _atomic_write_json(_job_json_path(job_id), job_record)
+
+        # Step 4: Generate the transparency report and the requested export.
+        download_filename = _export_outputs(
+            output_dir, package_name, sop_content, training_module, assessment,
+            scorm_version, output_format, source_filename, approval=None,
         )
 
-        # Save transparency report as HTML and JSON
-        create_html_report(transparency_report, str(output_dir / 'transparency_report.html'))
-        create_json_report(transparency_report, str(output_dir / 'transparency_report.json'))
-
-        # Step 4: Export based on format
-        if output_format == 'scorm':
-            exporter = SCORMExporter(scorm_version=scorm_version)
-            package_name = secure_filename(sop_content.title.replace(' ', '_')[:50])
-            output_path = exporter.create_package(
-                training_module,
-                assessment,
-                str(output_dir),
-                package_name
-            )
-            download_filename = Path(output_path).name
-
-        elif output_format == 'json':
-            # Export as JSON
-            json_data = {
-                "sop_content": sop_content.to_dict(),
-                "training_module": training_module.to_dict(),
-                "assessment": assessment.to_dict(),
-                "metadata": {
-                    "created_at": datetime.now().isoformat(),
-                    "num_questions": num_questions,
-                    "passing_score": passing_score
-                }
-            }
-            download_filename = "training_data.json"
-            output_path = output_dir / download_filename
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(json_data, f, indent=2, ensure_ascii=False)
-
-        elif output_format == 'html':
-            # Export as standalone HTML
-            download_filename = "training.html"
-            output_path = output_dir / download_filename
-            html_content = create_standalone_html(training_module, assessment)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-
-        else:
-            # Defensive; unreachable because of the validation above.
-            raise ValueError(f"Unsupported output_format: {output_format}")
-
-        download_token = generate_download_token(job_id)
+        token = generate_download_token(job_id)
 
         # Return results
         return {
             'success': True,
             'job_id': job_id,
-            'download_url': f'/api/download/{job_id}/{download_filename}?t={download_token}',
-            'transparency_report_url': f'/api/download/{job_id}/transparency_report.html?t={download_token}',
+            'status': job_record['status'],
+            'download_url': f'/api/download/{job_id}/{download_filename}?t={token}',
+            'transparency_report_url': f'/api/download/{job_id}/transparency_report.html?t={token}',
+            'review_url': f'/review/{job_id}?t={token}',
             'metadata': {
                 'title': sop_content.title,
                 'version': sop_content.version,
@@ -352,6 +542,68 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
         raise
 
 
+def _export_outputs(output_dir, package_name, sop_content, training_module, assessment,
+                     scorm_version, output_format, source_filename, approval=None):
+    """(Re)generate the transparency report and the requested export for a job.
+
+    Shared by the initial upload, an edit-and-regenerate, and an
+    approve-and-regenerate, so all three produce the same file layout for a
+    given output_format. `source_filename` is used only for the
+    transparency report's "source document" section - it may no longer exist
+    on disk by the time this runs (the upload is deleted right after initial
+    processing), which `calculate_file_hash` already handles gracefully.
+
+    Returns the filename of the primary download artifact.
+    """
+    output_dir = Path(output_dir)
+
+    transparency_report = generate_transparency_report(
+        sop_content, training_module, assessment, source_filename
+    )
+    create_html_report(transparency_report, str(output_dir / 'transparency_report.html'))
+    create_json_report(transparency_report, str(output_dir / 'transparency_report.json'))
+
+    if output_format == 'scorm':
+        exporter = SCORMExporter(scorm_version=scorm_version)
+        output_path = exporter.create_package(
+            training_module,
+            assessment,
+            str(output_dir),
+            package_name,
+            approval=approval,
+        )
+        download_filename = Path(output_path).name
+
+    elif output_format == 'json':
+        json_data = {
+            "sop_content": sop_content.to_dict(),
+            "training_module": training_module.to_dict(),
+            "assessment": assessment.to_dict(),
+            "metadata": {
+                "created_at": datetime.now().isoformat(),
+                "num_questions": len(assessment.questions),
+                "passing_score": assessment.passing_score
+            }
+        }
+        if approval:
+            json_data["approval"] = approval
+        download_filename = "training_data.json"
+        with open(output_dir / download_filename, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+
+    elif output_format == 'html':
+        download_filename = "training.html"
+        html_content = create_standalone_html(training_module, assessment)
+        with open(output_dir / download_filename, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+
+    else:
+        # Defensive; unreachable because of the validation upstream.
+        raise ValueError(f"Unsupported output_format: {output_format}")
+
+    return download_filename
+
+
 @app.route('/api/download/<job_id>/<filename>')
 def download_file(job_id, filename):
     """Download generated training package.
@@ -364,20 +616,10 @@ def download_file(job_id, filename):
     if not _is_safe_path_component(job_id) or not _is_safe_path_component(filename):
         return jsonify({'error': 'Invalid request'}), 400
 
-    token = request.args.get('t')
-    if not token:
-        return jsonify({'error': 'Missing download token'}), 403
-
-    ttl = int(app.config.get('DOWNLOAD_TTL_SECONDS', 24 * 60 * 60))
-    try:
-        token_job_id = _serializer().loads(token, max_age=ttl)
-    except SignatureExpired:
-        return jsonify({'error': 'Download link has expired'}), 403
-    except BadSignature:
-        return jsonify({'error': 'Invalid download token'}), 403
-
-    if token_job_id != job_id:
-        return jsonify({'error': 'Invalid download token'}), 403
+    token_error = _verify_job_token(job_id)
+    if token_error:
+        message, status = token_error
+        return jsonify({'error': message}), status
 
     output_root = Path(app.config['OUTPUT_FOLDER']).resolve()
     job_dir = (output_root / job_id).resolve()
@@ -393,6 +635,233 @@ def download_file(job_id, filename):
         return jsonify({'error': 'File not found'}), 404
 
     return send_from_directory(job_dir, filename, as_attachment=True)
+
+
+# --- SME review and approval -------------------------------------------
+
+@app.route('/review/<job_id>')
+def review_page(job_id):
+    """Server-rendered SME review page: source document vs. generated
+    content, editable, with an approval status.
+
+    Requires the same signed token as downloads (query param `t`).
+    """
+    if not _is_safe_path_component(job_id):
+        return 'Invalid request', 400
+
+    token_error = _verify_job_token(job_id)
+    if token_error:
+        message, status = token_error
+        return message, status
+
+    job = _read_job_json(job_id)
+    if job is None:
+        return 'Job not found', 404
+
+    sop = job.get('sop_content') or {}
+    source_lines = (sop.get('raw_content') or '').splitlines()
+
+    return render_template(
+        'review.html',
+        job_id=job_id,
+        token=request.args.get('t', ''),
+        status=job.get('status', 'draft'),
+        edits_count=job.get('edits_count', 0),
+        approval=job.get('approval'),
+        sop=sop,
+        source_lines=source_lines,
+        module=job.get('training_module') or {},
+        assessment=job.get('assessment') or {},
+        min_questions=MIN_ASSESSMENT_QUESTIONS,
+    )
+
+
+@app.route('/api/review/<job_id>', methods=['POST'])
+def review_submit(job_id):
+    """Accept SME edits to the generated module/assessment, validate them
+    strictly, rebuild the real model objects, and regenerate every export.
+
+    Requires the same signed token as downloads (query param `t`). Body is
+    JSON: `{"module": <TrainingModule.to_dict() shape>,
+             "assessment": <Assessment.to_dict() shape>}`.
+    """
+    if not _is_safe_path_component(job_id):
+        return jsonify({'error': 'Invalid request'}), 400
+
+    token_error = _verify_job_token(job_id)
+    if token_error:
+        message, status = token_error
+        return jsonify({'error': message}), status
+
+    job = _read_job_json(job_id)
+    if job is None:
+        return jsonify({'error': 'Job not found'}), 404
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'error': 'Request body must be a JSON object with "module" and "assessment"'}), 400
+
+    module_dict = body.get('module')
+    assessment_dict = body.get('assessment')
+
+    try:
+        _validate_module_dict(module_dict)
+        _validate_assessment_dict(assessment_dict)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    # The untouched generation, snapshotted the first time a job is edited,
+    # so edits_count is always measured against what the model produced.
+    draft_path = _draft_json_path(job_id)
+    if draft_path.is_file():
+        try:
+            with open(draft_path, encoding='utf-8') as f:
+                draft = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            draft = {'training_module': job['training_module'], 'assessment': job['assessment']}
+    else:
+        draft = {'training_module': job['training_module'], 'assessment': job['assessment']}
+        _atomic_write_json(draft_path, draft)
+
+    edits_count = (
+        _count_edits(draft.get('training_module'), module_dict)
+        + _count_edits(draft.get('assessment'), assessment_dict)
+    )
+
+    sop_content = sop_from_dict(job.get('sop_content'))
+    training_module = module_from_dict(module_dict)
+    assessment = assessment_from_dict(assessment_dict)
+
+    job['training_module'] = module_dict
+    job['assessment'] = assessment_dict
+    job['status'] = 'edited'
+    job['edits_count'] = edits_count
+    job['approval'] = None  # content changed - any prior approval no longer applies
+    job['updated_at'] = _utcnow_iso()
+    _atomic_write_json(_job_json_path(job_id), job)
+
+    req = job.get('request', {})
+    download_filename = _export_outputs(
+        _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
+        req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
+        job.get('source_filename'), approval=None,
+    )
+
+    token = request.args.get('t', '')
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': job['status'],
+        'edits_count': edits_count,
+        'download_url': f'/api/download/{job_id}/{download_filename}?t={token}',
+        'transparency_report_url': f'/api/download/{job_id}/transparency_report.html?t={token}',
+        'review_url': f'/review/{job_id}?t={token}',
+        'metadata': {
+            'title': sop_content.title,
+            'version': sop_content.version,
+            'num_procedures': len(sop_content.procedures),
+            'num_safety_warnings': len(sop_content.safety_warnings),
+            'num_questions': len(assessment.questions),
+            'passing_score': assessment.passing_score,
+            'estimated_duration': training_module.estimated_duration,
+            'learning_objectives': len(training_module.learning_objectives),
+            'medical_device_mode': True,
+            'compliance_questions_included': True,
+            'draft_watermarks_added': True,
+        },
+    }), 200
+
+
+@app.route('/api/approve/<job_id>', methods=['POST'])
+def approve_job(job_id):
+    """Record a named human's approval of a job and regenerate its package
+    with the DRAFT watermark replaced by an approval banner.
+
+    Requires the same signed token as downloads (query param `t`). Body is
+    JSON: `{"approved_by": str, "role": str, "notes": str}` - approved_by and
+    role are required and non-empty. 409 if the job is already approved.
+    """
+    if not _is_safe_path_component(job_id):
+        return jsonify({'error': 'Invalid request'}), 400
+
+    token_error = _verify_job_token(job_id)
+    if token_error:
+        message, status = token_error
+        return jsonify({'error': message}), status
+
+    job = _read_job_json(job_id)
+    if job is None:
+        return jsonify({'error': 'Job not found'}), 404
+
+    if job.get('status') == 'approved':
+        return jsonify({'error': 'Job has already been approved'}), 409
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'error': 'Request body must be a JSON object'}), 400
+
+    approved_by = body.get('approved_by')
+    role = body.get('role')
+    notes = body.get('notes', '')
+
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        return jsonify({'error': 'approved_by is required'}), 400
+    if not isinstance(role, str) or not role.strip():
+        return jsonify({'error': 'role is required'}), 400
+    if notes is None:
+        notes = ''
+    if not isinstance(notes, str):
+        return jsonify({'error': 'notes must be a string'}), 400
+
+    approval = {
+        'approved_by': approved_by.strip(),
+        'role': role.strip(),
+        'approved_at': _utcnow_iso(),
+        'notes': notes,
+        'edits_count': int(job.get('edits_count', 0)),
+    }
+    _atomic_write_json(_approval_json_path(job_id), approval)
+
+    job['approval'] = approval
+    job['status'] = 'approved'
+    job['updated_at'] = _utcnow_iso()
+    _atomic_write_json(_job_json_path(job_id), job)
+
+    sop_content = sop_from_dict(job.get('sop_content'))
+    training_module = module_from_dict(job.get('training_module'))
+    assessment = assessment_from_dict(job.get('assessment'))
+
+    req = job.get('request', {})
+    download_filename = _export_outputs(
+        _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
+        req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
+        job.get('source_filename'), approval=approval,
+    )
+
+    token = request.args.get('t', '')
+    return jsonify({
+        'success': True,
+        'job_id': job_id,
+        'status': job['status'],
+        'edits_count': job.get('edits_count', 0),
+        'approval': approval,
+        'download_url': f'/api/download/{job_id}/{download_filename}?t={token}',
+        'transparency_report_url': f'/api/download/{job_id}/transparency_report.html?t={token}',
+        'review_url': f'/review/{job_id}?t={token}',
+        'metadata': {
+            'title': sop_content.title,
+            'version': sop_content.version,
+            'num_procedures': len(sop_content.procedures),
+            'num_safety_warnings': len(sop_content.safety_warnings),
+            'num_questions': len(assessment.questions),
+            'passing_score': assessment.passing_score,
+            'estimated_duration': training_module.estimated_duration,
+            'learning_objectives': len(training_module.learning_objectives),
+            'medical_device_mode': True,
+            'compliance_questions_included': True,
+            'draft_watermarks_added': False,
+        },
+    }), 200
 
 
 @app.route('/health')
