@@ -1,18 +1,25 @@
 # Training Creator
 
-A powerful tool to convert Standard Operating Procedures (SOPs) and work instructions into interactive training materials with assessments, ready for upload to any Learning Management System (LMS).
+A tool to convert Standard Operating Procedures (SOPs) and work instructions into training materials with assessments, exportable as SCORM packages for a Learning Management System (LMS).
 
-**Available as both a user-friendly web interface and command-line tool!**
+**Available as both a web interface and a command-line tool.**
+
+## Status
+
+**Pre-release.** This is a working pipeline (parse -> generate -> assess -> export), not yet
+a validated product. Generated content and assessment questions require Subject Matter Expert
+(SME) and Quality review before use in a regulated training program — nothing here is a
+substitute for that review. See [GOAL.md](GOAL.md) for the current known gaps, what's fixed,
+and the roadmap to a compliance-grade product.
 
 ## Features
 
-- **🌐 Web Interface**: No coding required! Beautiful drag-and-drop interface
+- **Web Interface**: Drag-and-drop upload, no coding required
 - **Multi-format Input Support**: Parse SOPs from PDF, DOCX, TXT, and Markdown files
-- **Intelligent Content Analysis**: Automatically extracts procedures, steps, and key information
+- **Automated Content Extraction**: Extracts procedures, steps, and key SOP sections via pattern matching
 - **Training Content Generation**: Creates structured training modules with learning objectives
 - **Assessment Generation**: Automatically generates verification questions and quizzes
-- **LMS-Ready Export**: Outputs SCORM 1.2/2004 packages compatible with major LMS platforms
-- **Customizable Templates**: Modify training presentation and assessment styles
+- **SCORM Export**: Outputs SCORM 1.2/2004 packages
 
 ## Quick Start
 
@@ -81,20 +88,14 @@ exporter.create_package(training_module, assessments, 'output_folder')
 
 - **SCORM 1.2**: Maximum compatibility with older LMS platforms
 - **SCORM 2004**: Modern SCORM standard with sequencing support
-- **xAPI (Tin Can)**: For next-generation learning platforms
-- **HTML Package**: Standalone HTML files for any web platform
+- **HTML Package**: Standalone HTML file, not LMS-tracked
 - **JSON**: Structured data for custom integrations
 
 ## LMS Compatibility
 
-Tested and compatible with:
-- Moodle
-- Canvas
-- Blackboard
-- TalentLMS
-- Cornerstone OnDemand
-- SAP SuccessFactors
-- And any SCORM-compliant LMS
+Produces SCORM 1.2 and SCORM 2004 packages. Import into any SCORM-conformant LMS.
+Automated conformance testing against the ADL test suite is on the roadmap (see
+[GOAL.md](GOAL.md)) — no specific LMS platform has been verified against these packages yet.
 
 ## Project Structure
 
