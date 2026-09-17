@@ -332,6 +332,24 @@ package shipped, compare either anchored value against `head_hash` from
 used to be a valid entry hash and no longer appears in `show`'s output means something in the
 trail changed since that anchor was taken.
 
+### Checking your own document corpus
+
+Before a pilot, run every SOP you intend to use through the same measurements the test suite
+uses:
+
+```bash
+python3 -m tools.corpus_check /path/to/your/sops --questions 5 8 --json corpus_report.json
+```
+
+It reports how many documents parsed and exported, how many steps/warnings/definitions were
+found, whether any generated assessment could be passed by a fixed strategy (it exits non-zero
+if so), how many assessments came back thinner than requested, and the injection-scan result per
+document. Documents are treated as data: only titles and short excerpts are printed. On a set of
+107 real, unstructured procedures taken from the web (no PURPOSE/SCOPE headings, 2–14 steps each)
+every document parsed and exported, none produced a gameable assessment, and the 2–4-step
+documents came back with fewer questions than requested — which is the honest outcome for thin
+material.
+
 ## Running a Pilot
 
 GOAL.md's M1 exit criterion is **SMEs accept generated content with <30% edits across 20 real
