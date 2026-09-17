@@ -133,6 +133,7 @@ def generate_sample_route(sample_id):
             passing_score,
             scorm_version,
             output_format,
+            sample_id=sample_id,
         )
         flask_app.logger.info(f"[job_id={job_id}] Processing complete")
         return jsonify(result), 200

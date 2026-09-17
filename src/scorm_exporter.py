@@ -185,7 +185,8 @@ class SCORMExporter:
                        assessment: Assessment,
                        output_path: str,
                        package_name: Optional[str] = None,
-                       approval: Optional[dict] = None) -> str:
+                       approval: Optional[dict] = None,
+                       audit_head: Optional[str] = None) -> str:
         """
         Create a SCORM package from training content
 
@@ -199,6 +200,11 @@ class SCORMExporter:
                 page's DRAFT watermark is replaced with an approval banner and
                 the record is embedded in metadata.json. When ``None`` (the
                 default), output is byte-identical to the unapproved package.
+            audit_head: Optional audit trail head hash (``src.audit.AuditLog
+                .head_hash()``) to anchor into metadata.json as
+                ``audit_head_hash`` (docs/AUDIT_TRAIL.md "Anchoring the head
+                hash"). ``None`` (the default) leaves metadata.json exactly
+                as before - output stays byte-identical when this is omitted.
 
         Returns:
             Path to created ZIP file
@@ -220,7 +226,7 @@ class SCORMExporter:
 
         # Create metadata file for transparency
         self._create_metadata_file(package_dir, training_module, assessment, package_name,
-                                    approval=approval)
+                                    approval=approval, audit_head=audit_head)
 
         # Create ZIP package
         zip_path = output_path / f"{package_name}.zip"
@@ -1302,7 +1308,8 @@ class SCORMExporter:
 
     def _create_metadata_file(self, package_dir: Path, training_module: TrainingModule,
                              assessment: Assessment, source_info: str = "Unknown",
-                             approval: Optional[dict] = None):
+                             approval: Optional[dict] = None,
+                             audit_head: Optional[str] = None):
         """
         Create metadata.json for full transparency
 
@@ -1318,6 +1325,9 @@ class SCORMExporter:
                 verbatim under the "approval" key and ``review_status``
                 switches from DRAFT to APPROVED. ``None`` (the default)
                 leaves metadata.json exactly as before.
+            audit_head: Optional audit trail head hash. When present it is
+                embedded verbatim under "audit_head_hash". ``None`` (the
+                default) leaves metadata.json exactly as before.
         """
         try:
             from .medical_device_config import MEDICAL_DEVICE_CONFIG
@@ -1349,6 +1359,8 @@ class SCORMExporter:
             }
             if approval:
                 metadata["approval"] = approval
+            if audit_head:
+                metadata["audit_head_hash"] = audit_head
 
             with open(package_dir / 'metadata.json', 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
@@ -1370,6 +1382,8 @@ class SCORMExporter:
             }
             if approval:
                 metadata["approval"] = approval
+            if audit_head:
+                metadata["audit_head_hash"] = audit_head
 
             with open(package_dir / 'metadata.json', 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
