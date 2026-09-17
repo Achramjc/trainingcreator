@@ -94,6 +94,12 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
 ALLOWED_EXTENSIONS = {'txt', 'md', 'pdf', 'docx'}
+
+# Sample-SOP gallery routes (GET /api/samples, POST /api/samples/<id>/generate).
+# The blueprint imports this module's processing helpers lazily inside its
+# views, so registering it here creates no import cycle.
+from src.samples_routes import samples_bp  # noqa: E402
+app.register_blueprint(samples_bp)
 ALLOWED_OUTPUT_FORMATS = {'scorm', 'json', 'html'}
 ALLOWED_SCORM_VERSIONS = {'1.2', '2004'}
 
