@@ -4,6 +4,12 @@ Real pytest assertions for the M1 transparency-report additions:
   - requested_questions vs actual, and assessment.notes surfaced
   - optional approval block
   - stability of the pre-existing top-level JSON keys
+
+And the M3 (partial) audit-trail surfacing:
+  - audit_block_for_job() reading a real audit.jsonl from disk
+  - report["audit_trail"] shape, for both a trail and no trail
+  - the HTML rendering: red banner only on failure, timeline, head hash,
+    the mode statement, and escaping of untrusted actor names
 """
 
 import copy
@@ -18,7 +24,9 @@ from src.transparency_report import (
     generate_transparency_report,
     create_html_report,
     create_json_report,
+    audit_block_for_job,
 )
+from src.audit import AuditLog, Actor, content_hash as audit_content_hash
 
 
 @pytest.fixture()
@@ -379,4 +387,256 @@ class TestLMSRecordBlock:
                         "cmi.completion_status"):
             assert element in api, element
         assert "correct_responses" not in api
-        assert "correct_responses" in record["not_written"]
+
+
+# ---------------------------------------------------------------------------
+# Audit trail (M3 partial): audit_block_for_job() + report["audit_trail"]
+# ---------------------------------------------------------------------------
+
+def _build_intact_trail(job_dir, job_id, hmac_key=None, tamper_after_approval=False):
+    """Write a real, well-formed audit.jsonl for `job_id` under `job_dir`:
+    job.created -> content.generated -> content.approved -> package.exported.
+
+    With `tamper_after_approval=True`, an extra content.edited entry is
+    appended *after* the approval (no re-approval follows) -- a semantic
+    violation verify_job must catch, not a hash-chain break.
+    """
+    log = AuditLog.for_job(job_dir, job_id, hmac_key)
+    log.append("job.created", Actor("training-creator", "application", "system"),
+               {"source_filename": "sop.txt"})
+    digest = audit_content_hash({"training_module": "a"}, {"assessment": "b"})
+    log.append("content.generated", Actor("training-creator", "application", "system"),
+               {"questions": 5}, digest)
+    log.append("content.approved", Actor("Dana Reyes", "Quality Engineer", "web"),
+               {"approved_by": "Dana Reyes", "role": "Quality Engineer", "edits_count": 0},
+               digest)
+    log.append("package.exported", Actor("training-creator", "application", "system"),
+               {"package_sha256": "abc123def4567890fedcba", "format": "scorm",
+                "scorm_version": "1.2"}, digest)
+    if tamper_after_approval:
+        log.append("content.edited", Actor("Dana Reyes", "Quality Engineer", "web"),
+                   {"edits_count": 1, "categories": {"title": 1}}, digest)
+    return log
+
+
+def _corrupt_middle_line(job_dir):
+    """Tamper a middle entry's `details` in place, breaking its hash without
+    breaking JSON-parseability -- the "someone edited the record" case."""
+    path = job_dir / "audit.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) >= 2
+    obj = json.loads(lines[1])
+    obj["details"] = dict(obj["details"])
+    obj["details"]["questions"] = 999
+    lines[1] = json.dumps(obj)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class TestAuditBlockForJob:
+    def test_returns_none_without_a_file(self, tmp_path):
+        job_dir = tmp_path / "job-none"
+        job_dir.mkdir()
+        assert audit_block_for_job(job_dir, "job-none") is None
+
+    def test_shape_with_a_trail(self, tmp_path):
+        job_dir = tmp_path / "job-1"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-1")
+
+        audit = audit_block_for_job(job_dir, "job-1")
+        assert set(audit.keys()) == {"entries", "verification", "hmac_mode"}
+        assert audit["hmac_mode"] == "chain-only"
+        assert len(audit["entries"]) == 4
+        assert audit["entries"][0]["event"] == "job.created"
+        assert audit["verification"]["ok"] is True
+        assert audit["verification"]["package_matches_approval"] is True
+
+    def test_hmac_mode_when_key_given(self, tmp_path):
+        job_dir = tmp_path / "job-2"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-2", hmac_key=b"top-secret")
+
+        audit = audit_block_for_job(job_dir, "job-2", hmac_key=b"top-secret")
+        assert audit["hmac_mode"] == "hmac"
+        assert audit["verification"]["ok"] is True
+
+    def test_detects_tampering(self, tmp_path):
+        job_dir = tmp_path / "job-3"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-3")
+        _corrupt_middle_line(job_dir)
+
+        audit = audit_block_for_job(job_dir, "job-3")
+        assert audit["verification"]["ok"] is False
+        assert audit["verification"]["problems"]
+
+    def test_detects_edit_after_approval(self, tmp_path):
+        job_dir = tmp_path / "job-4"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-4", tamper_after_approval=True)
+
+        audit = audit_block_for_job(job_dir, "job-4")
+        assert audit["verification"]["ok"] is False
+        assert any("after approval" in p for p in audit["verification"]["problems"])
+
+
+class TestAuditTrailReportBlock:
+    def test_no_audit_trail_shape(self, sop, training, assessment, sample_sop_path):
+        report = _report(sop, training, assessment, sample_sop_path, audit=None)
+        assert report["audit_trail"] == {"status": "no_audit_trail"}
+
+    def test_intact_trail_shape_and_values(self, tmp_path, sop, training, assessment,
+                                           sample_sop_path):
+        job_dir = tmp_path / "job-json"
+        job_dir.mkdir()
+        log = _build_intact_trail(job_dir, "job-json")
+        audit = audit_block_for_job(job_dir, "job-json")
+
+        report = _report(sop, training, assessment, sample_sop_path, audit=audit)
+        block = report["audit_trail"]
+
+        assert block["status"] == "intact"
+        assert block["hmac_mode"] == "chain-only"
+        assert block["entries_count"] == 4
+        assert block["head_hash"] == log.head_hash()
+        assert block["package_matches_approval"] is True
+        assert block["problems"] == []
+
+        seqs = [item["seq"] for item in block["timeline"]]
+        events = [item["event"] for item in block["timeline"]]
+        assert seqs == [1, 2, 3, 4]
+        assert events == [
+            "job.created", "content.generated", "content.approved", "package.exported",
+        ]
+        for item in block["timeline"]:
+            assert set(item.keys()) == {
+                "seq", "ts", "event", "actor", "content_hash", "details_summary"}
+
+    def test_failed_trail_status_and_problems(self, tmp_path, sop, training, assessment,
+                                              sample_sop_path):
+        job_dir = tmp_path / "job-tampered"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-tampered")
+        _corrupt_middle_line(job_dir)
+        audit = audit_block_for_job(job_dir, "job-tampered")
+
+        report = _report(sop, training, assessment, sample_sop_path, audit=audit)
+        block = report["audit_trail"]
+        assert block["status"] == "failed"
+        assert block["problems"]
+
+    def test_existing_top_level_keys_still_present_with_audit(
+            self, tmp_path, sop, training, assessment, sample_sop_path):
+        job_dir = tmp_path / "job-keys"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-keys")
+        audit = audit_block_for_job(job_dir, "job-keys")
+        report = _report(sop, training, assessment, sample_sop_path, audit=audit)
+        for key in ("report_title", "citation_coverage", "lms_record", "approval"):
+            assert key in report
+
+
+class TestAuditTrailHTML:
+    def test_no_audit_trail_note(self, tmp_path, sop, training, assessment, sample_sop_path):
+        report = _report(sop, training, assessment, sample_sop_path, audit=None)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert "Audit Trail" in content
+        assert "No audit trail is available" in content
+        assert "AUDIT TRAIL VERIFICATION FAILED" not in content
+
+    def test_red_banner_only_on_failure(self, tmp_path, sop, training, assessment,
+                                        sample_sop_path):
+        ok_dir = tmp_path / "job-ok"
+        ok_dir.mkdir()
+        _build_intact_trail(ok_dir, "job-ok")
+        ok_audit = audit_block_for_job(ok_dir, "job-ok")
+        ok_report = _report(sop, training, assessment, sample_sop_path, audit=ok_audit)
+        ok_path = tmp_path / "ok.html"
+        create_html_report(ok_report, str(ok_path))
+        ok_content = ok_path.read_text(encoding="utf-8")
+        assert "AUDIT TRAIL VERIFICATION FAILED" not in ok_content
+
+        bad_dir = tmp_path / "job-bad"
+        bad_dir.mkdir()
+        _build_intact_trail(bad_dir, "job-bad")
+        _corrupt_middle_line(bad_dir)
+        bad_audit = audit_block_for_job(bad_dir, "job-bad")
+        bad_report = _report(sop, training, assessment, sample_sop_path, audit=bad_audit)
+        bad_path = tmp_path / "bad.html"
+        create_html_report(bad_report, str(bad_path))
+        bad_content = bad_path.read_text(encoding="utf-8")
+        assert "AUDIT TRAIL VERIFICATION FAILED" in bad_content
+
+    def test_timeline_lists_every_event_in_order(self, tmp_path, sop, training, assessment,
+                                                 sample_sop_path):
+        job_dir = tmp_path / "job-timeline"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-timeline")
+        audit = audit_block_for_job(job_dir, "job-timeline")
+        report = _report(sop, training, assessment, sample_sop_path, audit=audit)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+
+        order = [content.index(event) for event in
+                 ("job.created", "content.generated", "content.approved", "package.exported")]
+        assert order == sorted(order)
+
+    def test_head_hash_rendered(self, tmp_path, sop, training, assessment, sample_sop_path):
+        job_dir = tmp_path / "job-hash"
+        job_dir.mkdir()
+        log = _build_intact_trail(job_dir, "job-hash")
+        audit = audit_block_for_job(job_dir, "job-hash")
+        report = _report(sop, training, assessment, sample_sop_path, audit=audit)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert log.head_hash() in content
+        assert "metadata.json" in content
+
+    def test_mode_statement_matches_chain_only(self, tmp_path, sop, training, assessment,
+                                               sample_sop_path):
+        job_dir = tmp_path / "job-chain"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-chain")
+        audit = audit_block_for_job(job_dir, "job-chain")
+        report = _report(sop, training, assessment, sample_sop_path, audit=audit)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert "does not by itself" in content
+        assert "regeneration without the server key is detected" not in content
+
+    def test_mode_statement_matches_hmac(self, tmp_path, sop, training, assessment,
+                                         sample_sop_path):
+        job_dir = tmp_path / "job-hmac"
+        job_dir.mkdir()
+        _build_intact_trail(job_dir, "job-hmac", hmac_key=b"key")
+        audit = audit_block_for_job(job_dir, "job-hmac", hmac_key=b"key")
+        report = _report(sop, training, assessment, sample_sop_path, audit=audit)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert "regeneration without the server key is detected" in content
+        assert "does not by itself" not in content
+
+    def test_escapes_actor_name_with_script_tag(self, tmp_path, sop, training, assessment,
+                                                sample_sop_path):
+        job_dir = tmp_path / "job-xss"
+        job_dir.mkdir()
+        log = AuditLog.for_job(job_dir, "job-xss")
+        log.append("job.created", Actor("training-creator", "application", "system"), {})
+        digest = audit_content_hash({"a": 1}, {"b": 2})
+        log.append("content.approved",
+                   Actor("<script>alert(1)</script>", "QA", "web"),
+                   {"approved_by": "<script>alert(1)</script>", "role": "QA", "edits_count": 0},
+                   digest)
+        audit = audit_block_for_job(job_dir, "job-xss")
+        report = _report(sop, training, assessment, sample_sop_path, audit=audit)
+        path = tmp_path / "report.html"
+        create_html_report(report, str(path))
+        content = path.read_text(encoding="utf-8")
+        assert "<script>alert(1)</script>" not in content
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in content

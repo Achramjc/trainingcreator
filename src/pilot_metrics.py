@@ -20,6 +20,8 @@ import statistics
 from datetime import datetime
 from pathlib import Path
 
+from .audit import hmac_key_from_env, verify_job, AuditLog
+
 #: The six keys every job's `edits_by_category` carries (see
 #: `app._count_edits_by_category`'s docstring for what each one counts).
 EDIT_CATEGORY_KEYS = (
@@ -82,6 +84,25 @@ def _coerce_int(value, default=0):
     if isinstance(value, bool) or not isinstance(value, int):
         return default
     return value
+
+
+def _audit_status(job_dir, job_id, hmac_key):
+    """`(audit_verified, audit_problems)` for one job's audit trail.
+
+    `audit_verified` is `None` when the job has no `audit.jsonl` at all (a
+    job predating the audit trail, or one the app hasn't touched yet with
+    that instrumentation) -- never conflated with `False`, which means a
+    trail exists and failed verification. Never raises: a trail this module
+    cannot even read counts as a failed verification, not a crashed
+    dashboard, since `collect()` must tolerate arbitrary garbage on disk.
+    """
+    try:
+        if not AuditLog.for_job(job_dir, job_id, hmac_key).exists():
+            return None, []
+        result = verify_job(job_dir, job_id, hmac_key)
+        return result.ok, list(result.problems)
+    except Exception as exc:  # pragma: no cover - defensive, mirrors collect()'s tolerance
+        return False, [f"audit trail could not be read: {exc}"]
 
 
 def _job_summary(job_id, data):
@@ -149,7 +170,7 @@ def _job_summary(job_id, data):
     }
 
 
-def collect(output_folder):
+def collect(output_folder, hmac_key=None):
     """Scan every job directory under `output_folder` and aggregate SME
     review/edit/approve metrics.
 
@@ -158,7 +179,13 @@ def collect(output_folder):
     predating this instrumentation (missing keys). A job directory with no
     `job.json`, a `job.json` that isn't valid JSON, or one whose fields blow
     up while being summarised is counted in `unreadable_jobs` and otherwise
-    skipped. `collect()` itself never raises for a single bad job.
+    skipped. `collect()` itself never raises for a single bad job -- and that
+    includes a bad or missing audit trail: `_audit_status()` degrades to a
+    failed-verification finding rather than propagating an exception.
+
+    `hmac_key` is the key used to verify each job's audit trail (see
+    `src/audit.py`). Defaults to `hmac_key_from_env()` -- the same key the
+    application itself would use -- so a caller normally doesn't pass one.
 
     Returns a dict:
     ```
@@ -179,9 +206,14 @@ def collect(output_folder):
                      "mean_edit_rate": float | None},
           ...
       },
+      "jobs_with_failed_audit": int,           # jobs whose trail exists and failed verification
+      "failed_audit_jobs": [ {"job_id": ..., "problems": [...]}, ... ],
       "jobs": [ per-job summary dicts, shape as in _job_summary(), ... ],
     }
     ```
+    Each per-job summary also carries:
+      "audit_verified": True | False | None,   # None = no audit trail for this job
+      "audit_problems": [str, ...],            # from verify_job(); [] when verified or absent
 
     **`edit_rate` is GOAL.md's "<30% edits" number.** It is computed only
     over *approved* jobs - editing during review is expected and is not
@@ -203,6 +235,8 @@ def collect(output_folder):
     folder = Path(output_folder)
     jobs = []
     unreadable = 0
+    if hmac_key is None:
+        hmac_key = hmac_key_from_env()
 
     if folder.exists() and folder.is_dir():
         for job_dir in sorted(folder.iterdir()):
@@ -218,6 +252,9 @@ def collect(output_folder):
             except Exception:
                 unreadable += 1
                 continue
+            audit_verified, audit_problems = _audit_status(job_dir, job_dir.name, hmac_key)
+            summary['audit_verified'] = audit_verified
+            summary['audit_problems'] = audit_problems
             jobs.append(summary)
 
     total_jobs = len(jobs)
@@ -274,6 +311,11 @@ def collect(output_folder):
         bucket['mean_edits_per_approved_job'] = statistics.fmean(edits) if edits else None
         bucket['mean_edit_rate'] = statistics.fmean(rates) if rates else None
 
+    failed_audit_jobs = [
+        {'job_id': job['job_id'], 'problems': job['audit_problems']}
+        for job in jobs if job['audit_verified'] is False
+    ]
+
     return {
         'total_jobs': total_jobs,
         'unreadable_jobs': unreadable,
@@ -286,6 +328,8 @@ def collect(output_folder):
         'edits_by_category': category_totals,
         'median_time_to_approve_s': median_time_to_approve_s,
         'by_source_document': by_source_document,
+        'jobs_with_failed_audit': len(failed_audit_jobs),
+        'failed_audit_jobs': failed_audit_jobs,
         'jobs': jobs,
     }
 
@@ -319,6 +363,10 @@ def summary_table(metrics):
     lines.append(f"Edit rate (mean of per-job rates): {_fmt_pct(metrics['mean_edit_rate'])}")
     lines.append(
         f"Median time to approve: {_fmt_num(metrics['median_time_to_approve_s'])} s")
+    lines.append('')
+    lines.append(f"Jobs with failed audit-trail verification: {metrics['jobs_with_failed_audit']}")
+    for failed in metrics.get('failed_audit_jobs', []):
+        lines.append(f"  {failed['job_id']}: {'; '.join(failed['problems']) or '(no detail)'}")
     lines.append('')
     lines.append('Edits by category (approved jobs, summed):')
     for key in EDIT_CATEGORY_KEYS:

@@ -62,11 +62,40 @@
     .badge.edited { background: #17a2b8; color: white; }
     .badge.approved { background: #28a745; color: white; }
     .badge.unknown { background: #ccc; color: #333; }
+    .badge.audit-ok { background: #28a745; color: white; }
+    .badge.audit-failed { background: #dc3545; color: white; }
+    .badge.audit-none { background: #ccc; color: #333; }
     a { color: #1565c0; }
     .empty { color: #999; font-style: italic; padding: 12px; }
+    .audit-alert {
+        background: #f8d7da;
+        color: #721c24;
+        border: 2px solid #dc3545;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 24px;
+    }
+    .audit-alert h2 { margin: 0 0 8px; color: #721c24; }
+    .audit-alert ul { margin: 8px 0 0; padding-left: 20px; }
+    .audit-alert code { background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 3px; }
 </style>
 </head>
 <body>
+
+{% if metrics.jobs_with_failed_audit %}
+<div class="audit-alert">
+    <h2>&#9888; {{ metrics.jobs_with_failed_audit }} job(s) failed audit-trail verification</h2>
+    <p>The audit trail for these jobs did not verify intact (see <code>docs/AUDIT_TRAIL.md</code>).
+    Investigate before treating their approval records as trustworthy.</p>
+    <ul>
+        {% for failed in metrics.failed_audit_jobs %}
+        <li><strong>{{ failed.job_id }}</strong>:
+            {% if failed.problems %}{{ failed.problems | join('; ') }}{% else %}(no detail){% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
 
 <h1>Pilot metrics</h1>
 <p class="subtitle">
@@ -173,6 +202,7 @@
         <th>Edits</th>
         <th>Edit rate</th>
         <th>Edit rounds</th>
+        <th>Audit trail</th>
         <th>Review</th>
     </tr>
     {% for job in metrics.jobs %}
@@ -185,6 +215,15 @@
         <td>{% if job.edit_rate is not none %}{{ '%.1f'|format(job.edit_rate * 100) }}%{% else %}n/a{% endif %}</td>
         <td>{{ job.edit_rounds }}</td>
         <td>
+            {% if job.audit_verified is none %}
+            <span class="badge audit-none" title="No audit trail recorded for this job">no trail</span>
+            {% elif job.audit_verified %}
+            <span class="badge audit-ok">verified</span>
+            {% else %}
+            <span class="badge audit-failed" title="{{ job.audit_problems | join('; ') }}">failed</span>
+            {% endif %}
+        </td>
+        <td>
             {% if review_urls.get(job.job_id) %}
             <a href="{{ review_urls[job.job_id] }}">Open</a>
             {% else %}
@@ -193,7 +232,7 @@
         </td>
     </tr>
     {% else %}
-    <tr><td colspan="8" class="empty">No jobs yet.</td></tr>
+    <tr><td colspan="9" class="empty">No jobs yet.</td></tr>
     {% endfor %}
 </table>
 

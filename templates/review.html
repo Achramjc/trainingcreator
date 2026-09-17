@@ -117,6 +117,28 @@
     .status-msg.err { background: #ffebee; color: #c62828; border: 1px solid #ef5350; }
     .approval-box { background: #e8f5e9; border: 1px solid #4caf50; border-radius: 6px; padding: 14px; margin-bottom: 14px; }
     .download-link { display: inline-block; margin-top: 8px; color: #1565c0; }
+    .audit-status-ok { color: #218838; font-weight: 700; }
+    .audit-status-failed { color: #c62828; font-weight: 700; }
+    .audit-problem-list { color: #c62828; margin: 6px 0; padding-left: 18px; font-size: 0.85em; }
+    .head-hash-code {
+        font-family: 'SFMono-Regular', Consolas, monospace;
+        font-size: 0.82em;
+        word-break: break-all;
+        background: #f0f2f5;
+        padding: 2px 4px;
+        border-radius: 3px;
+    }
+    .copy-btn {
+        background: #eee; border: 1px solid #ccc; border-radius: 4px;
+        padding: 2px 10px; cursor: pointer; font-size: 0.8em; margin-left: 8px;
+    }
+    #audit-trail-container table {
+        width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8em;
+    }
+    #audit-trail-container th, #audit-trail-container td {
+        border: 1px solid #eee; padding: 4px 6px; text-align: left; vertical-align: top;
+    }
+    #audit-trail-container th { background: #f5f5f5; }
 </style>
 </head>
 <body>
@@ -243,6 +265,13 @@
             <button type="button" class="btn-primary btn-approve" id="approve-btn" onclick="submitApproval()">Approve</button>
             {% endif %}
             <div class="status-msg" id="approve-status"></div>
+        </div>
+
+        <div class="card">
+            <h2>Audit trail</h2>
+            <div id="audit-trail-container">
+                <p class="meta-line">Loading audit trail&hellip;</p>
+            </div>
         </div>
 
     </div>
@@ -528,6 +557,171 @@
             showMessage('approve-status', false, 'Error: ' + err);
         });
     }
+
+    // Audit trail panel: GET /api/audit/<job_id>?t=<token> (see
+    // src/audit.py / docs/AUDIT_TRAIL.md for what verification does and
+    // does not prove). Built with DOM nodes, never innerHTML with
+    // interpolated data - the same rule as the question editor above,
+    // because actor names and audit details ultimately come from SOP/SME
+    // input too.
+    function loadAuditTrail() {
+        var container = document.getElementById('audit-trail-container');
+        fetch('/api/audit/' + encodeURIComponent(JOB_ID) + '?t=' + encodeURIComponent(TOKEN))
+            .then(function (resp) {
+                if (resp.status === 404) { return null; }
+                if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
+                return resp.json();
+            })
+            .then(renderAuditTrail)
+            .catch(function (err) {
+                container.textContent = '';
+                var p = document.createElement('p');
+                p.className = 'status-msg show err';
+                p.textContent = 'Could not load audit trail: ' + err;
+                container.appendChild(p);
+            });
+    }
+
+    function _auditModeStatement(mode) {
+        if (mode === 'hmac') {
+            return 'HMAC mode: detects alteration of recorded entries, and regeneration ' +
+                'without the server key is detected.';
+        }
+        if (mode === 'chain-only') {
+            return 'Chain-only mode: detects alteration of recorded entries; does not by ' +
+                'itself prove entries were not removed from the end or the whole log ' +
+                'regenerated.';
+        }
+        return 'Unknown verification mode.';
+    }
+
+    function renderAuditTrail(data) {
+        var container = document.getElementById('audit-trail-container');
+        container.textContent = '';
+
+        if (!data) {
+            var none = document.createElement('p');
+            none.className = 'meta-line';
+            none.textContent = 'No audit trail is available for this job yet.';
+            container.appendChild(none);
+            return;
+        }
+
+        var verification = data.verification || {};
+        var entries = data.entries || [];
+        var hmacMode = data.hmac_mode || 'unknown';
+
+        var statusLine = document.createElement('p');
+        var statusSpan = document.createElement('span');
+        statusSpan.className = verification.ok ? 'audit-status-ok' : 'audit-status-failed';
+        statusSpan.textContent = verification.ok ? 'INTACT' : 'FAILED VERIFICATION';
+        statusLine.appendChild(document.createTextNode('Status: '));
+        statusLine.appendChild(statusSpan);
+        container.appendChild(statusLine);
+
+        var pmaText;
+        if (verification.package_matches_approval === true) { pmaText = 'yes'; }
+        else if (verification.package_matches_approval === false) { pmaText = 'no'; }
+        else { pmaText = 'not applicable'; }
+
+        var meta = document.createElement('p');
+        meta.className = 'meta-line';
+        meta.textContent = 'Entries: ' + entries.length +
+            ' · Package matches approval: ' + pmaText;
+        container.appendChild(meta);
+
+        var modeLine = document.createElement('p');
+        modeLine.className = 'meta-line';
+        modeLine.textContent = 'Verification mode: ' + hmacMode + ' — ' +
+            _auditModeStatement(hmacMode);
+        container.appendChild(modeLine);
+
+        var hashLine = document.createElement('p');
+        hashLine.appendChild(document.createTextNode('Head hash: '));
+        var hashCode = document.createElement('code');
+        hashCode.className = 'head-hash-code';
+        hashCode.textContent = verification.head_hash || '';
+        hashLine.appendChild(hashCode);
+        var copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.className = 'copy-btn';
+        copyBtn.textContent = 'Copy';
+        copyBtn.addEventListener('click', function () {
+            var text = verification.head_hash || '';
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).catch(function () {});
+            }
+            copyBtn.textContent = 'Copied';
+            setTimeout(function () { copyBtn.textContent = 'Copy'; }, 1500);
+        });
+        hashLine.appendChild(copyBtn);
+        container.appendChild(hashLine);
+
+        if (verification.problems && verification.problems.length) {
+            var problemsList = document.createElement('ul');
+            problemsList.className = 'audit-problem-list';
+            verification.problems.forEach(function (problem) {
+                var li = document.createElement('li');
+                li.textContent = problem;
+                problemsList.appendChild(li);
+            });
+            container.appendChild(problemsList);
+        }
+
+        var table = document.createElement('table');
+        var thead = document.createElement('thead');
+        var headRow = document.createElement('tr');
+        ['Seq', 'Timestamp', 'Event', 'Actor', 'Content hash', 'Details'].forEach(function (h) {
+            var th = document.createElement('th');
+            th.textContent = h;
+            headRow.appendChild(th);
+        });
+        thead.appendChild(headRow);
+        table.appendChild(thead);
+
+        var tbody = document.createElement('tbody');
+        entries.forEach(function (entry) {
+            var row = document.createElement('tr');
+
+            var seqTd = document.createElement('td');
+            seqTd.textContent = entry.seq;
+            row.appendChild(seqTd);
+
+            var tsTd = document.createElement('td');
+            tsTd.textContent = entry.ts;
+            row.appendChild(tsTd);
+
+            var eventTd = document.createElement('td');
+            eventTd.textContent = entry.event;
+            row.appendChild(eventTd);
+
+            var actor = entry.actor || {};
+            var actorTd = document.createElement('td');
+            actorTd.textContent = (actor.name || '') + ' (' + (actor.role || '') + ', ' +
+                (actor.source || '') + ')';
+            row.appendChild(actorTd);
+
+            var hashTd = document.createElement('td');
+            var fullHash = entry.content_hash || '';
+            hashTd.textContent = fullHash ? fullHash.slice(0, 12) : '—';
+            if (fullHash) { hashTd.title = fullHash; }
+            row.appendChild(hashTd);
+
+            var detailsTd = document.createElement('td');
+            try {
+                detailsTd.textContent = JSON.stringify(entry.details || {});
+            } catch (e) {
+                detailsTd.textContent = '';
+            }
+            row.appendChild(detailsTd);
+
+            tbody.appendChild(row);
+        });
+        table.appendChild(tbody);
+        container.appendChild(table);
+    }
+
+    loadAuditTrail();
 </script>
 </body>
 </html>

@@ -17,8 +17,26 @@ from pathlib import Path
 from html import escape as _escape
 import hashlib
 
+from .audit import AuditLog, verify_job
+
 
 REQUIRED_APPROVAL_KEYS = ("approved_by", "role", "approved_at", "notes", "edits_count")
+
+#: What each verification mode proves, stated plainly (docs/AUDIT_TRAIL.md
+#: "What verification proves" / "What verification cannot prove"). Shown
+#: wherever the audit trail is presented, because it changes what an auditor
+#: may conclude from an "intact" result.
+AUDIT_MODE_STATEMENTS = {
+    "chain-only": (
+        "Chain-only mode (no HMAC key configured): this detects alteration of "
+        "recorded entries; it does not by itself prove entries were not "
+        "removed from the end or the whole log regenerated."
+    ),
+    "hmac": (
+        "HMAC mode: this detects alteration of recorded entries, and "
+        "regeneration without the server key is detected."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +253,113 @@ def _build_approval_block(approval):
     }
 
 
-def generate_transparency_report(sop_content, training_module, assessment, source_file, approval=None):
+def audit_block_for_job(job_dir, job_id, hmac_key=None):
+    """Build the ``audit`` dict :func:`generate_transparency_report` expects,
+    from a job's on-disk ``audit.jsonl`` (see ``docs/AUDIT_TRAIL.md``).
+
+    Returns ``None`` when there is no audit trail file at all -- a job
+    produced before the trail existed, or by the CLI, which may not write
+    one -- so every caller has one line to write and still degrades
+    gracefully: ``generate_transparency_report(..., audit=audit_block_for_job(...))``.
+
+    Verification is read-only and re-run fresh every call: nothing here is
+    cached, so a report always reflects the trail as it stands right now.
+    """
+    log = AuditLog.for_job(job_dir, job_id, hmac_key)
+    if not log.exists():
+        return None
+    result = verify_job(job_dir, job_id, hmac_key)
+    entries = [entry.to_dict() for entry in log.entries()]
+    return {
+        "entries": entries,
+        "verification": result.to_dict(),
+        "hmac_mode": "hmac" if hmac_key else "chain-only",
+    }
+
+
+def _audit_details_summary(event, details):
+    """A one-line, human-readable summary of one audit entry's ``details``,
+    tailored per event type per docs/AUDIT_TRAIL.md's "What is recorded"
+    table. Falls back to a generic key=value listing for anything else."""
+    details = details or {}
+
+    def _get(key, default="?"):
+        value = details.get(key)
+        return default if value in (None, "") else value
+
+    if event == "package.exported":
+        sha = str(_get("package_sha256", ""))[:12]
+        return f"format={_get('format')} version={_get('scorm_version', '')} package_sha={sha}"
+    if event == "content.edited":
+        categories = details.get("categories")
+        if not isinstance(categories, (dict, list)):
+            categories = details.get("edits_by_category")
+        cat_text = ""
+        if isinstance(categories, dict):
+            cat_text = ", ".join(f"{k}={v}" for k, v in categories.items() if v)
+        elif isinstance(categories, list) and categories:
+            cat_text = ", ".join(str(c) for c in categories)
+        summary = f"edits_count={_get('edits_count', 0)}"
+        return f"{summary}, categories: {cat_text}" if cat_text else summary
+    if event == "content.approved":
+        return f"approved_by={_get('approved_by')} role={_get('role', '')}"
+    if event == "job.created":
+        return f"source_filename={_get('source_filename')}"
+    if event == "download.served":
+        return f"filename={_get('filename')}"
+    if event == "content.generated":
+        return f"questions={_get('questions')}"
+    if event == "retention.deleted":
+        head = str(_get("head_hash", ""))[:12]
+        return f"job_id={_get('job_id')} head_hash={head}"
+    if not details:
+        return ""
+    return " ".join(f"{k}={v}" for k, v in sorted(details.items()))
+
+
+def _build_audit_trail_block(audit):
+    """Normalise the ``audit`` argument into ``report["audit_trail"]``.
+
+    ``audit`` is ``None`` (no trail exists) or the shape
+    :func:`audit_block_for_job` builds: ``{"entries": [...], "verification":
+    ..., "hmac_mode": "hmac" | "chain-only"}``.
+    """
+    if not audit:
+        return {"status": "no_audit_trail"}
+
+    verification = audit.get("verification") or {}
+    entries = audit.get("entries") or []
+    hmac_mode = audit.get("hmac_mode")
+
+    timeline = []
+    for entry in entries:
+        actor = entry.get("actor") or {}
+        timeline.append({
+            "seq": entry.get("seq"),
+            "ts": entry.get("ts"),
+            "event": entry.get("event"),
+            "actor": {
+                "name": actor.get("name", ""),
+                "role": actor.get("role", ""),
+                "source": actor.get("source", ""),
+            },
+            "content_hash": entry.get("content_hash"),
+            "details_summary": _audit_details_summary(entry.get("event"), entry.get("details")),
+        })
+
+    return {
+        "status": "intact" if verification.get("ok") else "failed",
+        "hmac_mode": hmac_mode,
+        "entries_count": verification.get("entries", len(entries)),
+        "head_hash": verification.get("head_hash", ""),
+        "package_matches_approval": verification.get("package_matches_approval"),
+        "problems": list(verification.get("problems") or []),
+        "timeline": timeline,
+    }
+
+
+def generate_transparency_report(sop_content, training_module, assessment, source_file,
+                                 approval=None, audit=None):
     """
     Generate report showing exactly how training was created
 
@@ -250,6 +374,13 @@ def generate_transparency_report(sop_content, training_module, assessment, sourc
             content is an unreviewed draft. Nothing in this module writes or
             fetches this value -- the caller (the SME review workflow) is
             responsible for supplying it once a human has actually approved.
+        audit: Optional dict shaped like :func:`audit_block_for_job`'s
+            return value (``{"entries": [...], "verification": ...,
+            "hmac_mode": "hmac" | "chain-only"}``). When given, an
+            "Audit Trail" block is added to the report. When omitted (the
+            default), ``report["audit_trail"]`` states there is no trail --
+            this module never reads a job directory itself; the caller
+            supplies this once, typically via ``audit_block_for_job``.
 
     Returns:
         Dictionary containing complete transparency report
@@ -327,6 +458,8 @@ def generate_transparency_report(sop_content, training_module, assessment, sourc
             "This content has NOT been approved by a named human reviewer. "
             "It is an unreviewed draft and must not be used for training records."
         )
+
+    report["audit_trail"] = _build_audit_trail_block(audit)
 
     return report
 
@@ -481,6 +614,103 @@ def _render_approval_html(report_data):
     """
 
 
+def _render_audit_trail_html(report_data):
+    """Render the audit-trail block: verification status, timeline and
+    anchor. A failed verification must be impossible to miss (a red banner),
+    and the mode statement must say plainly what the mode does and does not
+    prove (docs/AUDIT_TRAIL.md)."""
+    audit = report_data.get("audit_trail") or {"status": "no_audit_trail"}
+
+    if audit.get("status") == "no_audit_trail":
+        return """
+    <div class="section audit-trail">
+        <h2>Audit Trail</h2>
+        <p><em>No audit trail is available for this content. This happens for content
+        produced before the audit trail existed (e.g. by the CLI, or by an earlier
+        version of this application).</em></p>
+    </div>
+    """
+
+    status = audit.get("status", "failed")
+    banner = ""
+    if status == "failed":
+        banner = (
+            '<div class="audit-banner-failed">'
+            "&#9888; AUDIT TRAIL VERIFICATION FAILED &mdash; this record may have been "
+            "altered, or describes a workflow that broke its own rules. See the problems "
+            "listed below before relying on anything else in this report."
+            "</div>"
+        )
+
+    package_matches = audit.get("package_matches_approval")
+    if package_matches is True:
+        package_matches_text = "Yes"
+    elif package_matches is False:
+        package_matches_text = "No &mdash; the exported package does not match the approved content"
+    else:
+        package_matches_text = "Not applicable (no approval, or no export recorded after the last approval, yet)"
+
+    hmac_mode = audit.get("hmac_mode")
+    mode_statement = _escape(AUDIT_MODE_STATEMENTS.get(
+        hmac_mode, "Unknown verification mode; treat this trail's integrity as unproven."))
+    hmac_mode_label = _escape(str(hmac_mode or "unknown"))
+
+    if audit.get("problems"):
+        problems_html = "<ul class='audit-problems'>" + "".join(
+            f"<li>{_escape(str(problem))}</li>" for problem in audit["problems"]
+        ) + "</ul>"
+    else:
+        problems_html = "<p>No problems found.</p>"
+
+    rows = []
+    for item in audit.get("timeline") or []:
+        actor = item.get("actor") or {}
+        actor_text = _escape(
+            f"{actor.get('name', '')} ({actor.get('role', '')}, {actor.get('source', '')})")
+        content_hash = item.get("content_hash") or ""
+        short_hash = _escape(content_hash[:12]) if content_hash else "&mdash;"
+        full_hash = _escape(content_hash)
+        rows.append(
+            f"<tr><td>{item.get('seq', '')}</td>"
+            f"<td>{_escape(str(item.get('ts', '')))}</td>"
+            f"<td>{_escape(str(item.get('event', '')))}</td>"
+            f"<td>{actor_text}</td>"
+            f"<td title='{full_hash}'>{short_hash}</td>"
+            f"<td>{_escape(item.get('details_summary', ''))}</td></tr>"
+        )
+    rows_html = "\n".join(rows) if rows else "<tr><td colspan='6'><em>No entries</em></td></tr>"
+
+    head_hash = _escape(audit.get("head_hash", ""))
+
+    return f"""
+    <div class="section audit-trail">
+        <h2>Audit Trail</h2>
+        {banner}
+        <table>
+            <tr><th>Verification status</th><td>{_escape(status)}</td></tr>
+            <tr><th>Entries</th><td>{audit.get('entries_count', 0)}</td></tr>
+            <tr><th>Head hash</th><td><code>{head_hash}</code></td></tr>
+            <tr><th>Package matches approval</th><td>{package_matches_text}</td></tr>
+            <tr><th>Verification mode</th><td><strong>{hmac_mode_label}</strong> &mdash; {mode_statement}</td></tr>
+        </table>
+        <h3>Problems found</h3>
+        {problems_html}
+        <h3>Event timeline</h3>
+        <table>
+            <thead><tr><th>Seq</th><th>Timestamp</th><th>Event</th><th>Actor</th>
+            <th>Content hash</th><th>Details</th></tr></thead>
+            <tbody>
+            {rows_html}
+            </tbody>
+        </table>
+        <p>Anchor: compare this head hash (<code>{head_hash}</code>) with the
+        <code>audit_head_hash</code> recorded in the package's <code>metadata.json</code>,
+        and with any copy stored outside this system, to confirm no trailing entries were
+        removed (see <code>docs/AUDIT_TRAIL.md</code>).</p>
+    </div>
+    """
+
+
 def create_html_report(report_data, output_path):
     """
     Create HTML version of transparency report
@@ -581,6 +811,21 @@ def create_html_report(report_data, output_path):
             border-left: 4px solid #4caf50;
             background: #e8f5e9;
         }}
+        .audit-trail {{
+            border-left: 4px solid #6c757d;
+        }}
+        .audit-banner-failed {{
+            background: #f8d7da;
+            color: #721c24;
+            border: 2px solid #dc3545;
+            padding: 12px 15px;
+            margin-bottom: 12px;
+            border-radius: 5px;
+            font-weight: bold;
+        }}
+        .audit-problems {{
+            color: #c62828;
+        }}
     </style>
 </head>
 <body>
@@ -620,6 +865,8 @@ def create_html_report(report_data, output_path):
     </div>
 
     {_render_lms_record_html(report_data)}
+
+    {_render_audit_trail_html(report_data)}
 
     <div class="checklist">
         <h2>✓ Required Reviews Before Use</h2>

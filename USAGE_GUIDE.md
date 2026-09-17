@@ -6,11 +6,12 @@
 3. [Input Formats](#input-formats)
 4. [Output Formats](#output-formats)
 5. [SME Review and Approval (Web App)](#sme-review-and-approval-web-app)
-6. [Running a Pilot](#running-a-pilot)
-7. [Advanced Usage](#advanced-usage)
-8. [LMS Upload Instructions](#lms-upload-instructions)
-9. [Customization](#customization)
-10. [Troubleshooting](#troubleshooting)
+6. [Audit Trail](#audit-trail)
+7. [Running a Pilot](#running-a-pilot)
+8. [Advanced Usage](#advanced-usage)
+9. [LMS Upload Instructions](#lms-upload-instructions)
+10. [Customization](#customization)
+11. [Troubleshooting](#troubleshooting)
 
 ## Installation
 
@@ -258,6 +259,68 @@ the thing being reviewed has changed - it needs a fresh sign-off.
 The review and approval endpoints reuse the same signed, expiring token as
 downloads (`DOWNLOAD_TTL_SECONDS`), so a review link works for exactly as
 long as a download link does.
+
+## Audit Trail
+
+Every job's actions - generation, edits, approval, export, download - can be recorded in a
+tamper-evident, append-only log at `<output_folder>/<job_id>/audit.jsonl`, one JSON line per
+action, each hash-chained to the one before it. The full design, exactly what it proves and what
+it does not, lives in `docs/AUDIT_TRAIL.md`; this section is how to read it day to day.
+
+### Where it lives
+
+- **Per job:** `<output_folder>/<job_id>/audit.jsonl` - deleted with the job directory.
+- **Global:** `<output_folder>/audit-global.jsonl` records `retention.deleted` events (a job's
+  last head hash, kept after the job itself is swept), since that entry can't live in a file that
+  is itself being deleted.
+- Content produced before this feature existed, or by a code path that hasn't started writing to
+  it yet, simply has no `audit.jsonl`. Every consumer of the trail (the transparency report, the
+  review page, the pilot dashboard) treats that as "no audit trail" rather than an error.
+
+### Reading the timeline
+
+**In the review page** (`/review/<job_id>?t=<token>`): the "Audit trail" panel fetches
+`GET /api/audit/<job_id>?t=<token>` and shows the verification status (intact / failed), the
+verification mode, package-matches-approval, the head hash (with a copy button), and a table of
+every recorded event - sequence number, timestamp, event, actor (name / role / source), a content
+hash, and its details. A `404` there means no trail exists yet for that job.
+
+**In the transparency report** (`transparency_report.html` / `.json`, under
+`report["audit_trail"]` in the JSON): the same information, plus a one-line, per-event-type
+summary of each entry's details (e.g. `package.exported` shows the format, SCORM version and
+package hash prefix; `content.approved` shows who approved it and their role). A **failed
+verification is shown as a red banner** at the top of the section - it is not something you have
+to notice by reading a status field.
+
+**In the pilot dashboard** (`/pilot`): jobs whose trail fails verification are counted
+(`jobs_with_failed_audit`) and listed in a red alert box at the top of the page, and each job's
+row in the jobs table carries a "verified" / "failed" / "no trail" badge.
+
+### Verifying independently
+
+You don't need the app running to check a trail - it's a plain file:
+
+```bash
+python3 -m src.audit verify outputs/<job_id>            # prints a VerificationResult as JSON; exit 1 if not ok
+python3 -m src.audit verify outputs/<job_id> --key-env AUDIT_HMAC_KEY   # if an HMAC key is configured
+python3 -m src.audit show   outputs/<job_id>             # one line per entry, head_hash on stderr
+```
+
+`ok: true` means the chain, MACs (if a key is configured) and the workflow rules (approval before
+export, no edits after the last approval, etc.) all check out. Anything else is listed in
+`problems`, each one naming exactly what's wrong.
+
+### The head hash in `metadata.json`
+
+`AuditLog.head_hash()` is the hash of the trail's last entry - one 64-character value that commits
+to everything recorded up to that point. Because a chain that has had its *last* entries deleted
+still verifies as intact (there's nothing left in the file to say they're missing -
+`docs/AUDIT_TRAIL.md` explains why), the head hash as of `package.exported` is written into the
+shipped package's `metadata.json` as `audit_head_hash`, and into the transparency report. To
+confirm nothing was quietly dropped from the end of the trail after the package shipped, compare
+that stored value against `head_hash` from `python3 -m src.audit verify` (or `show`) run on the
+job's current `audit.jsonl`. If they don't match, something in the trail changed after this
+package was built - investigate before trusting anything else about that job's history.
 
 ## Running a Pilot
 

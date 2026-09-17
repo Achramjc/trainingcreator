@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 import app as app_module
+from src.audit import Actor, AuditLog
 from src.pilot_metrics import EDIT_CATEGORY_KEYS, collect, summary_table
 
 # A minimal but structurally real training_module / assessment pair, sized
@@ -268,3 +269,99 @@ def test_pilot_dashboard_links_to_review_page(app, client, monkeypatch):
     review_url = text[start:end]
     review_resp = client.get(review_url)
     assert review_resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Audit trail surfaced in collect() / summary_table() / the /pilot dashboard
+# ---------------------------------------------------------------------------
+
+def _write_audit_trail(job_dir, job_id, tamper=False):
+    """Write a minimal, real audit.jsonl for `job_id` in `job_dir`. With
+    `tamper=True`, corrupt the one recorded entry's contents afterwards so
+    verification fails."""
+    log = AuditLog.for_job(job_dir, job_id)
+    log.append("job.created", Actor("training-creator", "application", "system"),
+               {"source_filename": "sop.txt"})
+    if tamper:
+        path = job_dir / "audit.jsonl"
+        obj = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+        obj["details"] = {"source_filename": "tampered.txt"}
+        path.write_text(json.dumps(obj) + "\n", encoding="utf-8")
+    return log
+
+
+def test_collect_sets_audit_verified_for_good_tampered_and_missing_trails(tmp_path):
+    good_dir = _write_job(tmp_path, "job-good", status="approved")
+    _write_audit_trail(good_dir, "job-good")
+
+    bad_dir = _write_job(tmp_path, "job-bad", status="approved")
+    _write_audit_trail(bad_dir, "job-bad", tamper=True)
+
+    # No audit.jsonl at all.
+    _write_job(tmp_path, "job-none", status="approved")
+
+    metrics = collect(tmp_path)
+    by_id = {job["job_id"]: job for job in metrics["jobs"]}
+
+    assert by_id["job-good"]["audit_verified"] is True
+    assert by_id["job-good"]["audit_problems"] == []
+
+    assert by_id["job-bad"]["audit_verified"] is False
+    assert by_id["job-bad"]["audit_problems"]
+
+    assert by_id["job-none"]["audit_verified"] is None
+    assert by_id["job-none"]["audit_problems"] == []
+
+
+def test_collect_counts_jobs_with_failed_audit(tmp_path):
+    good_dir = _write_job(tmp_path, "job-good", status="approved")
+    _write_audit_trail(good_dir, "job-good")
+
+    bad_dir_1 = _write_job(tmp_path, "job-bad-1", status="approved")
+    _write_audit_trail(bad_dir_1, "job-bad-1", tamper=True)
+
+    bad_dir_2 = _write_job(tmp_path, "job-bad-2", status="draft")
+    _write_audit_trail(bad_dir_2, "job-bad-2", tamper=True)
+
+    metrics = collect(tmp_path)
+    assert metrics["jobs_with_failed_audit"] == 2
+    failed_ids = {failed["job_id"] for failed in metrics["failed_audit_jobs"]}
+    assert failed_ids == {"job-bad-1", "job-bad-2"}
+    for failed in metrics["failed_audit_jobs"]:
+        assert failed["problems"]
+
+    # Never raises, and a bad trail doesn't stop the job from being counted.
+    summary_table(metrics)
+
+
+def test_collect_never_raises_on_a_bad_trail(tmp_path):
+    job_dir = _write_job(tmp_path, "job-garbage", status="approved")
+    (job_dir / "audit.jsonl").write_text("not even json\n", encoding="utf-8")
+
+    metrics = collect(tmp_path)
+    job = metrics["jobs"][0]
+    assert job["audit_verified"] is False
+    assert metrics["jobs_with_failed_audit"] == 1
+
+
+def test_pilot_dashboard_lists_failed_audit_job(app, client, monkeypatch):
+    monkeypatch.setenv("PILOT_METRICS_TOKEN", "s3cr3t-pilot-token")
+    bad_dir = _write_job(app.config["OUTPUT_FOLDER"], "job-bad-dashboard", status="approved")
+    _write_audit_trail(bad_dir, "job-bad-dashboard", tamper=True)
+
+    resp = client.get("/pilot?token=s3cr3t-pilot-token")
+    assert resp.status_code == 200
+    text = resp.get_data(as_text=True)
+    assert "job-bad-dashboard" in text
+    assert "failed audit-trail verification" in text.lower()
+
+
+def test_pilot_dashboard_shows_no_audit_alert_when_all_verified(app, client, monkeypatch):
+    monkeypatch.setenv("PILOT_METRICS_TOKEN", "s3cr3t-pilot-token")
+    good_dir = _write_job(app.config["OUTPUT_FOLDER"], "job-clean", status="approved")
+    _write_audit_trail(good_dir, "job-clean")
+
+    resp = client.get("/pilot?token=s3cr3t-pilot-token")
+    assert resp.status_code == 200
+    text = resp.get_data(as_text=True)
+    assert "failed audit-trail verification" not in text.lower()
