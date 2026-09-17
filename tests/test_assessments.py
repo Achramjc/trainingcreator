@@ -30,9 +30,19 @@ from pathlib import Path
 import pytest
 
 from src.assessments import (
+    MAX_OPTION_CHARS,
+    MAX_OPTIONS,
+    MIN_ASSESSMENT_QUESTIONS,
+    POINTS_CHOICE,
+    POINTS_SAFETY_CHOICE,
+    POINTS_SAFETY_TRUE_FALSE,
+    POINTS_TRUE_FALSE,
+    scale_points_for_options,
     AssessmentGenerator,
     MedicalDeviceAssessmentGenerator,
     alter_statement,
+    clip_option,
+    pick_distractors,
     ordered_steps,
     step_sort_key,
 )
@@ -40,9 +50,13 @@ from src.parser import SOPContent, SOPParser
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_SOP = REPO_ROOT / "examples" / "sample_sop.txt"
+NUMBERED_SOP = REPO_ROOT / "examples" / "sample_sop_numbered.txt"
 
-#: Every question count the blueprint has to cope with.
-QUESTION_COUNTS = (3, 5, 8, 12)
+#: Every question count the blueprint has to cope with, from the enforced
+#: minimum up.  Requests below MIN_ASSESSMENT_QUESTIONS are clamped (see
+#: test_short_requests_are_raised_to_the_minimum), so they are not swept here.
+QUESTION_COUNTS = tuple(range(MIN_ASSESSMENT_QUESTIONS, 13))
+BELOW_MINIMUM_COUNTS = tuple(range(1, MIN_ASSESSMENT_QUESTIONS))
 
 #: Wrong answers shipped by the pre-M0 generator.  Any of these reappearing means
 #: the "distractors are giveaways" defect has regressed.
@@ -178,6 +192,9 @@ def get_document(name):
     """Documents under test, cached (generation never mutates them)."""
     if name == "sample":
         return SOPParser().parse(str(SAMPLE_SOP))
+    if name == "numbered":
+        # Thin, numbered-convention SOP: 3 steps (4.1-4.3), 2 warnings.
+        return SOPParser().parse(str(NUMBERED_SOP))
     if name == "rich":
         # 9 steps with bodies, 5 warnings, 4 definitions
         return make_sop("Trim Blade Replacement SOP", "3.2", 9, 5, 4)
@@ -195,7 +212,7 @@ def get_document(name):
     raise KeyError(name)
 
 
-DOCUMENTS = ("sample", "rich", "sparse", "headings_only")
+DOCUMENTS = ("sample", "numbered", "rich", "sparse", "headings_only")
 GENERATORS = ("base", "medical_device")
 
 
@@ -211,10 +228,20 @@ def get_assessment(doc_name, generator_name, num_questions):
 
 # ---------------------------------------------------------------------------
 # Naive-learner strategies
+#
+# Every way a learner can answer the whole quiz without reading the SOP.  The
+# index strategies appear TWICE, once per realistic fallback: "always click the
+# third option" is undefined on a two-option question, and a learner faced with
+# one still clicks something.  Modelling that as "collects nothing" is how a
+# three-question quiz on examples/sample_sop_numbered.txt once let "always
+# option 3" score 100% - its smallest question had two options.
 # ---------------------------------------------------------------------------
-def _pick_index(index):
+def _pick_index(aim, fallback):
     def picker(question):
-        return index if index < len(question.options) else -1
+        count = len(question.options)
+        if aim < count:
+            return aim
+        return 0 if fallback == "first" else count - 1
     return picker
 
 
@@ -226,13 +253,26 @@ def _pick_true(question):
     return question.options.index("True") if "True" in question.options else -1
 
 
+def _pick_longest(question):
+    return max(range(len(question.options)),
+               key=lambda i: (len(question.options[i]), -i))
+
+
+def _pick_shortest(question):
+    return min(range(len(question.options)),
+               key=lambda i: (len(question.options[i]), i))
+
+
 NAIVE_STRATEGIES = {
-    "always_first_option": _pick_index(0),
-    "always_second_option": _pick_index(1),
-    "always_third_option": _pick_index(2),
     "always_last_option": _pick_last,
     "always_true": _pick_true,
+    "always_longest_option": _pick_longest,
+    "always_shortest_option": _pick_shortest,
 }
+for _aim in range(MAX_OPTIONS):
+    for _fallback in ("first", "last"):
+        NAIVE_STRATEGIES["always_option_{0}_else_{1}".format(_aim + 1, _fallback)] = (
+            _pick_index(_aim, _fallback))
 
 
 def naive_score(assessment, picker):
@@ -249,26 +289,56 @@ def naive_score(assessment, picker):
 # ---------------------------------------------------------------------------
 # Defect 1: the quiz could be passed by always clicking the first option
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("strategy", sorted(NAIVE_STRATEGIES))
 @pytest.mark.parametrize("num_questions", QUESTION_COUNTS)
 @pytest.mark.parametrize("generator_name", GENERATORS)
 @pytest.mark.parametrize("doc_name", DOCUMENTS)
-def test_naive_learner_fails(doc_name, generator_name, num_questions, strategy):
-    """A learner who never reads the SOP scores below 80% - whatever fixed
-    strategy they use.
+def test_naive_learner_fails(doc_name, generator_name, num_questions):
+    """A learner who never reads the SOP scores below the passing mark - whatever
+    fixed strategy they use, on every document, at every supported length.
 
-    Guards: hardcoded correct_answer=0, options rendered in source order, the
-    unconsumed randomize_options flag, and "always True" on true/false items.
+    This is the M0 exit criterion.  Guards: hardcoded correct_answer=0, options
+    rendered in source order, the unconsumed randomize_options flag, "always
+    True" on true/false items, and the length tell that made the correct option
+    systematically the longest one.
     """
     assessment = get_assessment(doc_name, generator_name, num_questions)
     assert assessment.questions, "generator produced no questions"
+    passing = assessment.passing_score
 
-    score = naive_score(assessment, NAIVE_STRATEGIES[strategy])
-    assert score < 80.0, (
-        "{0} scored {1:.1f}% on {2}/{3}/n={4} - a learner who never read the SOP "
-        "must not reach the passing mark".format(
-            strategy, score, doc_name, generator_name, num_questions)
+    failures = []
+    for name in sorted(NAIVE_STRATEGIES):
+        score = naive_score(assessment, NAIVE_STRATEGIES[name])
+        if score >= passing:
+            failures.append("{0} scored {1:.1f}%".format(name, score))
+
+    assert not failures, (
+        "on {0}/{1}/n={2} (passing {3}%, {4} questions) these strategies reach "
+        "the passing mark without reading the SOP: {5}".format(
+            doc_name, generator_name, num_questions, passing,
+            len(assessment.questions), "; ".join(failures))
     )
+
+
+def test_naive_learner_fails_on_the_shipped_fixtures():
+    """Explicit sweep of both bundled SOPs through the real parser.
+
+    Mirrors the checker's independent simulation, so a regression here is
+    directly comparable to the numbers in its report.
+    """
+    worst = {}
+    for doc_name in ("sample", "numbered"):
+        for generator_name in GENERATORS:
+            for num_questions in QUESTION_COUNTS:
+                assessment = get_assessment(doc_name, generator_name, num_questions)
+                for name, picker in NAIVE_STRATEGIES.items():
+                    score = naive_score(assessment, picker)
+                    assert score < assessment.passing_score, (
+                        "{0} scored {1:.1f}% (passing {2}%) on {3}/{4}/n={5}".format(
+                            name, score, assessment.passing_score, doc_name,
+                            generator_name, num_questions))
+                    worst[name] = max(worst.get(name, 0.0), score)
+    # Nothing should even be close; leave headroom below the lowest passing mark.
+    assert max(worst.values()) < 70.0, worst
 
 
 def test_naive_learner_fails_medical_device_passing_score():
@@ -277,6 +347,208 @@ def test_naive_learner_fails_medical_device_passing_score():
     assert assessment.passing_score >= 80
     for name, picker in NAIVE_STRATEGIES.items():
         assert naive_score(assessment, picker) < assessment.passing_score, name
+
+
+# ---------------------------------------------------------------------------
+# Option length must not be a tell
+# ---------------------------------------------------------------------------
+def test_clip_option_never_exceeds_its_limit():
+    """The ellipsis is counted against the budget, not added on top.
+
+    When it was added on top, clipped options came out at 176-183 characters
+    instead of a flat cap, and the jitter made the correct answer the longest
+    option on nearly every step question.
+    """
+    long_text = " ".join("word{0}".format(i) for i in range(200))
+    for limit in (20, 40, 100, MAX_OPTION_CHARS):
+        clipped = clip_option(long_text, limit)
+        assert len(clipped) <= limit, (limit, len(clipped))
+        assert clipped.endswith("...")
+    # Short text is returned untouched.
+    assert clip_option("Close the valve.") == "Close the valve."
+    assert clip_option("  Close   the\n valve. ") == "Close the valve."
+
+
+def _questions_with_three_or_more_options():
+    questions = []
+    for doc_name in DOCUMENTS:
+        for generator_name in GENERATORS:
+            for num_questions in QUESTION_COUNTS:
+                assessment = get_assessment(doc_name, generator_name, num_questions)
+                questions.extend(q for q in assessment.questions
+                                 if len(q.options) >= 3)
+    return questions
+
+
+def test_correct_option_is_not_systematically_longest_or_shortest():
+    """Length must carry no signal.
+
+    Distractors are chosen straddling the correct answer's length, so the
+    correct option's length rank is about 1/k - the same as chance.
+    """
+    questions = _questions_with_three_or_more_options()
+    assert len(questions) >= 40
+
+    longest = shortest = 0
+    for question in questions:
+        lengths = [len(o) for o in question.options]
+        if lengths[question.correct_answer] == max(lengths):
+            longest += 1
+        if lengths[question.correct_answer] == min(lengths):
+            shortest += 1
+
+    longest_share = 100.0 * longest / len(questions)
+    shortest_share = 100.0 * shortest / len(questions)
+    assert longest_share <= 40.0, (
+        "correct option is the longest in {0:.1f}% of {1} questions".format(
+            longest_share, len(questions)))
+    assert shortest_share <= 40.0, (
+        "correct option is the shortest in {0:.1f}% of {1} questions".format(
+            shortest_share, len(questions)))
+
+
+def _distinct_text(index, length):
+    """Text of exactly `length` characters sharing no vocabulary with the others.
+
+    Synthetic on purpose: this exercises the length-banding arithmetic in
+    isolation, so the near-identical filter must not be the thing under test.
+    """
+    from random import Random as _Random
+
+    rng = _Random(index * 9176 + 3)
+    words = ["t{0}w{1}".format(index, rng.randrange(10 ** 6)) for _ in range(60)]
+    return " ".join(words)[:length].rstrip()
+
+
+def test_pick_distractors_straddles_the_correct_answer_length():
+    """The mechanism, tested directly on a pool with material on both sides.
+
+    Taking simply the closest candidates by absolute length difference put every
+    distractor on one side of the correct answer whenever the correct answer sat
+    near an end of the pool's length distribution, which is what made "always the
+    longest option" a winning strategy.
+    """
+    from random import Random as _Random
+
+    correct = _distinct_text(0, 100)
+    pool = [_distinct_text(i, n) for i, n in
+            enumerate((40, 55, 70, 85, 115, 130, 145, 160), start=1)]
+
+    chosen = pick_distractors(correct, pool, _Random(12345))
+    assert len(chosen) == 3
+    lengths = [len(c) for c in chosen]
+    assert any(n > len(correct) for n in lengths), lengths
+    assert any(n < len(correct) for n in lengths), lengths
+    # Deterministic for a given seed.
+    assert pick_distractors(correct, pool, _Random(12345)) == chosen
+
+
+def test_pick_distractors_copes_when_only_one_side_has_material():
+    """No longer candidates: take the closest shorter ones rather than failing."""
+    from random import Random as _Random
+
+    correct = _distinct_text(0, 160)
+    pool = [_distinct_text(i, n) for i, n in enumerate((40, 60, 80, 100), start=1)]
+    chosen = pick_distractors(correct, pool, _Random(7))
+    assert len(chosen) == 3
+    assert all(len(c) < len(correct) for c in chosen)
+
+
+def test_true_false_items_are_worth_less_than_multiple_choice():
+    """Points follow the guess baseline: 50% for two options, 25% for four.
+
+    Crediting a true/false item the same as a four-option item over-rewards
+    guessing.  It also concentrated points on questions where "False" - always
+    the longer option - was the answer.
+    """
+    assert POINTS_TRUE_FALSE * 2 == POINTS_CHOICE
+    assert POINTS_SAFETY_TRUE_FALSE * 2 == POINTS_SAFETY_CHOICE
+    assert POINTS_SAFETY_CHOICE > POINTS_CHOICE
+
+    assessment = get_assessment("sample", "base", 12)
+    for question in assessment.questions:
+        if len(question.options) <= 2:
+            # Two options means a 50% guess baseline, whatever the question was
+            # authored as - a multiple-choice question the document could only
+            # give two options is weighted like a true/false one.
+            assert question.points <= POINTS_SAFETY_TRUE_FALSE
+        else:
+            assert question.points >= POINTS_CHOICE
+
+    assert scale_points_for_options(POINTS_SAFETY_CHOICE, 2) == POINTS_SAFETY_TRUE_FALSE
+    assert scale_points_for_options(POINTS_SAFETY_CHOICE, 4) == POINTS_SAFETY_CHOICE
+    assert scale_points_for_options(POINTS_CHOICE, 3) == POINTS_CHOICE
+    assert scale_points_for_options(1, 2) == 1  # never zero
+
+    # No single question may dominate a minimum-length assessment.
+    for doc_name in DOCUMENTS:
+        short = get_assessment(doc_name, "base", MIN_ASSESSMENT_QUESTIONS)
+        total = sum(q.points for q in short.questions)
+        assert max(q.points for q in short.questions) <= 0.5 * total, doc_name
+
+
+def test_length_rebalance_preserves_category_coverage():
+    """Swapping a length-extreme question only ever uses the same category, so
+    the coverage blueprint is unaffected."""
+    from collections import Counter
+
+    from src.answer_key import document_key
+
+    for doc_name in DOCUMENTS:
+        for num_questions in QUESTION_COUNTS:
+            generator = AssessmentGenerator()
+            document = get_document(doc_name)
+            doc_key = document_key(document.title or "", document.version or "")
+            pool = generator._build_pool(document, doc_key)
+            selected = generator._select_by_blueprint(pool, num_questions)
+            before = Counter(c.category for c in selected)
+            after = Counter(c.category for c in
+                            generator._rebalance_length_extremes(list(selected), pool))
+            assert before == after, (doc_name, num_questions, before, after)
+
+
+def test_length_rebalance_never_duplicates_a_question():
+    for doc_name in DOCUMENTS:
+        for generator_name in GENERATORS:
+            for num_questions in QUESTION_COUNTS:
+                assessment = get_assessment(doc_name, generator_name, num_questions)
+                ids = [q.id for q in assessment.questions]
+                assert len(set(ids)) == len(ids), (doc_name, num_questions, ids)
+
+
+# ---------------------------------------------------------------------------
+# Minimum assessment length
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("num_questions", BELOW_MINIMUM_COUNTS)
+@pytest.mark.parametrize("generator_name", GENERATORS)
+def test_short_requests_are_raised_to_the_minimum(generator_name, num_questions):
+    """Below the floor the arithmetic cannot work, so the count is raised and
+    the caller is told - rather than shipping a quiz that can be gamed.
+
+    A three-question quiz in which one question carries two of four points has
+    no layout that keeps every fixed strategy under the passing mark.
+    """
+    assessment = make_generator(generator_name).generate(
+        get_document("numbered"), num_questions=num_questions)
+
+    assert assessment.requested_questions == num_questions
+    assert len(assessment.questions) >= MIN_ASSESSMENT_QUESTIONS
+    assert assessment.notes, "raising the count must be recorded"
+    assert str(MIN_ASSESSMENT_QUESTIONS) in assessment.notes[0]
+    assert "notes" in assessment.to_dict()
+
+    for name, picker in NAIVE_STRATEGIES.items():
+        assert naive_score(assessment, picker) < assessment.passing_score, name
+
+
+def test_minimum_is_enforced_by_the_cli_and_the_web_api():
+    """The floor is not just a silent clamp - the entry points reject below it."""
+    import app as flask_app
+    from src.cli import main as cli_main
+
+    assert flask_app.MIN_ASSESSMENT_QUESTIONS == MIN_ASSESSMENT_QUESTIONS
+    questions_option = next(p for p in cli_main.params if p.name == "questions")
+    assert questions_option.type.min == MIN_ASSESSMENT_QUESTIONS
 
 
 # ---------------------------------------------------------------------------
@@ -439,17 +711,21 @@ def test_safety_and_sequence_coverage(doc_name, generator_name, num_questions):
 
 
 def test_blueprint_priority_order_on_a_tight_budget():
-    """The scarcest budget still buys the highest-priority coverage."""
+    """The scarcest budget still buys the highest-priority coverage first."""
     document = get_document("rich")
 
-    base = AssessmentGenerator().generate(document, num_questions=2)
+    base = AssessmentGenerator().generate(
+        document, num_questions=MIN_ASSESSMENT_QUESTIONS)
     kinds = [q.source_ref.get("kind") for q in base.questions]
-    assert len(base.questions) == 2
-    assert kinds.count("sequence") == 1
-    assert sum(1 for k in kinds if k in ("safety", "safety_contradiction")) == 1
+    assert len(base.questions) == MIN_ASSESSMENT_QUESTIONS
+    assert sum(1 for k in kinds if k in ("safety", "safety_contradiction")) >= 1
+    assert kinds.count("sequence") >= 1
 
-    medical = MedicalDeviceAssessmentGenerator().generate(document, num_questions=2)
-    assert {q.id for q in medical.questions} == {"md_req_1", "md_req_2"}
+    medical = MedicalDeviceAssessmentGenerator().generate(
+        document, num_questions=MIN_ASSESSMENT_QUESTIONS)
+    ids = {q.id for q in medical.questions}
+    assert {"md_req_1", "md_req_2"} <= ids
+    assert len(medical.questions) == MIN_ASSESSMENT_QUESTIONS
 
 
 @pytest.mark.parametrize("num_questions", (5, 8))

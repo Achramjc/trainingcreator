@@ -2,13 +2,15 @@
 Command Line Interface for Training Creator
 """
 
-import click
+import html
 import json
 from pathlib import Path
 
+import click
+
 from .parser import SOPParser
 from .generator import TrainingGenerator
-from .assessments import AssessmentGenerator
+from .assessments import MIN_ASSESSMENT_QUESTIONS, AssessmentGenerator
 from .scorm_exporter import SCORMExporter
 
 
@@ -20,8 +22,12 @@ from .scorm_exporter import SCORMExporter
 @click.option('--format', '-f', default='scorm1.2',
               type=click.Choice(['scorm1.2', 'scorm2004', 'html', 'json'], case_sensitive=False),
               help='Output format (default: scorm1.2)')
-@click.option('--questions', '-q', default=5, type=int,
-              help='Number of assessment questions to generate (default: 5)')
+@click.option('--questions', '-q', default=5,
+              type=click.IntRange(min=MIN_ASSESSMENT_QUESTIONS),
+              help='Number of assessment questions to generate '
+                   f'(default: 5, minimum: {MIN_ASSESSMENT_QUESTIONS}). Shorter '
+                   'assessments cannot spread their answers well enough to stop '
+                   'a learner passing by clicking the same option every time.')
 @click.option('--passing-score', '-p', default=70, type=int,
               help='Minimum passing score percentage (default: 70)')
 @click.option('--package-name', '-n', default=None,
@@ -144,27 +150,36 @@ def main(input, output, format, questions, passing_score, package_name, verbose)
 
 
 def _create_standalone_html(training_module, assessment) -> str:
-    """Create a standalone HTML file with all content"""
+    """Create a standalone HTML preview of the training content.
+
+    READ-ONLY: this lists the questions and their options for review. It does no
+    scoring and carries no answer key - use the SCORM package for anything a
+    learner is meant to complete.
+
+    Question text and options come from the source document, so everything
+    interpolated here is HTML-escaped; section content is generated markup and is
+    inserted as-is.
+    """
     sections_html = ""
     for section in training_module.sections:
         sections_html += f"<div class='section'>{section.get('content', '')}</div>"
 
     questions_html = ""
-    for q in assessment.questions:
+    for number, q in enumerate(assessment.questions, 1):
         questions_html += f"""
         <div class='question'>
-            <p><strong>Q{assessment.questions.index(q) + 1}:</strong> {q.text}</p>
+            <p><strong>Q{number}:</strong> {html.escape(str(q.text))}</p>
             <ul>
         """
-        for idx, option in enumerate(q.options):
-            questions_html += f"<li>{option}</li>"
+        for option in q.options:
+            questions_html += f"<li>{html.escape(str(option))}</li>"
         questions_html += "</ul></div>"
 
-    html = f"""<!DOCTYPE html>
+    page = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>{training_module.title}</title>
+    <title>{html.escape(str(training_module.title))}</title>
     <style>
         body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; }}
         h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
@@ -173,13 +188,14 @@ def _create_standalone_html(training_module, assessment) -> str:
     </style>
 </head>
 <body>
-    <h1>{training_module.title}</h1>
+    <h1>{html.escape(str(training_module.title))}</h1>
     {sections_html}
     <h2>Assessment</h2>
+    <p><em>Preview only - this page does not score answers.</em></p>
     {questions_html}
 </body>
 </html>"""
-    return html
+    return page
 
 
 if __name__ == '__main__':

@@ -394,6 +394,50 @@ def test_sop_markup_is_escaped_in_the_assessment(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# The CLI's standalone HTML is a preview, not an assessment
+# ---------------------------------------------------------------------------
+def test_cli_standalone_html_escapes_and_declares_itself_a_preview():
+    """`--format html` renders SOP text, so it must escape it, and it must say
+    that it does no scoring - it has no answer key and no submit button."""
+    from src.generator import TrainingGenerator
+    from src.parser import SOPContent
+    from src.cli import _create_standalone_html
+
+    sop = SOPContent()
+    sop.title = "Injection <script>alert(1)</script> SOP"
+    sop.version = "1.0"
+    sop.purpose = ('Prevent contamination when the "A & B" valve <assembly> is '
+                   "removed during a controlled shutdown of the production line.")
+    sop.scope = ('Applies to operators on Line <3> and Line "4" during planned '
+                 "maintenance of the valve assembly and associated pipework.")
+    sop.safety_warnings = [
+        "Never open the <main> valve while the line is pressurised & running.",
+        'All operators must wear goggles when the "B" reagent is decanted.',
+        "Do not vent the line into the <room> during a purge cycle.",
+    ]
+    sop.procedures = [
+        {"step_number": str(i), "title": "Step <{0}> & more".format(i),
+         "body": 'Close the "{0}" valve </script> and log reading <{0}>.'.format(i),
+         "content": "x", "substeps": []}
+        for i in range(1, 7)
+    ]
+
+    training = TrainingGenerator().generate(sop)
+    assessment = AssessmentGenerator().generate(sop, num_questions=6)
+    page = _create_standalone_html(training, assessment)
+
+    assert "<script>alert(1)</script>" not in page
+    assert "&lt;script&gt;" in page
+    for question in assessment.questions:
+        for option in question.options:
+            assert html_module.escape(str(option)) in page
+    # No answer key, and it says plainly that it does not score.
+    for token in ("correct_answer", "answer_hash", "AnswerKey"):
+        assert token not in page
+    assert "Preview only" in page
+
+
+# ---------------------------------------------------------------------------
 # Browser check (bonus - skipped unless Playwright for Python is installed)
 # ---------------------------------------------------------------------------
 def _launch_chromium(playwright):

@@ -88,8 +88,14 @@ exporter.create_package(training_module, assessments, 'output_folder')
 
 - **SCORM 1.2**: Maximum compatibility with older LMS platforms
 - **SCORM 2004**: Modern SCORM standard with sequencing support
-- **HTML Package**: Standalone HTML file, not LMS-tracked
-- **JSON**: Structured data for custom integrations
+- **HTML Package**: A single-file, **read-only preview** of the training content
+  and the assessment questions. It lists each question with its options but does
+  **not** score answers, does not record completion and is not LMS-tracked — it
+  is for review, not for delivering training. Use a SCORM package for anything a
+  learner is meant to complete.
+- **JSON**: Structured data for custom integrations. This export is for authors
+  and subject-matter experts and **does contain the answer key** — do not hand it
+  to learners.
 
 ## LMS Compatibility
 

@@ -75,12 +75,57 @@ from .parser import SOPContent
 MAX_OPTION_CHARS = 180
 MAX_OPTIONS = 4
 MIN_OPTIONS = 2
+#: Appended by clip_option; counted against MAX_OPTION_CHARS, never added on top.
+ELLIPSIS = "..."
 #: A distractor at or above this similarity to the correct answer is discarded.
 NEAR_IDENTICAL_RATIO = 0.88
 #: Ceiling on the fraction of the available points any single fixed answering
 #: strategy ("always option 1", "always the last option", ...) may collect.
 #: Well under any realistic passing score, so a naive learner fails with margin.
 NAIVE_SCORE_CEILING = 0.65
+#: Shortest assessment that can actually satisfy NAIVE_SCORE_CEILING.  With
+#: fewer questions than this the points are too lumpy to spread: some fixed
+#: strategy always lands on a heavy question plus a light one.  generate()
+#: raises any smaller request to this and records it in Assessment.notes.
+MIN_ASSESSMENT_QUESTIONS = 5
+
+# Points.  A four-option item can be guessed 25% of the time, a true/false item
+# 50%, so a true/false item is worth HALF a multiple-choice item of the same
+# importance - crediting them equally over-rewards guessing and weakens the
+# discrimination the assessment exists to provide.  Safety and compliance items
+# are worth double within their kind.  (They used to be flat 1/2, which let a
+# single two-point true/false question carry a third of a short quiz - and since
+# "False" is inevitably longer than "True", that handed a third of the marks to
+# anyone clicking the longest option.)
+POINTS_CHOICE = 2
+POINTS_TRUE_FALSE = 1
+POINTS_SAFETY_CHOICE = 4
+POINTS_SAFETY_TRUE_FALSE = 2
+
+
+def scale_points_for_options(points: int, option_count: int) -> int:
+    """Weight an item by the guess baseline it actually offers.
+
+    A multiple-choice question that could only be given two options because the
+    document had nothing else to offer *is* a true/false question, however it was
+    authored, and must be weighted like one.  Leaving it at full weight put the
+    heaviest question in a short quiz on a coin flip - and since such a question
+    is usually one long real warning against one short altered one, it handed
+    those points to anyone clicking the longest option.
+    """
+    if option_count <= 2:
+        return max(1, points // 2)
+    return points
+
+#: Largest share of the points that may sit on questions whose correct option is
+#: the longest (or the shortest) of the options offered.  Enforced by swapping a
+#: selected question for another from the SAME category, so coverage is
+#: unchanged.  True/false items count half their points towards each, because
+#: "False" is always the longer option and the truth values are balanced.
+LENGTH_TELL_CEILING = 0.35
+#: Bound on the repair loop above; it is a best-effort improvement, not a
+#: guarantee - a document may simply not contain a better-shaped alternative.
+MAX_LENGTH_REPAIR_SWAPS = 12
 
 #: Statement flips used to build *false* variants of real document sentences.
 #: Order matters - longer / more specific patterns first, and the negative forms
@@ -122,15 +167,25 @@ def _clean(text) -> str:
 
 
 def clip_option(text, limit: int = MAX_OPTION_CHARS) -> str:
-    """Clip an option to the shared length band, on a word boundary."""
+    """Clip an option to the shared length band, on a word boundary.
+
+    The result is always <= ``limit`` INCLUDING the ellipsis.  The first version
+    of this appended "..." after truncating to ``limit``, so clipped options came
+    out at 176-183 characters instead of a flat cap.  Options built from long
+    step bodies then differed by a few characters, and because distractors were
+    chosen closest-first by length the correct answer ended up the longest option
+    on almost every step question - "always click the longest option" scored
+    87.5% on the bundled sample SOP.
+    """
     t = _clean(text)
     if len(t) <= limit:
         return t
-    cut = t[:limit]
+    budget = limit - len(ELLIPSIS)
+    # +1 so a space sitting exactly on the boundary still counts as one.
+    cut = t[:budget + 1]
     space = cut.rfind(" ")
-    if space > limit * 0.6:
-        cut = cut[:space]
-    return cut.rstrip(" ,;:.-") + "..."
+    cut = cut[:space] if space > budget * 0.6 else cut[:budget]
+    return cut.rstrip(" ,;:.-") + ELLIPSIS
 
 
 def _sentences(text, min_len: int = 20) -> List[str]:
@@ -176,10 +231,15 @@ def pick_distractors(correct: str, candidates, rng: Random,
     """Choose up to ``limit`` distractors for ``correct`` from ``candidates``.
 
     Rejects anything empty, duplicated, identical or near-identical to the
-    correct answer, or that contains / is contained by it.  Survivors are ranked
-    by closeness in length to the correct answer (same length band = no
-    "the long one is the right one" tell) and a deterministic subset of that
-    band is taken.
+    correct answer, or that contains / is contained by it.
+
+    Survivors are then chosen so the correct answer sits in the MIDDLE of the
+    length band: closest-first alternately from the candidates longer than it and
+    the candidates shorter than it.  Taking simply the closest by absolute
+    difference is not enough - when the correct answer is near either end of the
+    pool's length distribution every distractor lands on the same side of it, and
+    "always click the longest option" becomes a winning strategy.  Straddling
+    puts the correct answer's length rank at roughly 1/k, the same as chance.
     """
     correct_clean = clip_option(correct)
     correct_norm = normalize_option_text(correct_clean)
@@ -204,10 +264,21 @@ def pick_distractors(correct: str, candidates, rng: Random,
         return []
 
     target_len = len(correct_clean)
-    pool.sort(key=lambda c: (abs(len(c) - target_len), normalize_option_text(c)))
-    band = pool[: max(limit * 2, limit)]
-    rng.shuffle(band)
-    return band[:limit]
+    # Shuffle first, then stable-sort by distance: equal-distance candidates are
+    # tie-broken pseudo-randomly while the ordering stays reproducible.
+    rng.shuffle(pool)
+    longer = sorted((c for c in pool if len(c) > target_len),
+                    key=lambda c: len(c) - target_len)
+    shorter = sorted((c for c in pool if len(c) <= target_len),
+                     key=lambda c: target_len - len(c))
+
+    chosen: List[str] = []
+    take_longer = True
+    while len(chosen) < limit and (longer or shorter):
+        source = longer if (take_longer and longer) or not shorter else shorter
+        chosen.append(source.pop(0))
+        take_longer = not take_longer
+    return chosen
 
 
 # ---------------------------------------------------------------------------
@@ -390,8 +461,12 @@ class Assessment:
         #: Kept for backward compatibility and to record that it happened.
         self.randomize_options: bool = True
         #: How many questions the caller asked for.  ``len(questions)`` is what
-        #: the source document could actually support.
+        #: the source document could actually support, after the request has
+        #: been raised to MIN_ASSESSMENT_QUESTIONS if it was below it.
         self.requested_questions: int = 0
+        #: Human-readable warnings about how the request was satisfied, for the
+        #: SME review JSON and the transparency report.
+        self.notes: List[str] = []
 
     @property
     def total_points(self) -> int:
@@ -408,6 +483,7 @@ class Assessment:
             "randomize_questions": self.randomize_questions,
             "randomize_options": self.randomize_options,
             "requested_questions": self.requested_questions,
+            "notes": list(self.notes),
         }
 
     def to_learner_dict(self) -> Dict:
@@ -503,19 +579,53 @@ class _Candidate:
             )
 
         q_type = "sequence" if self.kind == "sequence" else "multiple_choice"
+        options = [self.correct] + list(self.distractors)
         # Canonical form: correct option first.  _assign_answer_positions moves it.
         return Question(
             question_id=self.qid,
             question_type=q_type,
             question_text=self.prompt,
-            options=[self.correct] + list(self.distractors),
+            options=options,
             correct_answer=0,
             explanation=self.explanation,
-            points=self.points,
+            points=scale_points_for_options(self.points, len(options)),
             salt=salt,
             source_ref=dict(self.source_ref),
             topic=self.topic,
         )
+
+
+def _candidate_points(candidate: "_Candidate") -> int:
+    """Points this candidate will carry once materialised."""
+    if candidate.kind == "tf":
+        return candidate.points
+    return scale_points_for_options(candidate.points,
+                                    1 + len(candidate.distractors))
+
+
+def _length_extremes(candidate: "_Candidate") -> Tuple[bool, bool]:
+    """(correct option is the longest, correct option is the shortest)."""
+    lengths = [len(candidate.correct)] + [len(d) for d in candidate.distractors]
+    if len(lengths) < 2:
+        return (False, False)
+    return (len(candidate.correct) == max(lengths),
+            len(candidate.correct) == min(lengths))
+
+
+def _length_tell_weight(chosen: List["_Candidate"], extreme: int) -> float:
+    """Points a learner clicking only the longest (0) or shortest (1) option wins.
+
+    True/false items count half their points towards each: "False" is inevitably
+    the longer of the two, and the truth values are balanced across the selected
+    items, so roughly half of them fall on each side.
+    """
+    weight = 0.0
+    for candidate in chosen:
+        if candidate.kind == "tf":
+            weight += _candidate_points(candidate) / 2.0
+        elif _length_extremes(candidate)[extreme]:
+            weight += _candidate_points(candidate)
+    return weight
 
 
 def _assign_truth_values(candidates: List[_Candidate]) -> List[Optional[bool]]:
@@ -546,18 +656,57 @@ def _assign_truth_values(candidates: List[_Candidate]) -> List[Optional[bool]]:
     return truths
 
 
-def _strategy_loads(group_offsets, groups, option_counts, base_index_load,
-                    base_last_load):
-    """Points a fixed-index / always-last learner would collect, per strategy."""
-    index_load = dict(base_index_load)
-    last_load = base_last_load
-    for option_count, offset in zip(option_counts, group_offsets):
-        for rank, question in enumerate(groups[option_count]):
-            position = (offset + rank) % option_count
-            index_load[position] = index_load.get(position, 0) + question.points
-            if position == option_count - 1:
-                last_load += question.points
-    return index_load, last_load
+def naive_strategies(max_options: int) -> List[Tuple[str, int, str]]:
+    """The answering strategies a learner can execute without reading the SOP.
+
+    "Always click option 3" is not well defined on a two-option question, and the
+    first version of this model scored it as collecting nothing there.  A real
+    learner clicks *something*, so each aim-at-index strategy is modelled twice -
+    falling back to the first option, and to the last one - and the layout has to
+    survive whichever the learner does.  Missing that is how "always option 3"
+    reached 100% on a three-question quiz whose smallest question had two
+    options.
+
+    Strategies that do not depend on option *position* ("always the longest
+    option", "always True") cannot be influenced by this layout search; they are
+    handled by distractor length-banding and true/false truth balancing, and
+    asserted directly in the test suite.
+    """
+    strategies: List[Tuple[str, int, str]] = []
+    for aim in range(max_options):
+        for fallback in ("first", "last"):
+            strategies.append(("index", aim, fallback))
+    strategies.append(("last", 0, "last"))
+    return strategies
+
+
+def strategy_pick(strategy: Tuple[str, int, str], option_count: int) -> int:
+    """Which option index this strategy selects on a question of this size."""
+    kind, aim, fallback = strategy
+    if kind == "last":
+        return option_count - 1
+    if aim < option_count:
+        return aim
+    return 0 if fallback == "first" else option_count - 1
+
+
+def _worst_strategy_share(group_offsets, groups, option_counts,
+                          true_false_questions, total_points, max_options):
+    """Largest share of the points any modelled naive strategy would collect."""
+    worst = 0
+    for strategy in naive_strategies(max_options):
+        earned = 0
+        for question in true_false_questions:
+            if strategy_pick(strategy, len(question.options)) == question.correct_answer:
+                earned += question.points
+        for option_count, offset in zip(option_counts, group_offsets):
+            pick = strategy_pick(strategy, option_count)
+            for rank, question in enumerate(groups[option_count]):
+                if (offset + rank) % option_count == pick:
+                    earned += question.points
+        if earned > worst:
+            worst = earned
+    return worst / float(total_points)
 
 
 def _assign_answer_positions(questions: List[Question], doc_key: str) -> None:
@@ -577,11 +726,12 @@ def _assign_answer_positions(questions: List[Question], doc_key: str) -> None:
         perfectly balanced, so inside a group no position can hold more than
         ceil(n/k) of the answers;
       * the per-group offsets are then chosen *together*.  Every combination is
-        scored against the naive strategies a learner can actually execute -
-        "always option 1", "always option 2", ..., "always the last option", plus
-        whatever the fixed true/false answers already contribute - and the
-        combinations that hold every strategy at or below NAIVE_SCORE_CEILING are
-        kept.  One of those survivors is picked by document digest.
+        scored against the naive strategies a learner can actually execute (see
+        ``naive_strategies``: "always option N" with both realistic fallbacks for
+        questions that have fewer options than that, and "always the last
+        option"), including whatever the fixed true/false answers already
+        contribute, and the combinations that hold every strategy at or below
+        NAIVE_SCORE_CEILING are kept.  One survivor is picked by document digest.
 
     Choosing uniformly among the survivors rather than taking the single best is
     deliberate.  Always minimising would push the answer towards the middle
@@ -609,25 +759,18 @@ def _assign_answer_positions(questions: List[Question], doc_key: str) -> None:
 
     # True/false answers are already fixed, so they are part of what a naive
     # learner collects and the multiple-choice layout has to work around them.
-    base_index_load: Dict[int, int] = {}
-    base_last_load = 0
-    for question in questions:
-        if question.type != "true_false":
-            continue
-        index = question.correct_answer
-        if not isinstance(index, int):
-            continue
-        base_index_load[index] = base_index_load.get(index, 0) + question.points
-        if index == len(question.options) - 1:
-            base_last_load += question.points
+    true_false_questions = [q for q in questions
+                            if q.type == "true_false"
+                            and isinstance(q.correct_answer, int)]
 
     total_points = sum(q.points for q in questions) or 1
+    max_options = max(option_counts)
 
     scored: List[Tuple[float, Tuple[int, ...]]] = []
     for combination in product(*(range(k) for k in option_counts)):
-        index_load, last_load = _strategy_loads(
-            combination, groups, option_counts, base_index_load, base_last_load)
-        worst = max(max(index_load.values()), last_load) / float(total_points)
+        worst = _worst_strategy_share(
+            combination, groups, option_counts, true_false_questions,
+            total_points, max_options)
         scored.append((worst, combination))
 
     survivors = [combo for worst, combo in scored if worst <= NAIVE_SCORE_CEILING]
@@ -717,14 +860,23 @@ class AssessmentGenerator:
         Args:
             sop_content: Parsed SOP content
             num_questions: Number of questions to generate.  Honoured exactly
-                when the document supports it; otherwise the whole pool is
-                returned and ``assessment.requested_questions`` records the ask.
+                when the document supports it and it is at least
+                MIN_ASSESSMENT_QUESTIONS; otherwise the whole pool is returned
+                and ``assessment.requested_questions`` / ``assessment.notes``
+                record the ask and what happened to it.
             passing_score: Minimum passing score percentage
 
         Returns:
             Assessment object with generated questions
         """
-        num_questions = max(1, int(num_questions))
+        requested = max(1, int(num_questions))
+        # Below the floor the arithmetic simply does not work.  A three question
+        # quiz in which one question is worth two of four points cannot be laid
+        # out so that every fixed answering strategy stays under the passing
+        # mark - with that few questions some strategy always collects the heavy
+        # one plus a light one.  Raising the count is the honest fix; a three
+        # question compliance quiz is not a valid competence check anyway.
+        num_questions = max(requested, MIN_ASSESSMENT_QUESTIONS)
         doc_key = document_key(
             getattr(sop_content, "title", "") or "",
             getattr(sop_content, "version", "") or "",
@@ -738,10 +890,18 @@ class AssessmentGenerator:
             "Complete this assessment to verify your understanding of the procedure."
         )
         assessment.passing_score = passing_score
-        assessment.requested_questions = num_questions
+        assessment.requested_questions = requested
+        if num_questions != requested:
+            assessment.notes.append(
+                "Requested {0} question(s); raised to the minimum of {1}. An "
+                "assessment shorter than {1} questions cannot distribute its "
+                "answers well enough to stop a learner passing by clicking the "
+                "same option every time.".format(requested, MIN_ASSESSMENT_QUESTIONS)
+            )
 
         pool = self._build_pool(sop_content, doc_key)
         chosen = self._select_by_blueprint(pool, num_questions)
+        chosen = self._rebalance_length_extremes(chosen, pool)
         chosen.sort(key=lambda c: (self.PRESENTATION_RANK.get(c.category, 9),
                                    c.order, c.qid))
 
@@ -802,6 +962,69 @@ class AssessmentGenerator:
         return chosen
 
     # -- pool ---------------------------------------------------------------
+    def _rebalance_length_extremes(self, chosen: List[_Candidate],
+                                   pool: List[_Candidate]) -> List[_Candidate]:
+        """Stop "always click the longest option" from being a viable strategy.
+
+        ``pick_distractors`` already straddles the correct answer's length, but a
+        document can simply contain nothing longer (or nothing shorter) than a
+        given correct answer, and in a five-question quiz two or three such
+        questions are enough to matter.  Question *position* cannot fix this -
+        the longest option is the longest wherever it sits - so the lever here is
+        *which* questions are asked: a selected question whose correct option is
+        a length extreme is swapped for an unused candidate from the SAME
+        category that is not.  Category counts are untouched, so the coverage
+        blueprint still holds.
+
+        Best effort and bounded: a thin document may have no better-shaped
+        alternative, and the naive-learner tests are what actually hold the line.
+        """
+        selected = {cand.qid for cand in chosen}
+        spare: Dict[str, List[_Candidate]] = {}
+        for candidate in pool:
+            if candidate.qid not in selected and candidate.kind != "tf":
+                spare.setdefault(candidate.category, []).append(candidate)
+
+        for extreme in (0, 1):          # 0 = longest, 1 = shortest
+            for _ in range(MAX_LENGTH_REPAIR_SWAPS):
+                # Scaled points, to match _length_tell_weight's numerator.
+                total = sum(_candidate_points(cand) for cand in chosen) or 1
+                if _length_tell_weight(chosen, extreme) <= LENGTH_TELL_CEILING * total:
+                    break
+
+                offenders = sorted(
+                    (c for c in chosen
+                     if c.kind != "tf" and _length_extremes(c)[extreme]),
+                    key=lambda c: (-_candidate_points(c), c.qid))
+                if not offenders:
+                    break
+
+                swap = None
+                # Prefer a replacement that is neither extreme; settle for one
+                # that merely fixes the extreme being repaired.
+                for strict in (True, False):
+                    for offender in offenders:
+                        for alternative in spare.get(offender.category, []):
+                            flags = _length_extremes(alternative)
+                            if strict and any(flags):
+                                continue
+                            if flags[extreme]:
+                                continue
+                            swap = (offender, alternative)
+                            break
+                        if swap:
+                            break
+                    if swap:
+                        break
+                if not swap:
+                    break
+
+                offender, alternative = swap
+                chosen[chosen.index(offender)] = alternative
+                spare[offender.category].remove(alternative)
+                spare.setdefault(offender.category, []).append(offender)
+        return chosen
+
     def _build_pool(self, sop_content: SOPContent, doc_key: str) -> List[_Candidate]:
         """Every question this document can honestly support, in a stable order."""
         pool: List[_Candidate] = []
@@ -857,7 +1080,7 @@ class AssessmentGenerator:
                     "What is the primary purpose of this procedure, as stated in the SOP?",
                     clip_option(purpose[0]), distractors,
                     "The SOP purpose section states: {0}".format(purpose[0]),
-                    topic="Purpose",
+                    points=POINTS_CHOICE, topic="Purpose",
                     source_ref={"kind": "purpose", "section": "PURPOSE"},
                 ))
 
@@ -876,7 +1099,7 @@ class AssessmentGenerator:
                     "According to the SOP, where and to whom does this procedure apply?",
                     clip_option(scope[0]), distractors,
                     "The SOP scope section states: {0}".format(scope[0]),
-                    topic="Scope",
+                    points=POINTS_CHOICE, topic="Scope",
                     source_ref={"kind": "scope", "section": "SCOPE"},
                 ))
 
@@ -889,7 +1112,7 @@ class AssessmentGenerator:
                     clip_option(altered)) if altered else None),
                 "The SOP scope section states: {0}".format(scope[0]),
                 "That statement contradicts the SOP scope section, which states: {0}".format(scope[0]),
-                topic="Scope",
+                points=POINTS_TRUE_FALSE, topic="Scope",
                 source_ref={"kind": "scope", "section": "SCOPE"},
             ))
 
@@ -903,7 +1126,7 @@ class AssessmentGenerator:
                     clip_option(altered)) if altered else None),
                 "The SOP purpose section states: {0}".format(purpose[0]),
                 "That statement contradicts the SOP purpose section, which states: {0}".format(purpose[0]),
-                topic="Purpose",
+                points=POINTS_TRUE_FALSE, topic="Purpose",
                 source_ref={"kind": "purpose", "section": "PURPOSE"},
             ))
 
@@ -938,7 +1161,7 @@ class AssessmentGenerator:
                     'As defined in this SOP, what does "{0}" mean?'.format(term),
                     clip_option(definition), distractors,
                     '"{0}" is defined as: {1}'.format(term, definition),
-                    topic="Definitions",
+                    points=POINTS_CHOICE, topic="Definitions",
                     source_ref={"kind": "definition", "term": term},
                 ))
 
@@ -955,7 +1178,7 @@ class AssessmentGenerator:
                     '"{0}" is defined as: {1}'.format(term, definition),
                     'That is another term\'s definition. "{0}" is defined as: {1}'.format(
                         term, definition),
-                    topic="Definitions",
+                    points=POINTS_TRUE_FALSE, topic="Definitions",
                     source_ref={"kind": "definition", "term": term},
                 ))
 
@@ -1002,7 +1225,7 @@ class AssessmentGenerator:
             candidates.append(_Candidate.choice(
                 "step", order, qid, prompt, correct, distractors,
                 "Step {0} states: {1}".format(number, body or title),
-                topic="Step {0}".format(number),
+                points=POINTS_CHOICE, topic="Step {0}".format(number),
                 source_ref={"kind": "step", "step_number": number,
                             "source_lines": proc.get("source_lines")},
             ))
@@ -1051,7 +1274,7 @@ class AssessmentGenerator:
                 "Step {0} is followed by Step {1}: {2}".format(
                     number, next_number, step_title(following)),
                 kind="sequence",
-                topic="Step sequence",
+                points=POINTS_CHOICE, topic="Step sequence",
                 source_ref={"kind": "sequence", "after_step": number,
                             "answer_step": next_number},
             ))
@@ -1090,7 +1313,7 @@ class AssessmentGenerator:
                         "Which of the following safety warnings is stated in this SOP?",
                         clip_option(warning), distractors,
                         "The SOP states: {0}".format(warning),
-                        points=2, topic="Safety warnings",
+                        points=POINTS_SAFETY_CHOICE, topic="Safety warnings",
                         source_ref={"kind": "safety", "warning_index": index},
                     ))
 
@@ -1102,7 +1325,7 @@ class AssessmentGenerator:
                     clip_option(altered[index])) if altered[index] else None),
                 "The SOP states: {0}".format(warning),
                 "That contradicts the SOP, which states: {0}".format(warning),
-                points=2, topic="Safety warnings",
+                points=POINTS_SAFETY_TRUE_FALSE, topic="Safety warnings",
                 source_ref={"kind": "safety", "warning_index": index},
             ))
 
@@ -1124,7 +1347,7 @@ class AssessmentGenerator:
                         "warning in this SOP?",
                         clip_option(alt), distractors,
                         "The SOP states: {0}".format(warnings[index]),
-                        points=2, topic="Safety warnings",
+                        points=POINTS_SAFETY_CHOICE, topic="Safety warnings",
                         source_ref={"kind": "safety_contradiction",
                                     "warning_index": index},
                     ))

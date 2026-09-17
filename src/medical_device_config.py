@@ -31,7 +31,9 @@ MEDICAL_DEVICE_CONFIG = {
         {
             'id': 'md_req_1',
             'type': 'multiple_choice',
-            'points': 2,
+            # Four options, so worth double a true/false item (see POINTS_* in
+            # src/assessments.py) and double again for being a compliance item.
+            'points': 4,
             'reference': '21 CFR 820.70',
             'text': 'What should you do if you cannot follow this procedure as written?',
             'correct': 'Stop work and notify your supervisor or QA so the deviation '
@@ -51,6 +53,8 @@ MEDICAL_DEVICE_CONFIG = {
         {
             'id': 'md_req_2',
             'type': 'true_false',
+            # Two options: guessable half the time, so half the multiple-choice
+            # weight even though it is equally important.
             'points': 2,
             'reference': '21 CFR 820.25',
             'text': 'Deviations from this procedure could potentially impact '

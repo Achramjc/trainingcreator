@@ -21,7 +21,11 @@ import json
 
 from src.parser import SOPParser
 from src.generator import TrainingGenerator
-from src.assessments import AssessmentGenerator, MedicalDeviceAssessmentGenerator
+from src.assessments import (
+    MIN_ASSESSMENT_QUESTIONS,
+    AssessmentGenerator,
+    MedicalDeviceAssessmentGenerator,
+)
 from src.scorm_exporter import SCORMExporter
 from src.transparency_report import generate_transparency_report, create_html_report, create_json_report
 from src.medical_device_config import MEDICAL_DEVICE_CONFIG
@@ -184,8 +188,13 @@ def upload_file():
         output_format = request.form.get('output_format', 'scorm')
 
         # Validate parameters
-        if not 1 <= num_questions <= 20:
-            return jsonify({'error': 'Number of questions must be between 1 and 20'}), 400
+        # The floor is a validity requirement, not a preference: an assessment
+        # shorter than MIN_ASSESSMENT_QUESTIONS cannot spread its answers well
+        # enough to stop a learner passing by clicking the same option every
+        # time, so the generator would silently raise it anyway.
+        if not MIN_ASSESSMENT_QUESTIONS <= num_questions <= 20:
+            return jsonify({'error': 'Number of questions must be between '
+                                     f'{MIN_ASSESSMENT_QUESTIONS} and 20'}), 400
         if not 50 <= passing_score <= 100:
             return jsonify({'error': 'Passing score must be between 50 and 100'}), 400
         if output_format not in ALLOWED_OUTPUT_FORMATS:

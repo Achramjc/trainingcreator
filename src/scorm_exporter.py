@@ -644,6 +644,7 @@ class SCORMExporter:
                     "assessment_questions": len(assessment.questions),
                     "assessment_questions_requested": getattr(
                         assessment, "requested_questions", len(assessment.questions)),
+                    "assessment_notes": list(getattr(assessment, "notes", [])),
                     "passing_score": assessment.passing_score,
                     "estimated_duration_minutes": training_module.estimated_duration
                 },
