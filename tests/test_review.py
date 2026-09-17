@@ -414,6 +414,104 @@ def test_review_submit_edits_count_not_inflated_by_relayout(client):
     assert resp.get_json()["edits_count"] == 1
 
 
+# ---------------------------------------------------------------------------
+# Richer edit accounting: edits_by_category, edit_rounds, and the review/edit/
+# approve timestamps (Stream G pilot instrumentation).
+# ---------------------------------------------------------------------------
+def test_review_submit_edits_by_category_scripted(client):
+    """A scripted edit - one objective rewritten, one distractor's wording
+    rewritten on one question, and which option is marked correct moved (no
+    text rewritten) on a different question - lands in exactly the
+    categories that content belongs to, and edits_count keeps meaning "the
+    total"."""
+    payload, job_id, token = _upload_and_get_job(client, NUMBERED_SOP_PATH)
+    job = app_module._read_job_json(job_id)
+    module = job["training_module"]
+    assessment = job["assessment"]
+
+    module["learning_objectives"][0] = module["learning_objectives"][0] + " (edited)"
+
+    mc_questions = [q for q in assessment["questions"] if q["type"] != "true_false"]
+    assert len(mc_questions) >= 2
+
+    # One option's wording rewritten on the first MC question (not the
+    # correct one, so it can't also register as a question_answers change).
+    q1 = mc_questions[0]
+    wrong_idx = next(i for i in range(len(q1["options"])) if i != q1["correct_answer"])
+    q1["options"][wrong_idx] = q1["options"][wrong_idx] + " (reworded)"
+
+    # Which option is correct moved to another already-existing option's
+    # text on a *different* question - no option text rewritten at all.
+    q2 = mc_questions[1]
+    other_idx = next(i for i in range(len(q2["options"])) if i != q2["correct_answer"])
+    q2["correct_answer"] = other_idx
+
+    resp = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    result = resp.get_json()
+
+    categories = result["edits_by_category"]
+    assert categories["objectives"] == 1
+    assert categories["question_options"] == 1
+    assert categories["question_answers"] == 1
+    assert categories["title"] == 0
+    assert categories["sections"] == 0
+    assert categories["questions"] == 0
+    assert result["edits_count"] >= 3  # still the flat total, unaffected in meaning
+    assert result["edit_rounds"] == 1
+
+    saved = app_module._read_job_json(job_id)
+    assert saved["edits_by_category"] == categories
+    assert saved["edit_rounds"] == 1
+    assert saved["first_edit_at"] is not None
+    assert saved["review_opened_at"] is None  # this test never GETs /review
+
+    first_edit_at = saved["first_edit_at"]
+
+    # A second save increments edit_rounds without disturbing first_edit_at.
+    resp2 = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert resp2.status_code == 200, resp2.get_data(as_text=True)
+    assert resp2.get_json()["edit_rounds"] == 2
+
+    saved2 = app_module._read_job_json(job_id)
+    assert saved2["edit_rounds"] == 2
+    assert saved2["first_edit_at"] == first_edit_at
+
+
+def test_review_page_records_first_open_only(client, sample_sop_path):
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
+    job = app_module._read_job_json(job_id)
+    assert job["review_opened_at"] is None
+
+    resp = client.get(payload["review_url"])
+    assert resp.status_code == 200
+    opened = app_module._read_job_json(job_id)
+    assert opened["review_opened_at"] is not None
+
+    first_open = opened["review_opened_at"]
+    client.get(payload["review_url"])
+    opened_again = app_module._read_job_json(job_id)
+    assert opened_again["review_opened_at"] == first_open
+
+
+def test_approve_sets_job_level_approved_at(client, sample_sop_path):
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
+    resp = client.post(
+        f"/api/approve/{job_id}?t={token}",
+        json={"approved_by": "Jane", "role": "SME"},
+    )
+    assert resp.status_code == 200
+    saved = app_module._read_job_json(job_id)
+    assert saved["approved_at"] == saved["approval"]["approved_at"]
+    assert saved["approved_at"] is not None
+
+
 def test_review_submit_rejects_answers_gamed_by_length(client, sample_sop_path):
     """Position can't fix a text-level exploit: if the SME makes the correct
     option dramatically longer than its distractors in every multiple-choice
