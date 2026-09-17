@@ -12,6 +12,7 @@ default for that field, so a hand-edited or partial dict still rebuilds a
 sane object. Round-trip: ``obj.to_dict() == xxx_from_dict(obj.to_dict()).to_dict()``.
 """
 
+import copy
 from typing import Dict, Optional
 
 from .parser import SOPContent
@@ -19,10 +20,26 @@ from .generator import TrainingModule
 from .assessments import Assessment, Question
 
 
+def _restore_unlisted_fields(obj, data: Dict) -> None:
+    """Copy every key of ``data`` that names an attribute of ``obj``.
+
+    The model classes' ``to_dict()`` contracts are append-only (CLAUDE.md), so
+    fields added after this module was written - ``SOPContent.provenance`` and
+    ``lines``, ``TrainingModule.objectives`` - must survive a round-trip without
+    this module having to learn about each one. The explicit assignments that
+    follow in each rebuilder then overwrite the well-known fields with their
+    normalised forms.
+    """
+    for key, value in data.items():
+        if hasattr(obj, key):
+            setattr(obj, key, copy.deepcopy(value))
+
+
 def sop_from_dict(data: Optional[Dict]) -> SOPContent:
     """Rebuild a :class:`SOPContent` from its ``to_dict()`` output."""
     data = data or {}
     sop = SOPContent()
+    _restore_unlisted_fields(sop, data)
     sop.title = data.get("title", sop.title)
     sop.version = data.get("version", sop.version)
     sop.effective_date = data.get("effective_date", sop.effective_date)
@@ -44,6 +61,7 @@ def module_from_dict(data: Optional[Dict]) -> TrainingModule:
     """Rebuild a :class:`TrainingModule` from its ``to_dict()`` output."""
     data = data or {}
     module = TrainingModule()
+    _restore_unlisted_fields(module, data)
     module.title = data.get("title", module.title)
     module.learning_objectives = list(data.get("learning_objectives") or [])
     module.sections = [dict(s) for s in (data.get("sections") or [])]

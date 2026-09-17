@@ -474,3 +474,30 @@ def test_approve_after_position_gamed_edit_still_hides_answer_key(client):
     assessment_html = _zip_member_text(download_resp.data, "assessment.html")
     assert "correct_answer" not in assessment_html
     assert "DRAFT" not in assessment_html
+
+
+def test_transparency_report_carries_approval_record(client, sample_sop_path):
+    """The auditor-facing report must show the unreviewed-draft state before
+    approval and the exact approval record after it (GOAL criterion 7)."""
+    import json as _json
+    from pathlib import Path as _Path
+    from app import app as _app
+
+    _payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
+    report_path = _Path(_app.config['OUTPUT_FOLDER']) / job_id / 'transparency_report.json'
+
+    before = _json.loads(report_path.read_text(encoding='utf-8'))
+    assert before['approval'] == {'status': 'unreviewed_draft'}
+
+    approve = client.post(
+        f'/api/approve/{job_id}?t={token}',
+        json={'approved_by': 'Dr. Quality', 'role': 'QA Manager', 'notes': 'ok'},
+    )
+    assert approve.status_code == 200, approve.get_json()
+
+    after = _json.loads(report_path.read_text(encoding='utf-8'))
+    assert set(after['approval']) == {'approved_by', 'role', 'approved_at', 'notes', 'edits_count'}
+    assert after['approval']['approved_by'] == 'Dr. Quality'
+    assert after['approval']['role'] == 'QA Manager'
+    html_report = (report_path.parent / 'transparency_report.html').read_text(encoding='utf-8')
+    assert 'Dr. Quality' in html_report and 'UNREVIEWED DRAFT' not in html_report

@@ -702,7 +702,8 @@ def _export_outputs(output_dir, package_name, sop_content, training_module, asse
     output_dir = Path(output_dir)
 
     transparency_report = generate_transparency_report(
-        sop_content, training_module, assessment, source_filename
+        sop_content, training_module, assessment, source_filename,
+        approval=approval,
     )
     create_html_report(transparency_report, str(output_dir / 'transparency_report.html'))
     create_json_report(transparency_report, str(output_dir / 'transparency_report.json'))
