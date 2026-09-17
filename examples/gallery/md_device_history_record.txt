@@ -1,0 +1,102 @@
+Standard Operating Procedure: Device History Record Compilation and Lot Release Review
+
+Document Number: SOP-QA-014
+Version: 3.2
+Effective Date: 02/10/2026
+Department: Quality Assurance
+
+PURPOSE:
+This Standard Operating Procedure establishes the method for compiling, reviewing, and
+approving the Device History Record (DHR) for each production lot of the Model 220
+Infusion Set prior to lot release, so that objective evidence exists that every unit was
+manufactured in accordance with the Device Master Record (DMR) as required by 21 CFR
+820.184 and ISO 13485 Section 7.5.8.
+
+SCOPE:
+This procedure applies to all finished-goods lots of the Model 220 Infusion Set built at
+the Building 3 assembly line, and to all Quality Engineers, Assembly Technicians, and QA
+Release Reviewers involved in compiling or approving the DHR. It does not cover component
+incoming inspection records, which are governed by SOP-QA-006.
+
+DEFINITIONS:
+Device History Record (DHR): The compiled set of records containing the production history of a specific finished device lot, including all in-process and final inspection results.
+Device Master Record (DMR): The compiled set of records containing the procedures and specifications for a finished device, including drawings, work instructions, and acceptance criteria.
+Lot: A defined quantity of finished units, not to exceed 500 units, manufactured under essentially the same conditions and assigned a single lot number.
+Nonconforming Material Report (NCMR): The controlled form used to document, disposition, and track any unit or component that fails to meet an acceptance criterion.
+
+RESPONSIBILITIES:
+- Assembly Technicians: Complete traveler entries and in-process checks at each station
+- Quality Engineers: Verify test records and reconcile component lot traceability
+- QA Release Reviewer: Perform the final DHR review and sign the lot release disposition
+- Document Control: Archive the approved DHR for the 7-year retention period
+
+SAFETY WARNINGS:
+WARNING: Do not release a lot for shipment until every line of the DHR checklist has been
+reviewed and initialed. A missing signature is treated as an open nonconformance.
+CAUTION: Components awaiting DHR review are electrostatic-discharge sensitive. Handle only
+at a grounded workstation wearing a wrist strap.
+WARNING: A lot with an open NCMR of any severity may not proceed to release review until
+the NCMR is closed and its disposition is recorded in the DHR.
+
+PROCEDURE:
+
+Step 1: Retrieve the Batch Traveler and Component Records
+Pull the completed batch traveler for the lot from the production floor and confirm the
+lot number, build date, and quantity built match the production schedule. Retrieve the
+component lot certificates of conformance for every component listed on the traveler's
+bill of materials.
+a. Confirm the traveler carries a signature and date at every station
+b. Confirm the quantity built does not exceed the 500-unit lot maximum
+
+Step 2: Reconcile Component Lot Traceability
+Cross-reference each component lot number recorded on the traveler against the incoming
+inspection release records to confirm every component was released prior to use. Flag any
+component whose incoming inspection record cannot be located.
+
+Step 3: Verify In-Process Test Results
+Review the in-process leak test results for the lot. Each unit must record a leak rate at
+or below 0.5 mL per minute at the 300 mmHg test pressure specified in the DMR. Confirm the
+test equipment calibration record was current on the test date.
+a. Spot-check 10 percent of the recorded leak values against the raw data printout
+b. Confirm the test technician's initials appear next to each recorded value
+
+Step 4: Verify Final Inspection Results
+Confirm the final visual and dimensional inspection was performed on a sample size of 32
+units per the AQL 1.0 sampling plan, and that zero rejects were recorded. If any reject was
+recorded, confirm an NCMR was opened and disposed before proceeding.
+
+Step 5: Review Any Nonconforming Material Reports
+Locate every NCMR referencing this lot number. Confirm each one carries a disposition of
+use-as-is, rework, or scrap, an approval signature, and that any rework was verified by a
+follow-up inspection recorded in the DHR.
+
+Step 6: Verify Labeling and Packaging Records
+Confirm the label reconciliation record shows the number of labels printed equals the
+number of labels used plus the number voided, with no unaccounted-for labels. Confirm the
+packaging record shows the correct catalog number and expiration date were applied.
+
+Step 7: Complete the DHR Checklist
+Complete the DHR compilation checklist, initialing each of the 14 line items to confirm the
+corresponding record is present, legible, and internally consistent. Note the location of
+the original record for any item stored outside the physical DHR binder.
+
+Step 8: Perform the QA Release Review
+The QA Release Reviewer independently reviews the compiled DHR against the checklist,
+resolves any discrepancy with the Quality Engineer, and signs and dates the lot
+disposition. Only a lot with a fully signed disposition may be transferred to finished
+goods inventory.
+
+REFERENCES:
+- SOP-QA-006: Incoming Component Inspection
+- SOP-QA-009: Nonconforming Material Report Process
+- 21 CFR 820.184: Device History Record
+- ISO 13485:2016 Section 7.5.8: Traceability
+
+RECORDS:
+- Completed DHR binder, retained 7 years from lot release
+- DHR Compilation Checklist (Form QA-014-A)
+
+REVISION HISTORY:
+Version 3.2 (02/10/2026): Clarified NCMR closure requirement before release review
+Version 3.1 (08/01/2025): Added label reconciliation step
+Version 3.0 (01/15/2024): Reformatted to current template

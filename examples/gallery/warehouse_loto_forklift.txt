@@ -1,0 +1,98 @@
+Standard Operating Procedure: Lockout/Tagout for Electric Forklift Battery Service
+
+Document Number: SOP-MNT-077
+Version: 1.6
+Effective Date: 06/02/2026
+Department: Facilities Maintenance
+
+PURPOSE:
+This Standard Operating Procedure establishes the lockout/tagout steps required before
+servicing, charging, or replacing the battery pack on Class I electric forklifts, so that
+maintenance personnel are protected from unexpected energization, acid exposure, and
+crushing hazards during battery service.
+
+SCOPE:
+This procedure applies to all Class I electric forklifts operated in the Building 5
+warehouse, and to all Maintenance Technicians and Forklift Operators involved in battery
+changeout, watering, or charging station service. It does not apply to internal combustion
+forklifts, which are covered by SOP-MNT-081.
+
+DEFINITIONS:
+Lockout Device: A padlock or similar device applied to an energy-isolating device to prevent it from being operated until removed by the person who applied it.
+Zero Energy State: The condition in which all forms of stored and residual energy on the equipment have been dissipated or restrained.
+Authorized Employee: A person who has been trained and designated to perform lockout/tagout on a specific piece of equipment.
+Battery Retainer: The mechanical latch or restraint system that holds the battery pack in position within the forklift compartment.
+
+RESPONSIBILITIES:
+- Maintenance Technicians: Apply and remove lockout devices and perform battery service
+- Forklift Operators: Report equipment for service and do not operate a locked-out forklift
+- Facilities Supervisor: Maintain the list of authorized employees for this procedure
+- Safety Officer: Audit lockout compliance quarterly and investigate any near-miss
+
+SAFETY WARNINGS:
+WARNING: Never attempt to remove a battery pack without engaging the battery retainer latch first; an unrestrained pack can shift and cause a crushing injury.
+CAUTION: Battery acid causes chemical burns. Wear the acid-resistant apron, gloves, and face shield listed on the charging station safety poster before opening any cell caps.
+DANGER: Do not smoke or use any spark-producing tool near the charging station. Charging batteries vent hydrogen gas, which is explosive in the concentrations found near an unventilated charger.
+WARNING: A forklift with a missing or damaged lockout tag must not be assumed safe. Verify a zero energy state yourself before beginning work.
+
+PROCEDURE:
+
+1. Notify the Operator and Stage the Forklift
+Notify the assigned operator that the forklift is being taken out of service, and stage it
+in the designated maintenance bay with the forks lowered fully to the floor and the parking
+brake set.
+
+2. Apply the Lockout Device
+Turn the key switch to the off position, remove the key, and apply your personal lockout
+device to the key switch lockout hasp. Attach a lockout tag recording your name, the date,
+and the reason for lockout.
+a. Confirm only your padlock is used; group locks require a lockout box per SOP-EHS-002
+b. Verify the key is in your possession, not left in the ignition
+
+3. Verify Zero Energy State
+Attempt to start the forklift from the operator seat to confirm the lockout is effective.
+Confirm the hydraulic lift has fully lowered and no residual pressure remains in the mast
+cylinder by observing the pressure gauge reads zero.
+
+4. Disengage the Battery Retainer
+Release the battery compartment side gate and disengage the battery retainer latch,
+confirming the battery pack is free to slide but is not yet moved.
+
+5. Disconnect the Battery Connector
+Disconnect the battery connector using the connector handle, not the cables, and set it
+aside so it cannot make accidental contact with the compartment frame.
+
+6. Remove or Service the Battery Pack
+If replacing the pack, use the battery transfer cart to slide the pack out of the
+compartment. If watering or inspecting cells in place, open only the number of cell caps
+needed for the task at hand, no more than 4 at a time.
+a. Check electrolyte level is between the minimum and maximum lines on each cell
+b. Add distilled water only to cells below the minimum line, never acid
+
+7. Perform the Required Service
+Complete the required task, such as installing a charged replacement pack, topping off
+electrolyte, or cleaning corrosion from the terminals with the designated baking soda
+solution.
+
+8. Reconnect and Re-Engage the Retainer
+Reconnect the battery connector fully, confirming an audible click, then re-engage the
+battery retainer latch and close the compartment side gate.
+
+9. Remove Lockout and Return to Service
+Verify all tools and materials are clear of the forklift, then remove your personal
+lockout device and tag. Notify the operator the forklift is available and record the
+service in the maintenance log.
+
+REFERENCES:
+- SOP-EHS-002: Group Lockout Box Procedure
+- SOP-MNT-081: Internal Combustion Forklift Maintenance
+- OSHA 29 CFR 1910.178: Powered Industrial Trucks
+- OSHA 29 CFR 1910.147: The Control of Hazardous Energy
+
+RECORDS:
+- Maintenance Log entry for each battery service event
+
+REVISION HISTORY:
+Version 1.6 (06/02/2026): Limited open cell caps to 4 at a time during watering
+Version 1.4 (12/01/2025): Added zero energy state verification step
+Version 1.0 (04/15/2023): Initial release

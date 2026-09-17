@@ -1,0 +1,106 @@
+Standard Operating Procedure: Equipment Cleaning and Swab Sampling Between Product Changeovers
+
+Document Number: SOP-MFG-221
+Version: 4.0
+Effective Date: 01/20/2026
+Department: Manufacturing - Solid Dose
+
+1.0 PURPOSE
+This procedure defines the cleaning, swab sampling, and residue-limit verification
+required on the V-blender and tablet press train before a different drug product is
+introduced to the equipment train, so that cross-contamination between products is
+prevented and the equipment is released for the next changeover with objective evidence.
+
+2.0 SCOPE
+This procedure applies to all equipment in Suite 2 shared between more than one drug
+product, and to all Manufacturing Operators, Cleaning Verification Technicians, and
+Quality Assurance staff involved in changeover cleaning. It does not apply to dedicated
+single-product equipment, which follows SOP-MFG-104.
+
+3.0 DEFINITIONS
+Maximum Allowable Carryover (MACO): The calculated maximum quantity of the previous product's active ingredient that may remain on shared equipment surfaces without posing a safety risk to the next product.
+Swab Sample: A defined 25 square centimeter surface area sampled with a wetted swab and submitted for residue analysis.
+Clean Hold Time: The maximum 72-hour interval during which cleaned equipment may sit idle before requiring re-cleaning prior to use.
+Rinse Sample: A sample of the final rinse water collected to verify residue and detergent removal on surfaces a swab cannot reach.
+
+4.0 RESPONSIBILITIES
+- Manufacturing Operators: Perform the cleaning cycle and complete the cleaning log
+- Cleaning Verification Technicians: Collect swab and rinse samples per this procedure
+- Quality Assurance: Review results against the MACO limit and release equipment for use
+- Laboratory: Analyze swab and rinse samples and report results within 48 hours
+
+SAFETY WARNINGS
+WARNING: Do not enter the blender bowl until lockout/tagout has been applied to the drive
+motor and verified with a zero-energy check.
+CAUTION: Cleaning solvent is flammable. No open flame or spark-producing tools are
+permitted within 10 feet of the cleaning station while solvent is in use.
+WARNING: Respiratory protection rated for the previous product's occupational exposure
+band must be worn until swab results confirm the surface is below the MACO limit.
+DANGER: Never bypass the tablet press guard interlock to reach cleaning solvent into the
+compression zone while the turret is capable of rotating.
+
+5.0 PROCEDURE
+5.1 Verify Lockout and Disassembly
+Apply lockout/tagout to the equipment train per SOP-EHS-002 and verify zero energy state.
+Disassemble removable product-contact parts, including the blender bowl liner, press
+tooling, and dust collection ductwork, per the equipment-specific teardown instruction.
+
+5.2 Perform the Detergent Wash Cycle
+Wash all product-contact surfaces with the qualified alkaline detergent at 55 degrees
+Celsius for a minimum of 15 minutes of contact time, using a soft nylon brush on
+hard-to-reach surfaces such as the blender shaft seal.
+a. Confirm the detergent concentration is between 1.0 and 1.5 percent by volume
+b. Confirm wash water temperature with the calibrated thermometer before starting the timer
+
+5.3 Perform the Final Rinse
+Rinse all surfaces with purified water until the conductivity of the rinse effluent is at
+or below 5 microsiemens per centimeter, confirmed with the in-line conductivity meter.
+Collect a rinse sample from the final rinse of the blender bowl for laboratory analysis.
+
+5.4 Visually Inspect All Surfaces
+Inspect all product-contact surfaces under white light of at least 500 lux for visible
+residue, discoloration, or detergent film. Any surface showing visible residue fails
+inspection and must be re-cleaned before swabbing.
+
+5.5 Collect Swab Samples
+Collect swab samples from the six designated locations shown on the equipment cleaning
+map, including the blender shaft seal, the discharge valve, and the press die table. Each
+swab covers a 25 square centimeter area using the validated swabbing technique.
+a. Use a new sterile swab and glove pair for each location
+b. Label each swab vial with the location code, lot number, and date
+
+5.6 Submit Samples and Apply the Clean Hold Label
+Submit the swab and rinse samples to the laboratory with a completed chain-of-custody
+form. Apply the green Clean Hold label to the equipment, recording the cleaning
+completion time; the 72-hour clean hold clock begins at this timestamp.
+
+5.7 Review Laboratory Results Against the MACO Limit
+Quality Assurance reviews the reported residue result for each swab location against the
+calculated MACO limit of 4.0 micrograms per 25 square centimeters. Any result exceeding
+the MACO limit fails the cleaning verification and equipment must be re-cleaned and
+re-sampled.
+
+5.8 Release the Equipment for the Next Product
+Once all six swab results and the rinse sample pass, Quality Assurance signs the
+Equipment Release Log, records the next product and lot number authorized to use the
+equipment, and removes the Clean Hold label, replacing it with the equipment status tag.
+
+5.9 Reassemble and Verify Clean Hold Time at Use
+Reassemble the equipment using only the parts identified on the teardown record. Before
+production start, confirm the elapsed time since the cleaning completion timestamp does
+not exceed the 72-hour clean hold limit; if exceeded, the equipment must be re-cleaned.
+
+REFERENCES:
+- SOP-EHS-002: Lockout/Tagout Procedure
+- SOP-MFG-104: Dedicated Equipment Cleaning
+- SOP-QC-045: Swab and Rinse Sample Analysis
+- Company Cleaning Validation Master Plan, Section 6
+
+RECORDS:
+- Equipment Cleaning Log (Form MFG-221-A)
+- Equipment Release Log (Form MFG-221-B)
+
+REVISION HISTORY:
+Version 4.0 (01/20/2026): Lowered MACO limit following updated toxicology assessment
+Version 3.1 (05/12/2025): Added rinse sample requirement for the blender bowl
+Version 3.0 (09/01/2023): Initial cross-contamination risk assessment incorporated
