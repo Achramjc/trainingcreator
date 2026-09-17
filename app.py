@@ -938,17 +938,13 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
         }
         _atomic_write_json(_job_json_path(job_id), job_record)
 
-        # Step 4: Generate the transparency report and the requested export.
+        # Step 4: Generate the requested export and the transparency report
+        # (this appends this export's own `package.exported` entry - see
+        # `_export_outputs`).
         download_filename = _export_outputs(
             output_dir, package_name, sop_content, training_module, assessment,
-            scorm_version, output_format, source_filename, approval=None,
-        )
-        audit_log.append(
-            'package.exported', Actor('training-creator', 'application', 'system'),
-            {'package_sha256': file_hash(output_dir / download_filename),
-             'format': output_format, 'scorm_version': scorm_version,
-             'filename': download_filename},
-            generated_hash,
+            scorm_version, output_format, source_filename, audit_log,
+            generated_hash, approval=None,
         )
 
         token = generate_download_token(job_id)
@@ -985,9 +981,9 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
 
 
 def _export_outputs(output_dir, package_name, sop_content, training_module, assessment,
-                     scorm_version, output_format, source_filename, approval=None,
-                     audit_head=None):
-    """(Re)generate the transparency report and the requested export for a job.
+                     scorm_version, output_format, source_filename, audit_log,
+                     content_hash_value, approval=None, audit_head=None):
+    """(Re)generate the requested export and the transparency report for a job.
 
     Shared by the initial upload, an edit-and-regenerate, and an
     approve-and-regenerate, so all three produce the same file layout for a
@@ -996,28 +992,34 @@ def _export_outputs(output_dir, package_name, sop_content, training_module, asse
     on disk by the time this runs (the upload is deleted right after initial
     processing), which `calculate_file_hash` already handles gracefully.
 
+    `audit_log` is the caller's own `AuditLog` (see `_audit_log`) - this
+    function never builds its own, so the job id it reads/writes against is
+    always the caller's explicit one (`audit_log.job_id`), never guessed from
+    `output_dir`'s name. `content_hash_value` is the `content_hash(...)` of
+    the exact `training_module`/`assessment` dicts the caller already
+    persisted or is about to persist - the same value the caller used for its
+    own `content.generated`/`content.edited`/`content.approved` entry.
+
     `audit_head` (only meaningful for `output_format == 'scorm'`) is the audit
     trail's head hash to anchor into the package's metadata.json
     (`audit_head_hash`; see docs/AUDIT_TRAIL.md "Anchoring the head hash").
     Only `approve_job` passes one - it is the value the trail had immediately
     after `content.approved`, so anyone holding the package can confirm it is
-    the content that was approved, not a later edit.
+    the content that was approved, not a later edit. The same value is also
+    written into a JSON export's `audit_head_hash` key and an HTML export's
+    `<meta name="audit-head-hash">` tag, both only when given.
+
+    Ordering matters here and is load-bearing: the artifact is written first,
+    then this export's own `package.exported` entry is appended (with the
+    artifact's real file hash), and only then is the transparency report
+    built and written - so a report on disk always reflects the export that
+    produced it (including that very `package.exported` entry), and a failed
+    artifact write leaves no report on disk claiming an export that never
+    happened.
 
     Returns the filename of the primary download artifact.
     """
     output_dir = Path(output_dir)
-
-    # The report carries the trail as it stands at report generation; the
-    # package.exported event for this very export is appended by the caller
-    # afterwards, so the report's timeline is always one event behind the
-    # trail on disk. The package's metadata.json anchors the approval head.
-    audit = audit_block_for_job(output_dir, output_dir.name, app.config.get('AUDIT_HMAC_KEY'))
-    transparency_report = generate_transparency_report(
-        sop_content, training_module, assessment, source_filename,
-        approval=approval, audit=audit,
-    )
-    create_html_report(transparency_report, str(output_dir / 'transparency_report.html'))
-    create_json_report(transparency_report, str(output_dir / 'transparency_report.json'))
 
     if output_format == 'scorm':
         exporter = SCORMExporter(scorm_version=scorm_version)
@@ -1044,19 +1046,40 @@ def _export_outputs(output_dir, package_name, sop_content, training_module, asse
         }
         if approval:
             json_data["approval"] = approval
+        if audit_head:
+            json_data["audit_head_hash"] = audit_head
         download_filename = "training_data.json"
         with open(output_dir / download_filename, 'w', encoding='utf-8') as f:
             json.dump(json_data, f, indent=2, ensure_ascii=False)
 
     elif output_format == 'html':
         download_filename = "training.html"
-        html_content = create_standalone_html(training_module, assessment)
+        html_content = create_standalone_html(training_module, assessment, audit_head=audit_head)
         with open(output_dir / download_filename, 'w', encoding='utf-8') as f:
             f.write(html_content)
 
     else:
         # Defensive; unreachable because of the validation upstream.
         raise RequestValidationError(f"Unsupported output_format: {output_format}")
+
+    audit_log.append(
+        'package.exported', Actor('training-creator', 'application', 'system'),
+        {'package_sha256': file_hash(output_dir / download_filename),
+         'format': output_format, 'scorm_version': scorm_version,
+         'filename': download_filename},
+        content_hash_value,
+    )
+
+    # Built only after the export's own package.exported entry above, so the
+    # report's timeline and package_matches_approval reflect this export, not
+    # the one before it.
+    audit = audit_block_for_job(output_dir, audit_log.job_id, app.config.get('AUDIT_HMAC_KEY'))
+    transparency_report = generate_transparency_report(
+        sop_content, training_module, assessment, source_filename,
+        approval=approval, audit=audit,
+    )
+    create_html_report(transparency_report, str(output_dir / 'transparency_report.html'))
+    create_json_report(transparency_report, str(output_dir / 'transparency_report.json'))
 
     return download_filename
 
@@ -1268,7 +1291,8 @@ def review_submit(job_id):
         # the SME's module (as submitted) and the server-relaid-out assessment
         # - never a re-derived approximation of either.
         edited_hash = content_hash(module_dict, edited_assessment_dict)
-        _audit_log(job_id).append(
+        audit_log = _audit_log(job_id)
+        audit_log.append(
             'content.edited', _anonymous_web_actor(),
             {'edits_count': edits_count, 'edits_by_category': edits_by_category,
              'edit_rounds': job['edit_rounds']},
@@ -1279,15 +1303,7 @@ def review_submit(job_id):
         download_filename = _export_outputs(
             _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
             req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
-            job.get('source_filename'), approval=None,
-        )
-        _audit_log(job_id).append(
-            'package.exported', Actor('training-creator', 'application', 'system'),
-            {'package_sha256': file_hash(_job_dir(job_id) / download_filename),
-             'format': req.get('output_format', 'scorm'),
-             'scorm_version': req.get('scorm_version', '1.2'),
-             'filename': download_filename},
-            edited_hash,
+            job.get('source_filename'), audit_log, edited_hash, approval=None,
         )
     except RequestValidationError as e:
         return jsonify({'error': str(e)}), 400
@@ -1380,7 +1396,7 @@ def approve_job(job_id):
     # page, a package export) may already treat the job as approved. So for
     # *this* endpoint the audit entry is the state change: `content.approved`
     # is appended to the trail first, and approval.json/job.json are written
-    # only if that append succeeds. If the trail cannot be written, the
+    # only after a successful export. If the trail cannot be written, the
     # request fails (500) and nothing on disk records an approval that the
     # trail cannot back up - there is no unrecorded approval to roll back
     # because there is no approval yet. This is the opposite order from
@@ -1388,8 +1404,9 @@ def approve_job(job_id):
     # fine there because an unrecorded edit is just an edit whose provenance
     # is momentarily thin, not a compliance signature.
     approved_hash = content_hash(job.get('training_module'), job.get('assessment'))
+    audit_log = _audit_log(job_id)
     try:
-        approval_entry = _audit_log(job_id).append(
+        approval_entry = audit_log.append(
             'content.approved', Actor(approval['approved_by'], approval['role'], 'web'),
             dict(approval),  # the 5 approval keys, verbatim
             approved_hash,
@@ -1406,14 +1423,21 @@ def approve_job(job_id):
     # export's own package.exported entry extends the chain further.
     audit_head = approval_entry.hash
 
-    _atomic_write_json(_approval_json_path(job_id), approval)
-
-    job['approval'] = approval
-    job['status'] = 'approved'
-    job['approved_at'] = approval['approved_at']
-    job['updated_at'] = _utcnow_iso()
-    _atomic_write_json(_job_json_path(job_id), job)
-
+    # Export BEFORE approval.json/job.json are written (deliberately the
+    # opposite of the naive "approve then export" order): `content.approved`
+    # above is already permanent and cannot be un-appended, but nothing else
+    # here has committed to "this job is approved" yet. If the export raises,
+    # we return 500 and write nothing else - approval.json still doesn't
+    # exist, job.json's status is still not 'approved' (so this endpoint can
+    # be retried), and the trail shows a `content.approved` entry with no
+    # `package.exported` after it. That is a legitimate, self-explaining
+    # trail state, not a corrupted one: docs/AUDIT_TRAIL.md says plainly that
+    # an approval entry without a following export means the export failed,
+    # and the next successful approve+export supersedes it. This closes the
+    # previous failure mode, where an export error after approval.json/
+    # job.json were already written left an approved-looking job on disk
+    # while the *previous*, unapproved package was still what a download
+    # actually served.
     try:
         sop_content = sop_from_dict(job.get('sop_content'))
         training_module = module_from_dict(job.get('training_module'))
@@ -1423,20 +1447,21 @@ def approve_job(job_id):
         download_filename = _export_outputs(
             _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
             req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
-            job.get('source_filename'), approval=approval, audit_head=audit_head,
-        )
-        _audit_log(job_id).append(
-            'package.exported', Actor('training-creator', 'application', 'system'),
-            {'package_sha256': file_hash(_job_dir(job_id) / download_filename),
-             'format': req.get('output_format', 'scorm'),
-             'scorm_version': req.get('scorm_version', '1.2'),
-             'filename': download_filename},
-            approved_hash,
+            job.get('source_filename'), audit_log, approved_hash,
+            approval=approval, audit_head=audit_head,
         )
     except RequestValidationError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         return _internal_error_response(job_id, e)
+
+    _atomic_write_json(_approval_json_path(job_id), approval)
+
+    job['approval'] = approval
+    job['status'] = 'approved'
+    job['approved_at'] = approval['approved_at']
+    job['updated_at'] = _utcnow_iso()
+    _atomic_write_json(_job_json_path(job_id), job)
 
     token = request.args.get('t', '')
     return jsonify({
@@ -1543,7 +1568,7 @@ def handle_request_entity_too_large(e):
     return jsonify({'error': 'File too large. Reduce the file size and try again.'}), 413
 
 
-def create_standalone_html(training_module, assessment):
+def create_standalone_html(training_module, assessment, audit_head=None):
     """Create a standalone HTML file with all content.
 
     Note: this escapes text pulled from the document so it can't break out
@@ -1552,6 +1577,12 @@ def create_standalone_html(training_module, assessment):
     integrity issue the assessment module is expected to fix by exposing a
     learner-safe question payload; once it does, this export path should be
     updated to use it instead of `q.to_dict()`-shaped data.
+
+    `audit_head` mirrors the SCORM export's `metadata.json` anchor
+    (docs/AUDIT_TRAIL.md "Anchoring the head hash"): when given (only ever
+    the case for an approved job - see `_export_outputs`), it is embedded
+    verbatim as `<meta name="audit-head-hash">` so a holder of this file can
+    compare it against the `content.approved` entry in the job's trail.
     """
     sections_html = ""
     for section in training_module.sections:
@@ -1571,12 +1602,16 @@ def create_standalone_html(training_module, assessment):
         questions_html += "</ul></div>"
 
     title = html.escape(training_module.title)
+    audit_meta = (
+        f'\n    <meta name="audit-head-hash" content="{html.escape(audit_head)}">'
+        if audit_head else ""
+    )
 
     html_doc = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>{title}</title>
+    <title>{title}</title>{audit_meta}
     <style>
         body {{ font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; }}
         h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}

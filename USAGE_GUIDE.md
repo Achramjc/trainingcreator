@@ -315,12 +315,22 @@ export, no edits after the last approval, etc.) all check out. Anything else is 
 `AuditLog.head_hash()` is the hash of the trail's last entry - one 64-character value that commits
 to everything recorded up to that point. Because a chain that has had its *last* entries deleted
 still verifies as intact (there's nothing left in the file to say they're missing -
-`docs/AUDIT_TRAIL.md` explains why), the head hash as of `package.exported` is written into the
-shipped package's `metadata.json` as `audit_head_hash`, and into the transparency report. To
-confirm nothing was quietly dropped from the end of the trail after the package shipped, compare
-that stored value against `head_hash` from `python3 -m src.audit verify` (or `show`) run on the
-job's current `audit.jsonl`. If they don't match, something in the trail changed after this
-package was built - investigate before trusting anything else about that job's history.
+`docs/AUDIT_TRAIL.md` explains why), an approved job's shipped package (SCORM's `metadata.json`,
+the JSON export's `audit_head_hash` key, or the standalone HTML export's
+`<meta name="audit-head-hash">` tag) carries a head hash anchor - but **at approval**, not at
+export: it is the hash of the trail's `content.approved` entry itself, computed before that
+approval's own export extends the chain further. The transparency report's own head hash
+(`audit_trail.head_hash`) is a *different* point in the same trail - as of the export that
+produced the report, one or more entries later - so it will not equal `metadata.json`'s
+`audit_head_hash` even on a perfectly healthy job; don't compare those two to each other.
+
+To confirm the package is the content that was approved: run `python3 -m src.audit show
+<job_dir>` and check that the `content.approved` entry's own `hash` equals the package's
+`audit_head_hash`. To confirm nothing was quietly dropped from the end of the trail since the
+package shipped, compare either anchored value against `head_hash` from
+`python3 -m src.audit verify` (or `show`) run on the job's *current* `audit.jsonl` - a value that
+used to be a valid entry hash and no longer appears in `show`'s output means something in the
+trail changed since that anchor was taken.
 
 ## Running a Pilot
 

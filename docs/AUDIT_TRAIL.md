@@ -102,6 +102,18 @@ was found, and `problems` lists every finding, of two kinds:
 holds an approval followed by an export, `null` when there is no approval, or no export after the
 last one. "Not applicable" and "does not match" must never be displayed as the same thing.
 
+An **approval entry (`content.approved`) with no `package.exported` after it** is not a corrupted
+trail — it means the export that was supposed to follow that approval failed (a full disk, an
+exporter bug, ...). `app.py`'s `/api/approve` appends `content.approved` first, because that
+append is the one action with no natural undo, but writes `approval.json` and flips `job.json`'s
+status to `approved` only *after* the export it triggers (including that export's own
+`package.exported` entry and the transparency report) has succeeded. If the export raises, nothing
+past `content.approved` is written: no `approval.json`, `job.json` still isn't `approved`, and the
+endpoint can be retried. The next successful approve+export appends a fresh `content.approved`
+followed by its own `package.exported`, and verification's semantics (above) then judge the trail
+by that *last* approval, so the failed attempt's dangling `content.approved` does not stop the
+trail from verifying `ok` once the retry succeeds.
+
 ## What verification cannot prove
 
 * **Removal of whole trailing entries.** Delete the last *n* complete lines and what remains is a
@@ -133,8 +145,24 @@ strength:
 
 1. **Print it.** `python3 -m src.audit show <job_dir>` ends with `head_hash=…` on stderr; put it
    in the approval e-mail, the batch record, the release note.
-2. **Ship it.** Write the head hash as of `package.exported` into the package's `metadata.json`
-   and the transparency report. Anyone holding the package can compare it with the trail.
+2. **Ship it.** Two different anchors exist, at two different points in the trail, and they are
+   not the same value — do not compare them to each other:
+   * The package's `metadata.json` (`audit_head_hash`; every format — SCORM, JSON and standalone
+     HTML) carries the head hash **as of approval**: the hash of the `content.approved` entry
+     itself, computed before that approval's own export extends the chain. This is what "the
+     package holds the content a named human approved" means, and it never changes even if the
+     job is exported again later without a new approval.
+   * The transparency report (`transparency_report.html`/`.json`, `audit_trail.head_hash`) carries
+     the head hash **as of the export that produced it** — one or more entries later, since it is
+     built only after that export's own `package.exported` entry is appended (see "Using it from
+     the rest of the app" below).
+
+   To confirm a package is the content that was approved: run
+   `python3 -m src.audit show <job_dir>` and check that the `content.approved` entry's own `hash`
+   equals that package's `metadata.json` `audit_head_hash`. Comparing the report's head hash to
+   `metadata.json`'s `audit_head_hash` instead will normally show a *difference* of one entry (the
+   export's own `package.exported`) even when nothing at all is wrong — that difference is not a
+   finding.
 3. **Send it away.** Log it to a system the application cannot rewrite — syslog, a SIEM, the
    customer's eQMS, a signed nightly digest. This is the only anchor that survives an attacker
    with full disk access.

@@ -41,8 +41,8 @@ def _upload(client, sample_sop_path, **form_overrides):
         return client.post("/api/upload", data=data, content_type="multipart/form-data")
 
 
-def _upload_and_get_job(client, sample_sop_path):
-    resp = _upload(client, sample_sop_path)
+def _upload_and_get_job(client, sample_sop_path, **form_overrides):
+    resp = _upload(client, sample_sop_path, **form_overrides)
     assert resp.status_code == 200, resp.get_data(as_text=True)
     payload = resp.get_json()
     return payload, payload["job_id"], payload["review_url"].split("t=")[1]
@@ -170,6 +170,161 @@ def test_full_lifecycle_produces_a_verifying_trail_in_the_expected_order(
     assert audit_payload["verification"]["ok"] is True
     assert audit_payload["verification"]["package_matches_approval"] is True
     assert audit_payload["hmac_mode"] == "chain-only"
+
+
+# ---------------------------------------------------------------------------
+# F3: the on-disk transparency report reflects the export that produced it
+# ---------------------------------------------------------------------------
+def test_transparency_report_reflects_the_export_that_produced_it(
+        app, client, sample_sop_path):
+    """The transparency report written by an export must be built AFTER that
+    same export's own `package.exported` entry (app.py `_export_outputs`),
+    not one event behind it - and must not be silently rewritten by a later,
+    unrelated event such as `download.served`."""
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
+
+    job = app_module._read_job_json(job_id)
+    module = job["training_module"]
+    assessment = job["assessment"]
+    assessment["questions"][0]["options"][0] = "A freshly written distractor"
+    edit_resp = client.post(
+        f"/api/review/{job_id}?t={token}",
+        json={"module": module, "assessment": assessment},
+    )
+    assert edit_resp.status_code == 200, edit_resp.get_data(as_text=True)
+
+    approve_resp = client.post(
+        f"/api/approve/{job_id}?t={token}",
+        json={"approved_by": "Dana Reyes", "role": "Quality Engineer"},
+    )
+    assert approve_resp.status_code == 200, approve_resp.get_data(as_text=True)
+
+    # Snapshot the trail as it stands right after approve+export, BEFORE the
+    # download below appends `download.served` - the report on disk must
+    # match this moment, not any later one.
+    job_dir = app_module._job_dir(job_id)
+    verification_before_download = verify_job(
+        job_dir, job_id, app.config.get("AUDIT_HMAC_KEY"))
+    assert _events(job_id)[-2:] == ["content.approved", "package.exported"]
+
+    report = json.loads((job_dir / "transparency_report.json").read_text(encoding="utf-8"))
+    audit_trail = report["audit_trail"]
+
+    assert audit_trail["status"] == "intact"
+    assert audit_trail["package_matches_approval"] is True
+    assert audit_trail["head_hash"] == verification_before_download.head_hash
+
+    timeline_events = [item["event"] for item in audit_trail["timeline"]]
+    approved_index = timeline_events.index("content.approved")
+    assert "package.exported" in timeline_events[approved_index + 1:]
+
+    html_text = (job_dir / "transparency_report.html").read_text(encoding="utf-8")
+    assert "intact" in html_text
+    assert "AUDIT TRAIL VERIFICATION FAILED" not in html_text
+
+    # Downloading afterwards records `download.served` on the trail but must
+    # not rewrite the report already on disk (the report is "as of export",
+    # not "as of now").
+    download_resp = client.get(approve_resp.get_json()["download_url"])
+    assert download_resp.status_code == 200
+    assert _events(job_id)[-1] == "download.served"
+    report_after_download = json.loads(
+        (job_dir / "transparency_report.json").read_text(encoding="utf-8"))
+    assert report_after_download == report
+
+
+# ---------------------------------------------------------------------------
+# F2: approve is atomic across the export - a failed export must not leave an
+# approved-looking job on disk
+# ---------------------------------------------------------------------------
+def test_approve_export_failure_leaves_job_unapproved_and_retry_succeeds(
+        client, sample_sop_path, monkeypatch):
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path)
+
+    from src.scorm_exporter import SCORMExporter
+
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(SCORMExporter, "create_package", boom)
+
+    resp = client.post(
+        f"/api/approve/{job_id}?t={token}",
+        json={"approved_by": "Jane", "role": "SME"},
+    )
+    assert resp.status_code == 500
+
+    # Nothing beyond the (already-permanent) content.approved entry was
+    # written: no approval.json, job.json still not 'approved', and no
+    # package.exported after that entry.
+    assert not app_module._approval_json_path(job_id).exists()
+    job = app_module._read_job_json(job_id)
+    assert job["status"] != "approved"
+    assert job["approval"] is None
+
+    events = _events(job_id)
+    assert events.count("content.approved") == 1
+    approved_index = events.index("content.approved")
+    assert "package.exported" not in events[approved_index + 1:]
+
+    # Restore the real exporter and retry: since job.json's status is still
+    # not 'approved', the endpoint allows a second attempt.
+    monkeypatch.undo()
+
+    retry_resp = client.post(
+        f"/api/approve/{job_id}?t={token}",
+        json={"approved_by": "Jane", "role": "SME"},
+    )
+    assert retry_resp.status_code == 200, retry_resp.get_data(as_text=True)
+
+    verification = verify_job(app_module._job_dir(job_id), job_id,
+                               app_module.app.config.get("AUDIT_HMAC_KEY"))
+    assert verification.ok is True, verification.problems
+    assert verification.package_matches_approval is True
+
+
+# ---------------------------------------------------------------------------
+# F5: the audit head hash is anchored into JSON/HTML exports too, only once
+# a job is approved
+# ---------------------------------------------------------------------------
+def test_json_export_carries_audit_head_hash_only_after_approval(client, sample_sop_path):
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path, output_format="json")
+    job_dir = app_module._job_dir(job_id)
+
+    draft_json = json.loads((job_dir / "training_data.json").read_text(encoding="utf-8"))
+    assert "audit_head_hash" not in draft_json
+    assert "approval" not in draft_json
+
+    approve_resp = client.post(
+        f"/api/approve/{job_id}?t={token}",
+        json={"approved_by": "Jane", "role": "SME"},
+    )
+    assert approve_resp.status_code == 200, approve_resp.get_data(as_text=True)
+
+    approved_json = json.loads((job_dir / "training_data.json").read_text(encoding="utf-8"))
+    approved_entry = next(e for e in app_module._audit_log(job_id).entries()
+                           if e.event == "content.approved")
+    assert approved_json["audit_head_hash"] == approved_entry.hash
+    assert approved_json["approval"]["approved_by"] == "Jane"
+
+
+def test_html_export_carries_audit_head_hash_meta_only_after_approval(client, sample_sop_path):
+    payload, job_id, token = _upload_and_get_job(client, sample_sop_path, output_format="html")
+    job_dir = app_module._job_dir(job_id)
+
+    draft_html = (job_dir / "training.html").read_text(encoding="utf-8")
+    assert 'name="audit-head-hash"' not in draft_html
+
+    approve_resp = client.post(
+        f"/api/approve/{job_id}?t={token}",
+        json={"approved_by": "Jane", "role": "SME"},
+    )
+    assert approve_resp.status_code == 200, approve_resp.get_data(as_text=True)
+
+    approved_html = (job_dir / "training.html").read_text(encoding="utf-8")
+    approved_entry = next(e for e in app_module._audit_log(job_id).entries()
+                           if e.event == "content.approved")
+    assert f'name="audit-head-hash" content="{approved_entry.hash}"' in approved_html
 
 
 def test_api_audit_requires_token_and_404s_for_unknown_job(client, sample_sop_path):

@@ -689,7 +689,7 @@ def _render_audit_trail_html(report_data):
         <table>
             <tr><th>Verification status</th><td>{_escape(status)}</td></tr>
             <tr><th>Entries</th><td>{audit.get('entries_count', 0)}</td></tr>
-            <tr><th>Head hash</th><td><code>{head_hash}</code></td></tr>
+            <tr><th>Head hash (as of this export)</th><td><code>{head_hash}</code></td></tr>
             <tr><th>Package matches approval</th><td>{package_matches_text}</td></tr>
             <tr><th>Verification mode</th><td><strong>{hmac_mode_label}</strong> &mdash; {mode_statement}</td></tr>
         </table>
@@ -703,10 +703,15 @@ def _render_audit_trail_html(report_data):
             {rows_html}
             </tbody>
         </table>
-        <p>Anchor: compare this head hash (<code>{head_hash}</code>) with the
-        <code>audit_head_hash</code> recorded in the package's <code>metadata.json</code>,
-        and with any copy stored outside this system, to confirm no trailing entries were
-        removed (see <code>docs/AUDIT_TRAIL.md</code>).</p>
+        <p>Anchor: the head hash above commits to this trail as of the export that produced
+        this report - it is <em>not</em> the same value as the package's
+        <code>metadata.json</code> <code>audit_head_hash</code>, which anchors the trail as of
+        <em>approval</em> (the <code>content.approved</code> entry), one or more entries earlier.
+        To confirm the package is unaltered, run <code>python3 -m src.audit show &lt;job_dir&gt;</code>
+        and check that the <code>content.approved</code> entry's own hash equals
+        <code>metadata.json</code>'s <code>audit_head_hash</code>; then compare this report's
+        head hash above (or a copy stored outside this system) with the trail's current head hash
+        to confirm no trailing entries were later removed (see <code>docs/AUDIT_TRAIL.md</code>).</p>
     </div>
     """
 
