@@ -1,0 +1,17 @@
+# Optional dependencies for the grounded LLM enhancement layer (src/llm).
+#
+# NOT required to run Training Creator. The parser, generator, assessment
+# generator, SCORM exporter, CLI, web app and the entire test suite work with
+# this file uninstalled - `anthropic` is imported lazily, inside
+# AnthropicProvider, and nothing else touches it.
+#
+#   pip install -r requirements.txt -r requirements-llm.txt
+#   export TRAINING_CREATOR_LLM=anthropic
+#   export ANTHROPIC_API_KEY=sk-ant-...        # or: ant auth login
+#
+# See docs/LLM.md for what the layer does, what its grounding check rejects,
+# and why an SME approval step is still mandatory afterwards.
+
+# Pinned from `pip show anthropic` (1.6.0) in the environment this was built
+# and tested in, using the repo's ~= convention.
+anthropic~=1.6

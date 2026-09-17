@@ -12,6 +12,13 @@ from .parser import SOPParser
 from .generator import TrainingGenerator
 from .assessments import MIN_ASSESSMENT_QUESTIONS, AssessmentGenerator
 from .scorm_exporter import SCORMExporter
+from .llm import LLMConfig, enhance_assessment, enhance_module, merge_reports
+from .llm import build_provider as build_llm_provider
+
+#: Written next to the package whenever the LLM layer runs.  It lists every
+#: generated item, whether it was kept, and why - the artifact an SME reviews
+#: and an auditor asks for.
+ENHANCEMENT_REPORT_FILENAME = "enhancement_report.json"
 
 
 @click.command()
@@ -32,9 +39,19 @@ from .scorm_exporter import SCORMExporter
               help='Minimum passing score percentage (default: 70)')
 @click.option('--package-name', '-n', default=None,
               help='Custom package name (default: based on SOP title)')
+@click.option('--llm/--no-llm', 'llm', default=None,
+              help='Run the optional grounded LLM enhancement layer between '
+                   'generation and export. Default comes from the '
+                   'TRAINING_CREATOR_LLM environment variable (off unless it '
+                   'is set to "anthropic"). Every generated sentence is checked '
+                   'against a cited source line; anything unsupported is '
+                   'discarded and the deterministic text kept. Writes '
+                   'enhancement_report.json next to the output. This is '
+                   'acceleration, not approval: an SME must still sign off.')
 @click.option('--verbose', '-v', is_flag=True,
               help='Verbose output')
-def main(input, output, format, questions, passing_score, package_name, verbose):
+def main(input, output, format, questions, passing_score, package_name, llm,
+         verbose):
     """
     Training Creator - Convert SOPs and work instructions into LMS-ready training materials
 
@@ -88,10 +105,39 @@ def main(input, output, format, questions, passing_score, package_name, verbose)
         click.echo("   ✓ Assessment generated")
         click.echo()
 
-        # Step 4: Export to selected format
         output_path = Path(output)
         output_path.mkdir(parents=True, exist_ok=True)
 
+        # Step 3b: Optional grounded LLM enhancement.
+        #
+        # Deliberately between generation and export, never inside either: the
+        # deterministic pipeline must be able to run, and be tested, with this
+        # step absent.  A failure here is reported, not raised.
+        llm_config = LLMConfig.from_env()
+        if llm is not None:
+            llm_config = llm_config.with_enabled(llm)
+
+        if llm_config.enabled:
+            click.echo("🤖 Running grounded LLM enhancement "
+                       f"(model {llm_config.model})...")
+            provider = build_llm_provider(llm_config)
+            training_module, module_report = enhance_module(
+                training_module, sop_content, provider, llm_config)
+            assessment, assessment_report = enhance_assessment(
+                assessment, sop_content, provider, llm_config)
+            report = merge_reports("package", [module_report, assessment_report],
+                                   llm_config)
+            report_path = output_path / ENHANCEMENT_REPORT_FILENAME
+            with open(report_path, 'w', encoding='utf-8') as handle:
+                json.dump(report.to_dict(), handle, indent=2, ensure_ascii=False)
+            for line in report.summary_lines():
+                click.echo(f"   {line}")
+            click.echo(f"   ✓ Enhancement report written: {report_path}")
+            click.echo("   ⚠️  Machine-assisted draft - a named SME must review "
+                       "and approve before release.")
+            click.echo()
+
+        # Step 4: Export to selected format
         click.echo(f"📦 Exporting to {format.upper()} format...")
 
         if format.startswith('scorm'):
