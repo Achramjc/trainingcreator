@@ -20,6 +20,15 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 import json
 
+from src.audit import (
+    Actor,
+    AuditLog,
+    content_hash,
+    file_hash,
+    global_log,
+    hmac_key_from_env,
+    verify_job,
+)
 from src.parser import SOPParser
 from src.generator import TrainingGenerator
 from src.assessments import (
@@ -65,6 +74,14 @@ app.config['OUTPUT_RETENTION_SECONDS'] = int(os.environ.get('OUTPUT_RETENTION_SE
 _env_secret_key = os.environ.get('SECRET_KEY')
 _secret_key_was_generated = not bool(_env_secret_key)
 app.config['SECRET_KEY'] = _env_secret_key or secrets.token_hex(32)
+
+# Audit trail HMAC key (src/audit.py, docs/AUDIT_TRAIL.md). Built once at
+# import, same pattern as SECRET_KEY above, and stored on app.config (rather
+# than a bare module constant) so tests can override it the same way they
+# override SECRET_KEY. Unset AUDIT_HMAC_KEY is a supported "chain-only"
+# configuration - entries still hash-chain and verify, they simply carry no
+# `mac`; see DEPLOYMENT.md for what that does and doesn't protect against.
+app.config['AUDIT_HMAC_KEY'] = hmac_key_from_env()
 
 # --- Logging ------------------------------------------------------------
 
@@ -151,11 +168,25 @@ def allowed_file(filename):
 # deletion; see DEPLOYMENT.md.
 
 def _sweep_expired_outputs(output_folder, retention_seconds):
-    """Delete job directories under output_folder older than retention_seconds."""
+    """Delete job directories under output_folder older than retention_seconds.
+
+    Before a job directory (and the `audit.jsonl` inside it) is deleted, its
+    last head hash is recorded as `retention.deleted` on the *global* log
+    (`<output_folder>/audit-global.jsonl` - see `src.audit.global_log`),
+    because that is all that survives of the job's own trail afterwards.
+
+    This runs unattended (at process startup, or from a scheduler) rather
+    than inside a request, so a job whose retention record can't be written
+    - a bad log, a read-only disk - is skipped rather than crashing the
+    whole sweep or the app's startup; it is picked up on the next sweep once
+    the underlying problem is fixed, and the failure is logged loudly rather
+    than the deletion silently going unrecorded.
+    """
     folder = Path(output_folder)
     if not folder.exists():
         return
     now = time.time()
+    audit_key = app.config.get('AUDIT_HMAC_KEY')
     for job_dir in folder.iterdir():
         if not job_dir.is_dir():
             continue
@@ -163,8 +194,24 @@ def _sweep_expired_outputs(output_folder, retention_seconds):
             age = now - job_dir.stat().st_mtime
         except OSError:
             continue
-        if age > retention_seconds:
-            shutil.rmtree(job_dir, ignore_errors=True)
+        if age <= retention_seconds:
+            continue
+
+        job_id = job_dir.name
+        try:
+            head_hash = AuditLog.for_job(job_dir, job_id, audit_key).head_hash()
+            global_log(output_folder, audit_key).append(
+                'retention.deleted', Actor('retention-sweep', 'system', 'system'),
+                {'job_id': job_id, 'head_hash': head_hash,
+                 'retention_seconds': int(retention_seconds)},
+            )
+        except (OSError, ValueError) as e:
+            app.logger.error(
+                f"[job_id={job_id}] Could not record retention.deleted; "
+                f"leaving the job directory for the next sweep: {e}")
+            continue
+
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def _cleanup_upload(upload_path):
@@ -252,6 +299,20 @@ def _verify_job_token(job_id):
 
 def _job_dir(job_id):
     return Path(app.config['OUTPUT_FOLDER']) / job_id
+
+
+def _audit_log(job_id):
+    """This job's `AuditLog` (docs/AUDIT_TRAIL.md). One per job, for its life;
+    callers just call this wherever they need to append or read it - the file
+    itself is what persists, not this object."""
+    return AuditLog.for_job(_job_dir(job_id), job_id, app.config.get('AUDIT_HMAC_KEY'))
+
+
+def _anonymous_web_actor():
+    """Web actions before an approval carry no authenticated identity (that's
+    M2). This is the trail's honest placeholder, not a real name - see
+    docs/AUDIT_TRAIL.md and DEPLOYMENT.md."""
+    return Actor('anonymous', 'author', 'web')
 
 
 def _job_json_path(job_id):
@@ -747,12 +808,34 @@ def upload_file():
             _cleanup_upload(upload_path)
 
 
-def process_training(file_path, job_id, num_questions, passing_score, scorm_version, output_format):
-    """Process SOP and generate training package"""
+def process_training(file_path, job_id, num_questions, passing_score, scorm_version, output_format,
+                      sample_id=None):
+    """Process SOP and generate training package.
+
+    `sample_id` is set only when this run came from the sample-SOP gallery
+    (src/samples_routes.py) rather than a real upload; it is recorded in the
+    `job.created` audit entry's details and nowhere else.
+    """
     if output_format not in ALLOWED_OUTPUT_FORMATS:
         raise RequestValidationError(f"Unsupported output_format: {output_format}")
     if scorm_version not in ALLOWED_SCORM_VERSIONS:
         raise RequestValidationError(f"Unsupported scorm_version: {scorm_version}")
+
+    audit_log = _audit_log(job_id)
+    # Hashed before parsing touches it, and definitely before the caller's
+    # `finally` deletes it once this function returns.
+    source_sha256 = file_hash(file_path)
+    job_created_details = {
+        'source_filename': Path(file_path).name,
+        'num_questions': num_questions,
+        'passing_score': passing_score,
+        'scorm_version': scorm_version,
+        'output_format': output_format,
+        'source_sha256': source_sha256,
+    }
+    if sample_id is not None:
+        job_created_details['sample_id'] = sample_id
+    audit_log.append('job.created', _anonymous_web_actor(), job_created_details)
 
     try:
         # Step 1: Parse SOP
@@ -809,6 +892,18 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
         package_name = secure_filename(sop_content.title.replace(' ', '_')[:50])
         source_filename = Path(file_path).name
 
+        # The exact dicts about to be persisted to job.json - content_hash is
+        # computed from these, never re-serialized, so it hashes what job.json
+        # (and, below, the export) actually carries.
+        module_dict = training_module.to_dict()
+        assessment_dict = assessment.to_dict()
+        generated_hash = content_hash(module_dict, assessment_dict)
+        audit_log.append(
+            'content.generated', _anonymous_web_actor(),
+            {'questions': len(assessment.questions), 'llm_enhancement': llm_summary},
+            generated_hash,
+        )
+
         # Persist the draft *before* exporting, so a job.json always exists
         # once generation has started - this is the SME review record, and it
         # legitimately carries the answer key (SOPContent/TrainingModule/
@@ -828,8 +923,8 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
                 'output_format': output_format,
             },
             'sop_content': sop_content.to_dict(),
-            'training_module': training_module.to_dict(),
-            'assessment': assessment.to_dict(),
+            'training_module': module_dict,
+            'assessment': assessment_dict,
             'edits_count': 0,
             'edits_by_category': _zero_edit_categories(),
             'edit_rounds': 0,
@@ -845,6 +940,13 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
         download_filename = _export_outputs(
             output_dir, package_name, sop_content, training_module, assessment,
             scorm_version, output_format, source_filename, approval=None,
+        )
+        audit_log.append(
+            'package.exported', Actor('training-creator', 'application', 'system'),
+            {'package_sha256': file_hash(output_dir / download_filename),
+             'format': output_format, 'scorm_version': scorm_version,
+             'filename': download_filename},
+            generated_hash,
         )
 
         token = generate_download_token(job_id)
@@ -881,7 +983,8 @@ def process_training(file_path, job_id, num_questions, passing_score, scorm_vers
 
 
 def _export_outputs(output_dir, package_name, sop_content, training_module, assessment,
-                     scorm_version, output_format, source_filename, approval=None):
+                     scorm_version, output_format, source_filename, approval=None,
+                     audit_head=None):
     """(Re)generate the transparency report and the requested export for a job.
 
     Shared by the initial upload, an edit-and-regenerate, and an
@@ -890,6 +993,13 @@ def _export_outputs(output_dir, package_name, sop_content, training_module, asse
     transparency report's "source document" section - it may no longer exist
     on disk by the time this runs (the upload is deleted right after initial
     processing), which `calculate_file_hash` already handles gracefully.
+
+    `audit_head` (only meaningful for `output_format == 'scorm'`) is the audit
+    trail's head hash to anchor into the package's metadata.json
+    (`audit_head_hash`; see docs/AUDIT_TRAIL.md "Anchoring the head hash").
+    Only `approve_job` passes one - it is the value the trail had immediately
+    after `content.approved`, so anyone holding the package can confirm it is
+    the content that was approved, not a later edit.
 
     Returns the filename of the primary download artifact.
     """
@@ -910,6 +1020,7 @@ def _export_outputs(output_dir, package_name, sop_content, training_module, asse
             str(output_dir),
             package_name,
             approval=approval,
+            audit_head=audit_head,
         )
         download_filename = Path(output_path).name
 
@@ -973,7 +1084,47 @@ def download_file(job_id, filename):
     if not target.is_file():
         return jsonify({'error': 'File not found'}), 404
 
+    try:
+        _audit_log(job_id).append(
+            'download.served', _anonymous_web_actor(), {'filename': filename})
+    except Exception as e:
+        # Never swallow a trail-write failure (docs/AUDIT_TRAIL.md): the
+        # request fails rather than a download leaving with no record of it.
+        return _internal_error_response(job_id, e)
+
     return send_from_directory(job_dir, filename, as_attachment=True)
+
+
+@app.route('/api/audit/<job_id>')
+def get_audit_trail(job_id):
+    """The job's audit trail plus its own verification result.
+
+    Requires the same signed token as downloads (query param `t`) - 403
+    without it, 404 if the job doesn't exist. `hmac_mode` says whether the
+    entries carry a `mac` (`AUDIT_HMAC_KEY` set) or are chain-only (unset);
+    see docs/AUDIT_TRAIL.md.
+    """
+    if not _is_safe_path_component(job_id):
+        return jsonify({'error': 'Invalid request'}), 400
+
+    token_error = _verify_job_token(job_id)
+    if token_error:
+        message, status = token_error
+        return jsonify({'error': message}), status
+
+    if _read_job_json(job_id) is None:
+        return jsonify({'error': 'Job not found'}), 404
+
+    audit_key = app.config.get('AUDIT_HMAC_KEY')
+    job_dir = _job_dir(job_id)
+    entries = [entry.to_dict() for entry in AuditLog.for_job(job_dir, job_id, audit_key).entries()]
+    verification = verify_job(job_dir, job_id, audit_key)
+
+    return jsonify({
+        'entries': entries,
+        'verification': verification.to_dict(),
+        'hmac_mode': 'hmac' if audit_key else 'chain-only',
+    }), 200
 
 
 # --- SME review and approval -------------------------------------------
@@ -1000,6 +1151,7 @@ def review_page(job_id):
     if job.get('review_opened_at') is None:
         job['review_opened_at'] = _utcnow_iso()
         _atomic_write_json(_job_json_path(job_id), job)
+        _audit_log(job_id).append('review.opened', _anonymous_web_actor(), {})
 
     sop = job.get('sop_content') or {}
     source_lines = (sop.get('raw_content') or '').splitlines()
@@ -1091,8 +1243,9 @@ def review_submit(job_id):
                 naive_failures[0], assessment.passing_score)}), 400
 
         now = _utcnow_iso()
+        edited_assessment_dict = assessment.to_dict()
         job['training_module'] = module_dict
-        job['assessment'] = assessment.to_dict()
+        job['assessment'] = edited_assessment_dict
         job['status'] = 'edited'
         job['edits_count'] = edits_count
         job['edits_by_category'] = edits_by_category
@@ -1104,11 +1257,30 @@ def review_submit(job_id):
         job['updated_at'] = now
         _atomic_write_json(_job_json_path(job_id), job)
 
+        # `content_hash` is taken from exactly what was just persisted above -
+        # the SME's module (as submitted) and the server-relaid-out assessment
+        # - never a re-derived approximation of either.
+        edited_hash = content_hash(module_dict, edited_assessment_dict)
+        _audit_log(job_id).append(
+            'content.edited', _anonymous_web_actor(),
+            {'edits_count': edits_count, 'edits_by_category': edits_by_category,
+             'edit_rounds': job['edit_rounds']},
+            edited_hash,
+        )
+
         req = job.get('request', {})
         download_filename = _export_outputs(
             _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
             req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
             job.get('source_filename'), approval=None,
+        )
+        _audit_log(job_id).append(
+            'package.exported', Actor('training-creator', 'application', 'system'),
+            {'package_sha256': file_hash(_job_dir(job_id) / download_filename),
+             'format': req.get('output_format', 'scorm'),
+             'scorm_version': req.get('scorm_version', '1.2'),
+             'filename': download_filename},
+            edited_hash,
         )
     except RequestValidationError as e:
         return jsonify({'error': str(e)}), 400
@@ -1193,6 +1365,40 @@ def approve_job(job_id):
         'notes': notes,
         'edits_count': int(job.get('edits_count', 0)),
     }
+
+    # Atomicity decision (see docs/AUDIT_TRAIL.md's general "append after the
+    # state change succeeds" rule, deliberately reversed here): approval is
+    # the one action in this app with no natural undo once written - once
+    # approval.json exists, a downstream reader (an SME re-opening the review
+    # page, a package export) may already treat the job as approved. So for
+    # *this* endpoint the audit entry is the state change: `content.approved`
+    # is appended to the trail first, and approval.json/job.json are written
+    # only if that append succeeds. If the trail cannot be written, the
+    # request fails (500) and nothing on disk records an approval that the
+    # trail cannot back up - there is no unrecorded approval to roll back
+    # because there is no approval yet. This is the opposite order from
+    # content.edited/content.generated (state saved, then recorded), which is
+    # fine there because an unrecorded edit is just an edit whose provenance
+    # is momentarily thin, not a compliance signature.
+    approved_hash = content_hash(job.get('training_module'), job.get('assessment'))
+    try:
+        approval_entry = _audit_log(job_id).append(
+            'content.approved', Actor(approval['approved_by'], approval['role'], 'web'),
+            dict(approval),  # the 5 approval keys, verbatim
+            approved_hash,
+        )
+    except Exception as e:
+        # Never swallow a trail-write failure: nothing else here has been
+        # written yet (see the atomicity note above), so failing now leaves
+        # no unrecorded approval on disk.
+        return _internal_error_response(job_id, e)
+
+    # The head hash as of this entry - anchored into the package below so a
+    # holder of the package can confirm it carries the approved content (see
+    # docs/AUDIT_TRAIL.md "Anchoring the head hash"). Computed now, before the
+    # export's own package.exported entry extends the chain further.
+    audit_head = approval_entry.hash
+
     _atomic_write_json(_approval_json_path(job_id), approval)
 
     job['approval'] = approval
@@ -1210,7 +1416,15 @@ def approve_job(job_id):
         download_filename = _export_outputs(
             _job_dir(job_id), job.get('package_name'), sop_content, training_module, assessment,
             req.get('scorm_version', '1.2'), req.get('output_format', 'scorm'),
-            job.get('source_filename'), approval=approval,
+            job.get('source_filename'), approval=approval, audit_head=audit_head,
+        )
+        _audit_log(job_id).append(
+            'package.exported', Actor('training-creator', 'application', 'system'),
+            {'package_sha256': file_hash(_job_dir(job_id) / download_filename),
+             'format': req.get('output_format', 'scorm'),
+             'scorm_version': req.get('scorm_version', '1.2'),
+             'filename': download_filename},
+            approved_hash,
         )
     except RequestValidationError as e:
         return jsonify({'error': str(e)}), 400

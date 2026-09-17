@@ -4,10 +4,12 @@ Command Line Interface for Training Creator
 
 import html
 import json
+import os
 from pathlib import Path
 
 import click
 
+from .audit import Actor, AuditLog, content_hash, file_hash, hmac_key_from_env
 from .parser import SOPParser
 from .generator import TrainingGenerator
 from .assessments import MIN_ASSESSMENT_QUESTIONS, AssessmentGenerator
@@ -66,6 +68,19 @@ def main(input, output, format, questions, passing_score, package_name, llm,
         click.echo("=" * 60)
         click.echo()
 
+        # The output directory doubles as this job's audit-trail directory
+        # (docs/AUDIT_TRAIL.md): `<output>/audit.jsonl`, job id = the
+        # directory's own name, so `python3 -m src.audit verify <output>`
+        # needs no --job-id to check a CLI-produced directory.
+        output_path = Path(output)
+        job_id = output_path.resolve().name
+        audit_log = AuditLog.for_job(output_path, job_id, hmac_key_from_env())
+        audit_log.append(
+            'job.created', Actor(os.environ.get('USER', 'cli'), 'author', 'cli'),
+            {'source_filename': Path(input).name, 'source_sha256': file_hash(input),
+             'num_questions': questions, 'passing_score': passing_score,
+             'format': format})
+
         # Step 1: Parse SOP
         click.echo(f"📄 Parsing SOP from: {input}")
         parser = SOPParser()
@@ -105,7 +120,6 @@ def main(input, output, format, questions, passing_score, package_name, llm,
         click.echo("   ✓ Assessment generated")
         click.echo()
 
-        output_path = Path(output)
         output_path.mkdir(parents=True, exist_ok=True)
 
         # Step 3b: Optional grounded LLM enhancement.
@@ -137,6 +151,16 @@ def main(input, output, format, questions, passing_score, package_name, llm,
                        "and approve before release.")
             click.echo()
 
+        # `content_hash` covers exactly the module/assessment about to be
+        # exported below (post-LLM-enhancement, if that ran) - the same rule
+        # app.py's process_training follows.
+        module_dict = training_module.to_dict()
+        assessment_dict = assessment.to_dict()
+        generated_hash = content_hash(module_dict, assessment_dict)
+        audit_log.append(
+            'content.generated', Actor(os.environ.get('USER', 'cli'), 'author', 'cli'),
+            {'questions': len(assessment.questions)}, generated_hash)
+
         # Step 4: Export to selected format
         click.echo(f"📦 Exporting to {format.upper()} format...")
 
@@ -146,18 +170,20 @@ def main(input, output, format, questions, passing_score, package_name, llm,
             result_path = exporter.create_package(training_module, assessment,
                                                   str(output_path), package_name)
             click.echo(f"   ✓ SCORM package created: {result_path}")
+            exported_path = Path(result_path)
 
         elif format == 'json':
             # Export as JSON
             json_data = {
                 "sop_content": sop_content.to_dict(),
-                "training_module": training_module.to_dict(),
-                "assessment": assessment.to_dict()
+                "training_module": module_dict,
+                "assessment": assessment_dict
             }
             json_path = output_path / f"{package_name or 'training'}.json"
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(json_data, f, indent=2, ensure_ascii=False)
             click.echo(f"   ✓ JSON data saved: {json_path}")
+            exported_path = json_path
 
         elif format == 'html':
             # Export as standalone HTML (simplified)
@@ -165,6 +191,13 @@ def main(input, output, format, questions, passing_score, package_name, llm,
             html_content = _create_standalone_html(training_module, assessment)
             html_path.write_text(html_content, encoding='utf-8')
             click.echo(f"   ✓ HTML file created: {html_path}")
+            exported_path = html_path
+
+        audit_log.append(
+            'package.exported', Actor('training-creator', 'application', 'system'),
+            {'package_sha256': file_hash(exported_path), 'format': format,
+             'filename': exported_path.name},
+            generated_hash)
 
         click.echo()
         click.echo("=" * 60)
@@ -178,6 +211,8 @@ def main(input, output, format, questions, passing_score, package_name, llm,
         click.echo(f"   Training Duration: ~{training_module.estimated_duration} minutes")
         click.echo(f"   Assessment Questions: {len(assessment.questions)}")
         click.echo(f"   Passing Score: {passing_score}%")
+        click.echo(f"   Audit trail: {output_path / 'audit.jsonl'}")
+        click.echo(f"   Audit head hash: {audit_log.head_hash()}")
         click.echo()
         click.echo("🚀 Your training package is ready to upload to your LMS!")
 

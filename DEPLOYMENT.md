@@ -200,6 +200,11 @@ DOWNLOAD_TTL_SECONDS=86400
 # swept away on the next process startup, in seconds (default 86400 = 24h)
 OUTPUT_RETENTION_SECONDS=86400
 
+# Audit trail (src/audit.py, docs/AUDIT_TRAIL.md): HMAC key for the
+# tamper-evident hash chain each job carries in <output>/<job_id>/audit.jsonl.
+# Read once at process startup. Optional - see below.
+AUDIT_HMAC_KEY=a-long-random-secret-kept-outside-the-job-directory
+
 # Optional: Database for user accounts (future)
 DATABASE_URL=postgresql://user:pass@localhost/trainingcreator
 
@@ -228,7 +233,47 @@ download links. Always set `SECRET_KEY` explicitly in production.
 processing (success or failure) — it is the customer's controlled document and is not retained.
 Job output directories older than `OUTPUT_RETENTION_SECONDS` are swept on process startup. This
 is a simple, synchronous, local-disk implementation. **M2 replaces it** with object storage
-(e.g. S3) and bucket lifecycle rules instead of app-managed deletion — see GOAL.md.
+(e.g. S3) and bucket lifecycle rules instead of app-managed deletion — see GOAL.md. Before a job
+directory is deleted, its audit trail's last head hash is recorded as a `retention.deleted` entry
+on the global log (`<output>/audit-global.jsonl`) — see the audit trail section below.
+
+### Audit trail (`src/audit.py`, `docs/AUDIT_TRAIL.md`)
+
+Every job gets a tamper-evident, hash-chained log at `<output>/<job_id>/audit.jsonl`, recording
+who did what and when (upload accepted, content generated, SME review opened/edited/approved,
+package exported, download served) and tying every content event to the exact SHA-256 of the
+training content it describes. `GET /api/audit/<job_id>?t=<token>` (same signed token as
+downloads) returns the entries plus a live verification result; `python3 -m src.audit verify
+<job_dir>` and `... show <job_dir>` do the same from the command line, including for a
+CLI-produced output directory (`python3 -m src.cli` writes an `audit.jsonl` directly into
+`--output` and prints its head hash at the end).
+
+**`AUDIT_HMAC_KEY`** is read once at process startup (`app.config['AUDIT_HMAC_KEY']`, mirroring
+how `SECRET_KEY` is handled above).
+
+* **Set:** every entry additionally carries `hmac_sha256(key, entry_hash)` (`"mac"`). An attacker
+  who can edit the log file but does not have this key cannot produce a chain that still verifies.
+  Keep the key out of the job directory it protects — ideally on a different host or in a secrets
+  manager, not next to `audit.jsonl` — and rotating it does not invalidate already-written entries
+  (only the entries written after rotation carry the new key's MAC).
+* **Unset (default):** *chain-only* mode. Entries still hash-chain (`prev_hash`/`hash`) and
+  `verify_job()` still catches an edited field, a reordered/deleted entry, or a truncated line —
+  it just cannot prove the *whole file* wasn't regenerated from scratch by someone with disk
+  access and no key. `GET /api/audit` and `python3 -m src.audit verify` both report which mode
+  produced a given trail (`hmac_mode: "hmac"` vs. `"chain-only"`), so this is never silently
+  ambiguous to whoever is reading it.
+
+**Actor identity (current, pre-M2):** every web action recorded before a job is approved uses
+`Actor("anonymous", "author", "web")` — there is no authenticated user session yet (accounts are
+M2), so the trail cannot claim otherwise. The one identified actor pre-M2 is the approval itself:
+`content.approved` carries the name and role the approver typed into the approval form, the same
+identity `approval.json` already records — a claim of identity, not an authenticated one (see
+docs/AUDIT_TRAIL.md, "What verification cannot prove"). `package.exported` entries are recorded by
+the application itself (`Actor("training-creator", "application", "system")`), and the retention
+sweep by `Actor("retention-sweep", "system", "system")`.
+
+This is not a claim of 21 CFR Part 11 compliance — see `docs/AUDIT_TRAIL.md`'s "Relationship to
+21 CFR Part 11" section for exactly what this does and does not provide.
 
 ## Scaling Considerations
 
