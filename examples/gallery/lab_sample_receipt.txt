@@ -1,0 +1,106 @@
+Standard Operating Procedure: Clinical Sample Receipt, Accessioning, and Rejection Criteria
+
+Document Number: SOP-LAB-055
+Version: 5.0
+Effective Date: 05/06/2026
+Department: Clinical Laboratory
+
+PURPOSE:
+This Standard Operating Procedure establishes the process for receiving, accessioning,
+and evaluating incoming patient specimens against defined rejection criteria, so that only
+specimens suitable for accurate testing enter the testing workflow and every accessioning
+decision is documented in accordance with CLIA and CAP requirements.
+
+SCOPE:
+This procedure applies to all specimens received at the central receiving bench, and to
+all Accessioning Technicians and the on-duty Laboratory Supervisor. It applies to blood,
+urine, and swab specimens; specialty specimens such as CSF follow SOP-LAB-071.
+
+DEFINITIONS:
+Accessioning: The process of assigning a unique laboratory identifier to a specimen and entering its associated order and patient information into the laboratory information system.
+Quantity Not Sufficient (QNS): A specimen volume below the minimum required for the ordered test, typically less than 2 milliliters for a standard chemistry tube.
+Hemolysis Index: A semi-quantitative measure of red blood cell breakdown in a serum or plasma sample, reported on a scale of 0 to 4.
+Chain of Custody: The documented, unbroken record of specimen handling from collection through result reporting, required for legal or forensic testing.
+Positive Patient Identification: Verification of patient identity using two independent identifiers, typically full name and date of birth.
+
+RESPONSIBILITIES:
+- Accessioning Technicians: Receive, inspect, and accession or reject incoming specimens
+- Laboratory Supervisor: Adjudicate disputed rejections and approve redraw requests
+- Phlebotomy Team: Recollect specimens rejected at accessioning
+- Laboratory Director: Review the monthly specimen rejection rate report
+
+SAFETY WARNINGS:
+WARNING: Treat every specimen as a biohazard. Wear gloves and a face shield when opening any transport bag showing visible leakage.
+CAUTION: Specimens received on dry ice must be handled with insulated gloves to prevent frostbite injury.
+DANGER: Do not open a transport bag with a broken primary tube on the open bench. Move it to the biosafety cabinet before opening.
+WARNING: Never pipette a specimen by mouth or attempt to recap a used needle found in a specimen bag; dispose of it directly into the sharps container.
+
+PROCEDURE:
+
+Step 1: Receive and Inspect the Specimen Bag
+Inspect the outer transport bag for leakage, damage, or missing paperwork upon arrival at
+the receiving bench. Any bag with visible leakage is handled per the biohazard spill
+protocol in SOP-LAB-090 before further processing.
+
+Step 2: Verify Positive Patient Identification
+Confirm the specimen label carries two independent patient identifiers, typically full
+name and date of birth, matching the accompanying requisition exactly. A mismatch between
+the label and requisition requires rejection under the mislabeling criterion.
+
+Step 3: Inspect Specimen Volume and Condition
+Inspect the specimen for adequate volume, clotting in an anticoagulated tube, and gross
+hemolysis. A chemistry tube with less than 2 milliliters of serum is rejected as Quantity
+Not Sufficient.
+a. Check anticoagulated tubes for visible clots by gentle inversion
+b. Estimate the hemolysis index by comparing serum color to the reference card
+
+Step 4: Verify Collection Time Against Test Stability
+Compare the collection timestamp on the requisition to the current time and confirm the
+elapsed time does not exceed the stability window for the ordered test, for example 2
+hours for an ammonia level drawn on ice.
+
+Step 5: Apply Rejection Criteria if Any Fail
+Reject the specimen if any of the following apply: mislabeling, Quantity Not Sufficient,
+clotted anticoagulated specimen, gross hemolysis incompatible with the ordered test, or
+expired stability window. Record the specific rejection reason in the laboratory
+information system.
+
+Step 6: Notify the Ordering Location of a Rejection
+Call the ordering unit or clinic to report the rejection and the specific reason within 30
+minutes of the rejection decision, and document the name of the person notified and the
+time of the call.
+
+Step 7: Accession the Specimen
+For a specimen passing all criteria, assign the unique accession number, enter the
+patient, order, and specimen type information into the laboratory information system, and
+print the aliquot labels required for testing.
+
+Step 8: Sort and Route the Specimen
+Sort the accessioned specimen to the correct testing section based on the ordered panel,
+and place time-sensitive specimens, such as those requiring processing within 1 hour, in
+the priority routing lane.
+
+Step 9: Log the Chain of Custody for Applicable Specimens
+For any specimen flagged for forensic or employment testing, complete the chain-of-custody
+form at every handoff point, including receiving, accessioning, and routing, with a
+signature and timestamp at each step.
+
+Step 10: Reconcile the Daily Rejection Count
+At the end of each shift, reconcile the total number of specimens rejected against the
+laboratory information system rejection log and forward any discrepancy to the Laboratory
+Supervisor before shift handoff.
+
+REFERENCES:
+- SOP-LAB-071: Cerebrospinal Fluid Specimen Handling
+- SOP-LAB-090: Biohazard Spill Response
+- CLIA 42 CFR 493.1242: Specimen Receipt and Accessioning
+- CAP Checklist GEN.40072: Specimen Rejection Criteria
+
+RECORDS:
+- Specimen Rejection Log, retained 2 years
+- Chain of Custody Form (Form LAB-055-A)
+
+REVISION HISTORY:
+Version 5.0 (05/06/2026): Lowered chemistry tube QNS threshold from 3 to 2 milliliters
+Version 4.2 (11/18/2025): Added priority routing lane for 1-hour specimens
+Version 4.0 (02/09/2024): Added chain-of-custody requirement for forensic specimens

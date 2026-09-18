@@ -1,0 +1,230 @@
+# Audit trail
+
+`src/audit.py` records who did what, when, and to which exact content, in a file an auditor
+can verify independently: `<output>/<job_id>/audit.jsonl`.
+
+It answers four questions:
+
+1. **Who did what, when?** — one time-stamped entry per action, with the actor the application
+   recorded.
+2. **To which content?** — every content event carries the SHA-256 of the exact
+   `training_module` + `assessment` it is about.
+3. **Did anything change after approval, and is the exported package the approved content?** —
+   `verify_job()` answers both, and says `None` rather than `True` when the question does not
+   apply yet.
+4. **Has the record itself been altered?** — each entry hashes the entry before it, and
+   optionally carries an HMAC over that hash.
+
+It is stdlib-only (`hashlib`, `hmac`, `json`, `fcntl`, `os`, `dataclasses`, `datetime`): the
+audit trail must not be able to fail because of a dependency.
+
+## What is recorded
+
+| Event | When | `content_hash` | `details` should carry |
+|---|---|---|---|
+| `job.created` | an SOP is accepted for processing | – | `source_filename`, request parameters |
+| `content.generated` | parse → generate → assess finished | **required** | question count, LLM enhancement summary |
+| `review.opened` | an SME opened the review page | – | nothing sensitive |
+| `content.edited` | an SME edit was accepted | **required** | `edits_count`, `edit_rounds` |
+| `content.approved` | a named human approved | **required** | `approved_by`, `role`, `edits_count` |
+| `package.exported` | a package/report was written | **required** | `package_sha256`, `format`, `scorm_version` |
+| `download.served` | a package left the server | – | `filename` |
+| `retention.deleted` | a job directory was swept | – | `job_id`, `head_hash`, `retention_seconds` |
+
+`content_hash` is required on the four content events because without it the trail cannot tie an
+approval to a package. Verification reports a content event that has none.
+
+`retention.deleted` goes to the **global** log (`<output>/audit-global.jsonl`, job id `_global`)
+via `global_log(output_folder)`, because the job's own log is deleted with the job. Record the
+job's last `head_hash` in its `details`: that is all that survives of the deleted trail.
+
+Never put an answer key, a learner's answers or document text in `details`. The trail says what
+happened; `job.json` and the transparency report hold the content.
+
+## Entry format
+
+One JSON object per line, appended, never rewritten:
+
+```json
+{"seq":4,"ts":"2026-09-17T09:12:44.512883+00:00","job_id":"3f9c…","event":"content.edited",
+ "actor":{"name":"Dana Reyes","role":"Quality Engineer","source":"web"},
+ "content_hash":"9a1f…","details":{"edits_count":3},
+ "prev_hash":"7c02…","hash":"0eee…","mac":"4650…"}
+```
+
+* `seq` — 1, 2, 3, … contiguous within a log.
+* `ts` — UTC ISO-8601 with microseconds and an explicit `+00:00`. Server clock (see limits).
+* `actor.source` — `web`, `cli` or `system`. `system` is the application itself, not a person.
+* `hash` — `sha256(canonical_json(entry without hash and mac))`, where `canonical_json` is
+  `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`. The line on disk
+  is that same canonical encoding of the full entry, so a line re-hashes to itself byte for byte.
+* `prev_hash` — the previous entry's `hash`; `"0"*64` (`GENESIS`) for `seq` 1.
+* `mac` — `hmac_sha256(key, hash)` in hex when `AUDIT_HMAC_KEY` is set, otherwise `null`.
+
+A line with any missing or unexpected field is rejected by verification: a field outside the
+known set would not be covered by `hash`, which would make it a place to hide un-hashed content.
+
+### Appending
+
+`AuditLog.append()` validates everything *before* touching the file (known event, non-empty actor
+name, allowed source, JSON-faithful `details`, hex `content_hash`), then takes an exclusive
+`fcntl.flock`, reads the tail, writes exactly one line with `O_APPEND`, `fsync`s and releases.
+Eight processes appending 25 entries each produce one valid 200-entry chain
+(`tests/test_audit.py`). Nothing in the module ever rewrites, truncates or reorders the file — a
+damaged line is left in place and reported, never cleaned up.
+
+## What verification proves
+
+`AuditLog.verify()` checks the chain and the MACs only. `verify_job(job_dir, job_id, key)` adds
+the workflow semantics. Both return a `VerificationResult`; `ok` is true only when nothing at all
+was found, and `problems` lists every finding, of two kinds:
+
+**Integrity** — the file was altered:
+
+* a field changed anywhere in an entry (its hash no longer matches its contents);
+* an entry deleted, inserted or reordered (the next `prev_hash` no longer links);
+* a line corrupted, malformed, or carrying an extra field;
+* a line left incomplete by an interrupted write or a mid-line truncation;
+* with a key: a forged entry with no MAC, with a MAC from a different key, or a whole log
+  regenerated by someone who did not have the key.
+
+**Consistency** — the file is intact but describes a job that broke its own rules:
+
+* `seq` not contiguous from 1, or a timestamp going backwards, or one that is not UTC ISO-8601;
+* an event outside the known vocabulary, or a trail that does not start at `job.created`;
+* an entry carrying another job's id;
+* a content event with no `content_hash`;
+* **content edited after the last approval** with no later approval;
+* **an exported package that is not the approved content** — also reported as
+  `package_matches_approval: false`.
+
+`package_matches_approval` is tri-state and must be shown that way: `true`/`false` when the trail
+holds an approval followed by an export, `null` when there is no approval, or no export after the
+last one. "Not applicable" and "does not match" must never be displayed as the same thing.
+
+An **approval entry (`content.approved`) with no `package.exported` after it** is not a corrupted
+trail — it means the export that was supposed to follow that approval failed (a full disk, an
+exporter bug, ...). `app.py`'s `/api/approve` appends `content.approved` first, because that
+append is the one action with no natural undo, but writes `approval.json` and flips `job.json`'s
+status to `approved` only *after* the export it triggers (including that export's own
+`package.exported` entry and the transparency report) has succeeded. If the export raises, nothing
+past `content.approved` is written: no `approval.json`, `job.json` still isn't `approved`, and the
+endpoint can be retried. The next successful approve+export appends a fresh `content.approved`
+followed by its own `package.exported`, and verification's semantics (above) then judge the trail
+by that *last* approval, so the failed attempt's dangling `content.approved` does not stop the
+trail from verifying `ok` once the retry succeeds.
+
+## What verification cannot prove
+
+* **Removal of whole trailing entries.** Delete the last *n* complete lines and what remains is a
+  valid chain — the file no longer contains the evidence that anything is missing. The chain can
+  only see a truncation that cuts a line in half. The fix is external: anchor `head_hash`
+  (see below). Nothing else in this module closes this hole, and no amount of hashing inside one
+  file can.
+* **An attacker with both disk access and the key.** They can rewrite the whole log into any
+  internally consistent story. The semantic checks catch clumsy rewrites (a gap, a backwards
+  timestamp, a missing `job.created`), and an anchored head hash catches the rest — but a
+  well-formed forgery signed with the real key is, by construction, indistinguishable. Keep the
+  key out of the job directory, ideally out of the machine that writes the log.
+* **That the timestamps are true.** `ts` is the server clock at the moment of the append. A wrong
+  or manipulated clock produces a perfectly valid chain of wrong times. The only check made here
+  is that time does not run backwards within a trail.
+* **That the actor is who they say.** Until accounts arrive (M2), `actor.name` is whatever the
+  application passed in — for an approval, the name the reviewer typed. The trail records a
+  claim of identity, not an authenticated one.
+* **That the log exists at all.** An attacker who deletes `audit.jsonl` leaves `verify_job`
+  reporting "empty or missing", which is a finding, not proof of what was lost. Retention of the
+  file itself is the customer's backup policy.
+
+## Anchoring the head hash
+
+`AuditLog.head_hash()` is the hash of the last entry — the single 64-character value that commits
+to the entire trail. Anchoring it anywhere the log's writer cannot reach afterwards turns
+"trailing entries removed" from undetectable into obvious. Three cheap anchors, in increasing
+strength:
+
+1. **Print it.** `python3 -m src.audit show <job_dir>` ends with `head_hash=…` on stderr; put it
+   in the approval e-mail, the batch record, the release note.
+2. **Ship it.** Two different anchors exist, at two different points in the trail, and they are
+   not the same value — do not compare them to each other:
+   * The package's `metadata.json` (`audit_head_hash`; every format — SCORM, JSON and standalone
+     HTML) carries the head hash **as of approval**: the hash of the `content.approved` entry
+     itself, computed before that approval's own export extends the chain. This is what "the
+     package holds the content a named human approved" means, and it never changes even if the
+     job is exported again later without a new approval.
+   * The transparency report (`transparency_report.html`/`.json`, `audit_trail.head_hash`) carries
+     the head hash **as of the export that produced it** — one or more entries later, since it is
+     built only after that export's own `package.exported` entry is appended (see "Using it from
+     the rest of the app" below).
+
+   To confirm a package is the content that was approved: run
+   `python3 -m src.audit show <job_dir>` and check that the `content.approved` entry's own `hash`
+   equals that package's `metadata.json` `audit_head_hash`. Comparing the report's head hash to
+   `metadata.json`'s `audit_head_hash` instead will normally show a *difference* of one entry (the
+   export's own `package.exported`) even when nothing at all is wrong — that difference is not a
+   finding.
+3. **Send it away.** Log it to a system the application cannot rewrite — syslog, a SIEM, the
+   customer's eQMS, a signed nightly digest. This is the only anchor that survives an attacker
+   with full disk access.
+
+## Relationship to 21 CFR Part 11
+
+**This is not a claim of Part 11 compliance.** It implements the direction Part 11 §11.10(e)
+points in — secure, computer-generated, time-stamped records of operator entries and actions that
+do not obscure previously recorded information — and supports ISO 13485 §4.2.5 / 21 CFR 820.180
+record-keeping. Part 11 also requires, and this module does not provide: authenticated unique
+user accounts and authority checks (M2), electronic signatures bound to their records with the
+printed name, date/time and meaning of the signature, signature manifestations in human-readable
+copies, and a validated system with documented change control. Customers validate this tool
+inside their own QMS; see `GOAL.md`'s non-goal on certification.
+
+## Using it from the rest of the app
+
+One `AuditLog` per job, for the life of the job:
+
+```python
+from src.audit import Actor, AuditLog, content_hash, file_hash, hmac_key_from_env
+
+log = AuditLog.for_job(job_dir, job_id, hmac_key_from_env())
+log.append("job.created", Actor("training-creator", "application", "system"),
+           {"source_filename": name, "num_questions": n})
+
+digest = content_hash(training_module.to_dict(), assessment.to_dict())
+log.append("content.generated", Actor("training-creator", "application", "system"),
+           {"questions": len(assessment.questions)}, digest)
+
+log.append("content.approved", Actor(approved_by, role, "web"),
+           {"approved_by": approved_by, "role": role, "edits_count": edits}, digest)
+
+log.append("package.exported", Actor("training-creator", "application", "system"),
+           {"package_sha256": file_hash(package_path), "format": "scorm",
+            "scorm_version": "1.2"}, digest)
+```
+
+Rules for integrators:
+
+* **Compute `content_hash` from the same dicts `job.json` stores** (`to_dict()` of the module and
+  the assessment, via `src/serialization.py`'s round-trip contract). Hash the content you are
+  *about to persist or export*, not a rebuilt approximation of it.
+* **Append after the state change succeeds**, not before — the trail records what happened.
+* **Never swallow a `ValueError`** from `append` by writing a degraded entry instead; it means the
+  caller passed something the record cannot faithfully hold.
+* **An append failure must not silently pass.** If the trail cannot be written, the action it
+  describes should fail loudly rather than complete unrecorded.
+* `hmac_key_from_env()` returns `None` when `AUDIT_HMAC_KEY` is unset. That is a supported
+  configuration (chain only, no MACs) — but say which one is in force wherever the trail is
+  presented, because it changes what verification proves.
+* Verification is read-only and cheap; the review page, the transparency report and the CLI can
+  all call `verify_job()` directly.
+
+## CLI
+
+```bash
+python3 -m src.audit verify outputs/<job_id>                 # VerificationResult as JSON; exit 1 if not ok
+python3 -m src.audit verify outputs/<job_id> --job-id 3f9c…  # default: the directory name
+python3 -m src.audit verify outputs/<job_id> --key-env AUDIT_HMAC_KEY
+python3 -m src.audit show   outputs/<job_id>                 # one line per entry; head_hash on stderr
+```
+
+`show` prints the intact entries even when the file is damaged, and reports the damage on stderr
+— an auditor needs to see what survived.

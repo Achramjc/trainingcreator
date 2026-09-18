@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SME Review - {{ module.title }}</title>
+<style>
+    * { box-sizing: border-box; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        margin: 0;
+        background: #f0f2f5;
+        color: #222;
+    }
+    header {
+        background: #2c3e50;
+        color: white;
+        padding: 16px 24px;
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 16px;
+    }
+    header h1 { font-size: 1.3em; margin: 0; flex: 1 1 auto; }
+    .badge {
+        display: inline-block;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 0.85em;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+    .badge.draft { background: #ffc107; color: #664d03; }
+    .badge.edited { background: #17a2b8; color: white; }
+    .badge.approved { background: #28a745; color: white; }
+    .header-stat { font-size: 0.85em; opacity: 0.9; }
+    .layout {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 0;
+        height: calc(100vh - 64px);
+    }
+    @media (max-width: 900px) {
+        .layout { grid-template-columns: 1fr; height: auto; }
+        .pane { height: 60vh; }
+    }
+    .pane { overflow-y: auto; padding: 16px; }
+    .source-pane {
+        background: #1e1e1e;
+        color: #d4d4d4;
+    }
+    .src-line {
+        display: flex;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: 'SFMono-Regular', Consolas, monospace;
+        font-size: 0.85em;
+        line-height: 1.5;
+        padding: 1px 4px;
+        border-radius: 3px;
+    }
+    .src-line .ln {
+        flex: 0 0 3.5em;
+        color: #6a737d;
+        user-select: none;
+        text-align: right;
+        margin-right: 12px;
+    }
+    .src-line.highlight { background: #5a4a00; }
+    .content-pane { background: #f0f2f5; }
+    .card {
+        background: white;
+        border-radius: 8px;
+        padding: 20px;
+        margin-bottom: 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .card h2 { margin-top: 0; font-size: 1.1em; color: #2c3e50; }
+    label.field-label { display: block; font-weight: 600; font-size: 0.85em; color: #555; margin: 10px 0 4px; }
+    input[type="text"], input[type="number"], textarea {
+        width: 100%;
+        padding: 8px 10px;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        font-size: 0.95em;
+        font-family: inherit;
+    }
+    textarea { min-height: 90px; resize: vertical; font-family: 'SFMono-Regular', Consolas, monospace; font-size: 0.8em; }
+    .row { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+    .row input[type="text"] { flex: 1; }
+    .remove-btn, .add-btn, .show-source {
+        background: #eee;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        padding: 4px 10px;
+        cursor: pointer;
+        font-size: 0.85em;
+    }
+    .remove-btn { color: #c62828; }
+    .add-btn { color: #2e7d32; margin-top: 6px; }
+    .show-source { color: #1565c0; text-decoration: none; margin-left: 8px; }
+    .question-block { border: 1px solid #e0e0e0; border-radius: 6px; padding: 14px; margin-bottom: 14px; }
+    .question-block h3 { margin: 0 0 8px; font-size: 0.95em; }
+    .option-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+    .option-row input[type="text"] { flex: 1; }
+    .meta-line { font-size: 0.8em; color: #777; margin-bottom: 6px; }
+    .btn-primary {
+        background: #667eea; color: white; border: none; border-radius: 6px;
+        padding: 12px 24px; font-size: 1em; font-weight: 600; cursor: pointer; margin-top: 8px;
+    }
+    .btn-primary:hover { background: #5568d3; }
+    .btn-approve { background: #28a745; }
+    .btn-approve:hover { background: #218838; }
+    .status-msg { margin-top: 10px; padding: 10px; border-radius: 6px; display: none; font-size: 0.9em; }
+    .status-msg.show { display: block; }
+    .status-msg.ok { background: #e8f5e9; color: #2e7d32; border: 1px solid #4caf50; }
+    .status-msg.err { background: #ffebee; color: #c62828; border: 1px solid #ef5350; }
+    .approval-box { background: #e8f5e9; border: 1px solid #4caf50; border-radius: 6px; padding: 14px; margin-bottom: 14px; }
+    .download-link { display: inline-block; margin-top: 8px; color: #1565c0; }
+    .audit-status-ok { color: #218838; font-weight: 700; }
+    .audit-status-failed { color: #c62828; font-weight: 700; }
+    .audit-problem-list { color: #c62828; margin: 6px 0; padding-left: 18px; font-size: 0.85em; }
+    .head-hash-code {
+        font-family: 'SFMono-Regular', Consolas, monospace;
+        font-size: 0.82em;
+        word-break: break-all;
+        background: #f0f2f5;
+        padding: 2px 4px;
+        border-radius: 3px;
+    }
+    .copy-btn {
+        background: #eee; border: 1px solid #ccc; border-radius: 4px;
+        padding: 2px 10px; cursor: pointer; font-size: 0.8em; margin-left: 8px;
+    }
+    #audit-trail-container table {
+        width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.8em;
+    }
+    #audit-trail-container th, #audit-trail-container td {
+        border: 1px solid #eee; padding: 4px 6px; text-align: left; vertical-align: top;
+    }
+    #audit-trail-container th { background: #f5f5f5; }
+    /* Input-document scan banner. Deliberately the loudest thing on the page
+       when it appears: the SME is the last line of defence against a document
+       written to steer the training it generates. */
+    .scan-banner {
+        border-radius: 6px; padding: 14px 16px; margin-bottom: 14px;
+        border: 2px solid #dc3545; background: #f8d7da; color: #721c24;
+    }
+    .scan-banner.low { border-color: #ffc107; background: #fff3cd; color: #6b5200; }
+    .scan-banner h2 { margin: 0 0 6px; font-size: 1.02em; }
+    .scan-banner table {
+        width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.82em;
+        background: #fff;
+    }
+    .scan-banner th, .scan-banner td {
+        border: 1px solid #e3c4c4; padding: 4px 6px; text-align: left;
+        vertical-align: top;
+    }
+    .scan-banner td.scan-excerpt {
+        font-family: 'SFMono-Regular', Consolas, monospace; word-break: break-word;
+    }
+    .scan-banner .scan-line-link { color: #1565c0; text-decoration: none; }
+</style>
+</head>
+<body>
+
+<script type="application/json" id="module-data">{{ module | tojson }}</script>
+<script type="application/json" id="assessment-data">{{ assessment | tojson }}</script>
+
+<header>
+    <h1>SME Review: {{ module.title or "Untitled Module" }}</h1>
+    <span class="badge {{ status }}" id="status-badge">{{ status }}</span>
+    <span class="header-stat">Edits so far: <strong id="edits-count-display">{{ edits_count }}</strong></span>
+    <span class="header-stat">Passing score: <strong>{{ assessment.passing_score }}%</strong></span>
+    <span class="header-stat">Requested questions: <strong>{{ assessment.requested_questions }}</strong></span>
+</header>
+
+<div class="layout">
+    <div class="pane source-pane" id="source-pane">
+        {% for line in source_lines %}
+        <div class="src-line" id="line-{{ loop.index }}"><span class="ln">{{ loop.index }}</span><span class="lt">{{ line }}</span></div>
+        {% endfor %}
+        {% if not source_lines %}
+        <p style="color:#aaa;">No source document text is available for this job.</p>
+        {% endif %}
+    </div>
+
+    <div class="pane content-pane">
+
+        {% if injection_scan and injection_scan.risk and injection_scan.risk != 'none' %}
+        {# Everything below is document-derived and Jinja-escaped. Excerpts are
+           already rendered with invisible characters shown as <U+XXXX> markers by
+           src/injection_scan.visible(), so a zero-width payload cannot ride into
+           this page inside the warning about it. #}
+        <div class="scan-banner {{ injection_scan.risk }}" id="injection-scan-banner">
+            <h2>
+                {% if injection_scan.risk == 'high' %}
+                ⚠ This source document contains text aimed at an automated system
+                {% else %}
+                ⚠ Check these lines of the source document
+                {% endif %}
+            </h2>
+            <p style="margin:4px 0;">
+                Input scan risk: <strong>{{ injection_scan.risk }}</strong>.
+                {{ injection_scan.summary }}
+            </p>
+            {% if injection_scan.risk == 'high' %}
+            <p style="margin:4px 0;">
+                The optional LLM enhancement layer was <strong>not run</strong> on
+                this document, whether or not it is enabled. The content below was
+                produced by the deterministic pipeline, which does not follow
+                instructions found in a document. Read the flagged lines before
+                you approve: a document that tries to steer a model may also be
+                trying to steer you.
+            </p>
+            {% else %}
+            <p style="margin:4px 0;">
+                Nothing here stops generation, and the LLM layer (if enabled) still
+                ran. Procedure text rarely needs a URL, an e-mail address or
+                markup; confirm each flagged line belongs in training content.
+            </p>
+            {% endif %}
+            <table>
+                <thead><tr><th>Line</th><th>Finding</th><th>Text</th></tr></thead>
+                <tbody>
+                {% for finding in injection_scan.findings %}
+                <tr>
+                    <td>
+                        <a class="scan-line-link" href="#line-{{ finding.line }}"
+                           onclick="scrollAndHighlight({{ finding.line }}, {{ finding.line }}); return false;">{{ finding.line }}</a>
+                    </td>
+                    <td>{{ finding.kind }}{% if finding.description %}<br><span style="font-weight:400;">{{ finding.description }}</span>{% endif %}</td>
+                    <td class="scan-excerpt">{{ finding.excerpt }}</td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+
+        {% if approval %}
+        <div class="approval-box">
+            <strong>Approved</strong> by {{ approval.approved_by }} ({{ approval.role }}) on
+            {{ approval.approved_at }}.
+            {% if approval.notes %}<br>Notes: {{ approval.notes }}{% endif %}
+        </div>
+        {% endif %}
+
+        <div class="card">
+            <h2>Module</h2>
+            <label class="field-label" for="module-title">Title</label>
+            <input type="text" id="module-title" value="{{ module.title }}">
+
+            <label class="field-label">Learning objectives</label>
+            <div id="objectives-list">
+                {% for obj in module.learning_objectives %}
+                <div class="row">
+                    <input type="text" class="objective-input" value="{{ obj }}">
+                    <button type="button" class="remove-btn" onclick="this.parentElement.remove()">Remove</button>
+                </div>
+                {% endfor %}
+            </div>
+            <button type="button" class="add-btn" onclick="addObjective()">+ Add objective</button>
+        </div>
+
+        <div class="card">
+            <h2>Sections</h2>
+            {% for section in module.sections %}
+            <div class="section-block">
+                <label class="field-label">{{ section.title or section.id }}</label>
+                <textarea class="section-content">{{ section.content }}</textarea>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="card">
+            <h2>Assessment</h2>
+            <label class="field-label" for="passing-score">Passing score (%)</label>
+            <input type="number" id="passing-score" min="1" max="100" value="{{ assessment.passing_score }}">
+
+            <h3 style="margin-top:18px;">Questions (minimum {{ min_questions }})</h3>
+            <p class="meta-line" id="layout-note" style="display:none;">
+                Saving may re-order options: which option is correct is your call, but where it
+                sits in the list is chosen by the server so the quiz can't be passed by clicking
+                the same position every time.
+            </p>
+            <div id="questions-container">
+            {% for q in assessment.questions %}
+            <div class="question-block">
+                <div class="meta-line">Question {{ loop.index }} &middot; {{ q.type }}
+                    {% if q.source_ref and q.source_ref.source_lines %}
+                    <a href="#" class="show-source"
+                       onclick="scrollAndHighlight({{ q.source_ref.source_lines[0] }}, {{ q.source_ref.source_lines[1] }}); return false;">
+                        Show source (lines {{ q.source_ref.source_lines[0] }}&ndash;{{ q.source_ref.source_lines[1] }})
+                    </a>
+                    {% endif %}
+                </div>
+                <label class="field-label">Question text</label>
+                <input type="text" class="question-text" value="{{ q.text }}">
+
+                <label class="field-label">Options (select the correct one)</label>
+                <div class="options-list">
+                    {% for opt in q.options %}
+                    <div class="option-row">
+                        <input type="radio" name="correct-{{ q.id }}" value="{{ loop.index0 }}"
+                               {% if loop.index0 == q.correct_answer %}checked{% endif %}>
+                        <input type="text" class="option-text" value="{{ opt }}">
+                        <button type="button" class="remove-btn" onclick="removeOption(this)">Remove</button>
+                    </div>
+                    {% endfor %}
+                </div>
+                <button type="button" class="add-btn" onclick="addOption(this)">+ Add option</button>
+
+                <label class="field-label">Explanation (SME/audit only - never shown to learners)</label>
+                <textarea class="question-explanation">{{ q.explanation }}</textarea>
+            </div>
+            {% endfor %}
+            </div>
+        </div>
+
+        <div class="card">
+            <button type="button" class="btn-primary" id="save-btn" onclick="submitReview()">Save edits</button>
+            <div class="status-msg" id="review-status"></div>
+        </div>
+
+        <div class="card">
+            <h2>Approve</h2>
+            {% if status == 'approved' %}
+            <p>This job has already been approved. Editing it will require a new approval.</p>
+            {% else %}
+            <label class="field-label" for="approved-by">Your name</label>
+            <input type="text" id="approved-by" placeholder="Jane Doe">
+            <label class="field-label" for="approver-role">Role</label>
+            <input type="text" id="approver-role" placeholder="Subject Matter Expert">
+            <label class="field-label" for="approval-notes">Notes (optional)</label>
+            <textarea id="approval-notes" style="min-height:60px;"></textarea>
+            <button type="button" class="btn-primary btn-approve" id="approve-btn" onclick="submitApproval()">Approve</button>
+            {% endif %}
+            <div class="status-msg" id="approve-status"></div>
+        </div>
+
+        <div class="card">
+            <h2>Audit trail</h2>
+            <div id="audit-trail-container">
+                <p class="meta-line">Loading audit trail&hellip;</p>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+    var JOB_ID = {{ job_id | tojson }};
+    var TOKEN = {{ token | tojson }};
+    var originalModule = JSON.parse(document.getElementById('module-data').textContent);
+    var originalAssessment = JSON.parse(document.getElementById('assessment-data').textContent);
+
+    function scrollAndHighlight(start, end) {
+        document.querySelectorAll('.src-line.highlight').forEach(function (el) {
+            el.classList.remove('highlight');
+        });
+        var first = null;
+        for (var i = start; i <= end; i++) {
+            var el = document.getElementById('line-' + i);
+            if (el) {
+                el.classList.add('highlight');
+                if (!first) { first = el; }
+            }
+        }
+        if (first) { first.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+    }
+
+    function addObjective() {
+        var list = document.getElementById('objectives-list');
+        var row = document.createElement('div');
+        row.className = 'row';
+        row.innerHTML = '<input type="text" class="objective-input" value="">' +
+            '<button type="button" class="remove-btn" onclick="this.parentElement.remove()">Remove</button>';
+        list.appendChild(row);
+        row.querySelector('input').focus();
+    }
+
+    function addOption(button) {
+        var list = button.previousElementSibling;
+        var rows = list.querySelectorAll('.option-row');
+        if (rows.length >= 4) {
+            alert('A question may have at most 4 options.');
+            return;
+        }
+        var name = rows[0].querySelector('input[type=radio]').name;
+        var row = document.createElement('div');
+        row.className = 'option-row';
+        row.innerHTML = '<input type="radio" name="' + name + '" value="' + rows.length + '">' +
+            '<input type="text" class="option-text" value="">' +
+            '<button type="button" class="remove-btn" onclick="removeOption(this)">Remove</button>';
+        list.appendChild(row);
+        row.querySelector('input[type=text]').focus();
+    }
+
+    function removeOption(button) {
+        var row = button.parentElement;
+        var list = row.parentElement;
+        if (list.querySelectorAll('.option-row').length <= 2) {
+            alert('A question must have at least 2 options.');
+            return;
+        }
+        var wasChecked = row.querySelector('input[type=radio]').checked;
+        row.remove();
+        if (wasChecked) {
+            var first = list.querySelector('input[type=radio]');
+            if (first) { first.checked = true; }
+        }
+    }
+
+    function collectModule() {
+        var data = JSON.parse(JSON.stringify(originalModule));
+        data.title = document.getElementById('module-title').value;
+        data.learning_objectives = Array.prototype.map.call(
+            document.querySelectorAll('.objective-input'), function (el) { return el.value.trim(); }
+        ).filter(function (v) { return v.length > 0; });
+        var blocks = document.querySelectorAll('.section-block');
+        data.sections = Array.prototype.map.call(blocks, function (el, idx) {
+            var orig = data.sections[idx] || {};
+            var copy = Object.assign({}, orig);
+            copy.content = el.querySelector('textarea').value;
+            return copy;
+        });
+        return data;
+    }
+
+    function collectAssessment() {
+        var data = JSON.parse(JSON.stringify(originalAssessment));
+        var scoreEl = document.getElementById('passing-score');
+        data.passing_score = parseInt(scoreEl.value, 10);
+        var blocks = document.querySelectorAll('.question-block');
+        data.questions = Array.prototype.map.call(blocks, function (el, idx) {
+            var orig = data.questions[idx] || {};
+            var copy = Object.assign({}, orig);
+            copy.text = el.querySelector('.question-text').value.trim();
+            var rows = el.querySelectorAll('.option-row');
+            copy.options = Array.prototype.map.call(rows, function (r) {
+                return r.querySelector('.option-text').value.trim();
+            });
+            var correctIndex = 0;
+            Array.prototype.forEach.call(rows, function (r, i) {
+                if (r.querySelector('input[type=radio]').checked) { correctIndex = i; }
+            });
+            copy.correct_answer = correctIndex;
+            copy.explanation = el.querySelector('.question-explanation').value;
+            return copy;
+        });
+        return data;
+    }
+
+    function showMessage(elId, ok, text) {
+        var el = document.getElementById(elId);
+        el.className = 'status-msg show ' + (ok ? 'ok' : 'err');
+        el.textContent = text;
+    }
+
+    // Rebuilds the question editor from an Assessment.to_dict()-shaped
+    // object using DOM nodes (never innerHTML with interpolated option
+    // text), so SOP/SME text can never be interpreted as markup here either.
+    // Needed after a save: the server re-lays-out answer positions
+    // server-side (see _relayout_assessment_answers in app.py) - which
+    // option is correct never moves, but *where* it sits in the list can -
+    // so the page must reflect the saved state, not what was last typed.
+    function buildOptionRow(qid, index, text, checked) {
+        var row = document.createElement('div');
+        row.className = 'option-row';
+
+        var radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'correct-' + qid;
+        radio.value = String(index);
+        radio.checked = !!checked;
+        row.appendChild(radio);
+
+        var input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'option-text';
+        input.value = text;
+        row.appendChild(input);
+
+        var removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'remove-btn';
+        removeBtn.textContent = 'Remove';
+        removeBtn.addEventListener('click', function () { removeOption(removeBtn); });
+        row.appendChild(removeBtn);
+
+        return row;
+    }
+
+    function buildQuestionBlock(q, index) {
+        var block = document.createElement('div');
+        block.className = 'question-block';
+
+        var meta = document.createElement('div');
+        meta.className = 'meta-line';
+        meta.appendChild(document.createTextNode(
+            'Question ' + (index + 1) + ' · ' + q.type + ' '));
+        if (q.source_ref && q.source_ref.source_lines) {
+            var start = q.source_ref.source_lines[0];
+            var end = q.source_ref.source_lines[1];
+            var link = document.createElement('a');
+            link.href = '#';
+            link.className = 'show-source';
+            link.textContent = 'Show source (lines ' + start + '–' + end + ')';
+            link.addEventListener('click', function (e) {
+                e.preventDefault();
+                scrollAndHighlight(start, end);
+            });
+            meta.appendChild(link);
+        }
+        block.appendChild(meta);
+
+        var textLabel = document.createElement('label');
+        textLabel.className = 'field-label';
+        textLabel.textContent = 'Question text';
+        block.appendChild(textLabel);
+
+        var textInput = document.createElement('input');
+        textInput.type = 'text';
+        textInput.className = 'question-text';
+        textInput.value = q.text;
+        block.appendChild(textInput);
+
+        var optsLabel = document.createElement('label');
+        optsLabel.className = 'field-label';
+        optsLabel.textContent = 'Options (select the correct one)';
+        block.appendChild(optsLabel);
+
+        var optsList = document.createElement('div');
+        optsList.className = 'options-list';
+        (q.options || []).forEach(function (opt, i) {
+            optsList.appendChild(buildOptionRow(q.id, i, opt, i === q.correct_answer));
+        });
+        block.appendChild(optsList);
+
+        var addBtn = document.createElement('button');
+        addBtn.type = 'button';
+        addBtn.className = 'add-btn';
+        addBtn.textContent = '+ Add option';
+        addBtn.addEventListener('click', function () { addOption(addBtn); });
+        block.appendChild(addBtn);
+
+        var explLabel = document.createElement('label');
+        explLabel.className = 'field-label';
+        explLabel.textContent = 'Explanation (SME/audit only - never shown to learners)';
+        block.appendChild(explLabel);
+
+        var expl = document.createElement('textarea');
+        expl.className = 'question-explanation';
+        expl.value = q.explanation || '';
+        block.appendChild(expl);
+
+        return block;
+    }
+
+    function renderQuestions(assessmentData) {
+        var container = document.getElementById('questions-container');
+        container.innerHTML = '';
+        (assessmentData.questions || []).forEach(function (q, idx) {
+            container.appendChild(buildQuestionBlock(q, idx));
+        });
+    }
+
+    function submitReview() {
+        var btn = document.getElementById('save-btn');
+        btn.disabled = true;
+        fetch('/api/review/' + encodeURIComponent(JOB_ID) + '?t=' + encodeURIComponent(TOKEN), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ module: collectModule(), assessment: collectAssessment() })
+        }).then(function (resp) {
+            return resp.json().then(function (data) { return { ok: resp.ok, data: data }; });
+        }).then(function (result) {
+            btn.disabled = false;
+            if (!result.ok) {
+                showMessage('review-status', false, 'Error: ' + (result.data.error || 'save failed'));
+                return;
+            }
+            originalModule = collectModule();
+            // Use the server's re-laid-out assessment, not what was last
+            // typed: the server may have moved correct options to new
+            // positions (see _relayout_assessment_answers in app.py).
+            originalAssessment = result.data.assessment;
+            renderQuestions(originalAssessment);
+            document.getElementById('passing-score').value = originalAssessment.passing_score;
+            document.getElementById('layout-note').style.display = 'block';
+            document.getElementById('status-badge').textContent = result.data.status;
+            document.getElementById('status-badge').className = 'badge ' + result.data.status;
+            document.getElementById('edits-count-display').textContent = result.data.edits_count;
+            showMessage('review-status', true,
+                'Saved. ' + result.data.edits_count + ' field(s) changed from the original generation. ' +
+                'Updated package: ' + result.data.download_url);
+        }).catch(function (err) {
+            btn.disabled = false;
+            showMessage('review-status', false, 'Error: ' + err);
+        });
+    }
+
+    function submitApproval() {
+        var approvedBy = document.getElementById('approved-by').value;
+        var role = document.getElementById('approver-role').value;
+        var notes = document.getElementById('approval-notes').value;
+        var btn = document.getElementById('approve-btn');
+        btn.disabled = true;
+        fetch('/api/approve/' + encodeURIComponent(JOB_ID) + '?t=' + encodeURIComponent(TOKEN), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ approved_by: approvedBy, role: role, notes: notes })
+        }).then(function (resp) {
+            return resp.json().then(function (data) { return { ok: resp.ok, data: data }; });
+        }).then(function (result) {
+            btn.disabled = false;
+            if (!result.ok) {
+                showMessage('approve-status', false, 'Error: ' + (result.data.error || 'approval failed'));
+                return;
+            }
+            document.getElementById('status-badge').textContent = 'approved';
+            document.getElementById('status-badge').className = 'badge approved';
+            showMessage('approve-status', true,
+                'Approved by ' + result.data.approval.approved_by + '. Updated package: ' +
+                result.data.download_url);
+        }).catch(function (err) {
+            btn.disabled = false;
+            showMessage('approve-status', false, 'Error: ' + err);
+        });
+    }
+
+    // Audit trail panel: GET /api/audit/<job_id>?t=<token> (see
+    // src/audit.py / docs/AUDIT_TRAIL.md for what verification does and
+    // does not prove). Built with DOM nodes, never innerHTML with
+    // interpolated data - the same rule as the question editor above,
+    // because actor names and audit details ultimately come from SOP/SME
+    // input too.
+    function loadAuditTrail() {
+        var container = document.getElementById('audit-trail-container');
+        fetch('/api/audit/' + encodeURIComponent(JOB_ID) + '?t=' + encodeURIComponent(TOKEN))
+            .then(function (resp) {
+                if (resp.status === 404) { return null; }
+                if (!resp.ok) { throw new Error('HTTP ' + resp.status); }
+                return resp.json();
+            })
+            .then(renderAuditTrail)
+            .catch(function (err) {
+                container.textContent = '';
+                var p = document.createElement('p');
+                p.className = 'status-msg show err';
+                p.textContent = 'Could not load audit trail: ' + err;
+                container.appendChild(p);
+            });
+    }
+
+    function _auditModeStatement(mode) {
+        if (mode === 'hmac') {
+            return 'HMAC mode: detects alteration of recorded entries, and regeneration ' +
+                'without the server key is detected.';
+        }
+        if (mode === 'chain-only') {
+            return 'Chain-only mode: detects alteration of recorded entries; does not by ' +
+                'itself prove entries were not removed from the end or the whole log ' +
+                'regenerated.';
+        }
+        return 'Unknown verification mode.';
+    }
+
+    function renderAuditTrail(data) {
+        var container = document.getElementById('audit-trail-container');
+        container.textContent = '';
+
+        if (!data) {
+            var none = document.createElement('p');
+            none.className = 'meta-line';
+            none.textContent = 'No audit trail is available for this job yet.';
+            container.appendChild(none);
+            return;
+        }
+
+        var verification = data.verification || {};
+        var entries = data.entries || [];
+        var hmacMode = data.hmac_mode || 'unknown';
+
+        var statusLine = document.createElement('p');
+        var statusSpan = document.createElement('span');
+        statusSpan.className = verification.ok ? 'audit-status-ok' : 'audit-status-failed';
+        statusSpan.textContent = verification.ok ? 'INTACT' : 'FAILED VERIFICATION';
+        statusLine.appendChild(document.createTextNode('Status: '));
+        statusLine.appendChild(statusSpan);
+        container.appendChild(statusLine);
+
+        var pmaText;
+        if (verification.package_matches_approval === true) { pmaText = 'yes'; }
+        else if (verification.package_matches_approval === false) { pmaText = 'no'; }
+        else { pmaText = 'not applicable'; }
+
+        var meta = document.createElement('p');
+        meta.className = 'meta-line';
+        meta.textContent = 'Entries: ' + entries.length +
+            ' · Package matches approval: ' + pmaText;
+        container.appendChild(meta);
+
+        var modeLine = document.createElement('p');
+        modeLine.className = 'meta-line';
+        modeLine.textContent = 'Verification mode: ' + hmacMode + ' — ' +
+            _auditModeStatement(hmacMode);
+        container.appendChild(modeLine);
+
+        var hashLine = document.createElement('p');
+        hashLine.appendChild(document.createTextNode('Head hash: '));
+        var hashCode = document.createElement('code');
+        hashCode.className = 'head-hash-code';
+        hashCode.textContent = verification.head_hash || '';
+        hashLine.appendChild(hashCode);
+        var copyBtn = document.createElement('button');
+        copyBtn.type = 'button';
+        copyBtn.className = 'copy-btn';
+        copyBtn.textContent = 'Copy';
+        copyBtn.addEventListener('click', function () {
+            var text = verification.head_hash || '';
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).catch(function () {});
+            }
+            copyBtn.textContent = 'Copied';
+            setTimeout(function () { copyBtn.textContent = 'Copy'; }, 1500);
+        });
+        hashLine.appendChild(copyBtn);
+        container.appendChild(hashLine);
+
+        if (verification.problems && verification.problems.length) {
+            var problemsList = document.createElement('ul');
+            problemsList.className = 'audit-problem-list';
+            verification.problems.forEach(function (problem) {
+                var li = document.createElement('li');
+                li.textContent = problem;
+                problemsList.appendChild(li);
+            });
+            container.appendChild(problemsList);
+        }
+
+        var table = document.createElement('table');
+        var thead = document.createElement('thead');
+        var headRow = document.createElement('tr');
+        ['Seq', 'Timestamp', 'Event', 'Actor', 'Content hash', 'Details'].forEach(function (h) {
+            var th = document.createElement('th');
+            th.textContent = h;
+            headRow.appendChild(th);
+        });
+        thead.appendChild(headRow);
+        table.appendChild(thead);
+
+        var tbody = document.createElement('tbody');
+        entries.forEach(function (entry) {
+            var row = document.createElement('tr');
+
+            var seqTd = document.createElement('td');
+            seqTd.textContent = entry.seq;
+            row.appendChild(seqTd);
+
+            var tsTd = document.createElement('td');
+            tsTd.textContent = entry.ts;
+            row.appendChild(tsTd);
+
+            var eventTd = document.createElement('td');
+            eventTd.textContent = entry.event;
+            row.appendChild(eventTd);
+
+            var actor = entry.actor || {};
+            var actorTd = document.createElement('td');
+            actorTd.textContent = (actor.name || '') + ' (' + (actor.role || '') + ', ' +
+                (actor.source || '') + ')';
+            row.appendChild(actorTd);
+
+            var hashTd = document.createElement('td');
+            var fullHash = entry.content_hash || '';
+            hashTd.textContent = fullHash ? fullHash.slice(0, 12) : '—';
+            if (fullHash) { hashTd.title = fullHash; }
+            row.appendChild(hashTd);
+
+            var detailsTd = document.createElement('td');
+            try {
+                detailsTd.textContent = JSON.stringify(entry.details || {});
+            } catch (e) {
+                detailsTd.textContent = '';
+            }
+            row.appendChild(detailsTd);
+
+            tbody.appendChild(row);
+        });
+        table.appendChild(tbody);
+        container.appendChild(table);
+    }
+
+    loadAuditTrail();
+</script>
+</body>
+</html>

@@ -313,6 +313,60 @@
             margin-bottom: 10px;
         }
 
+        .sample-intro {
+            color: #666;
+            margin-bottom: 20px;
+        }
+
+        .sample-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+        }
+
+        .sample-grid.empty::before {
+            content: "No samples available right now.";
+            color: #999;
+        }
+
+        .sample-card {
+            border: 2px solid #e0e7ff;
+            border-radius: 8px;
+            padding: 18px;
+            display: flex;
+            flex-direction: column;
+            background: #f8f9ff;
+        }
+
+        .sample-regime {
+            font-size: 0.8em;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            color: #667eea;
+            margin-bottom: 6px;
+        }
+
+        .sample-title {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+        }
+
+        .sample-desc {
+            color: #555;
+            font-size: 0.9em;
+            line-height: 1.4;
+            margin-bottom: 14px;
+            flex-grow: 1;
+        }
+
+        .sample-btn {
+            margin-top: 0;
+            padding: 10px 16px;
+            font-size: 0.95em;
+        }
+
         @media (max-width: 768px) {
             .header h1 {
                 font-size: 1.8em;
@@ -358,6 +412,13 @@
             </div>
         </div>
 
+        <div class="card" id="sampleGalleryCard">
+            <h2 style="margin-bottom: 10px; color: #333;">Try a Sample SOP</h2>
+            <p class="sample-intro">No document handy? Generate a training package from a
+                realistic sample SOP in one click, using the settings below.</p>
+            <div class="sample-grid" id="sampleGrid"></div>
+        </div>
+
         <div class="card">
             <h2 style="margin-bottom: 20px; color: #333;">Upload Your SOP or Work Instruction</h2>
 
@@ -393,7 +454,7 @@
                     <label for="scormVersion">SCORM Version</label>
                     <select id="scormVersion">
                         <option value="1.2" selected>SCORM 1.2 (Most Compatible)</option>
-                        <option value="2004">SCORM 2004</option>
+                        <option value="2004">SCORM 2004 (4th Edition)</option>
                     </select>
                 </div>
                 <div class="option-group">
@@ -450,7 +511,11 @@
                     <p style="margin: 0; color: #2e7d32;"><strong>✓ DRAFT Training Generated</strong> - Includes compliance questions, watermarks, and transparency report for review.</p>
                 </div>
                 <div class="results-grid" id="resultsGrid"></div>
-                <button class="btn download-btn" id="downloadBtn">Download Training Package</button>
+                <div style="background: #e3f2fd; padding: 18px; margin-bottom: 15px; border-radius: 6px; border: 2px solid #2196f3;">
+                    <p style="margin: 0 0 10px 0; color: #0d47a1;"><strong>Nothing here is ready for learners yet.</strong> A named human must review and approve it first.</p>
+                    <a class="btn" id="reviewLink" href="#" style="display:block; text-decoration:none; text-align:center; background: linear-gradient(135deg, #2196f3 0%, #1565c0 100%);">Review &amp; Approve</a>
+                </div>
+                <button class="btn download-btn" id="downloadBtn">Download DRAFT Package (unapproved)</button>
                 <button class="btn" id="transparencyBtn" style="background: linear-gradient(135deg, #2196f3 0%, #1976d2 100%); margin-top: 10px;">View Transparency Report</button>
             </div>
         </div>
@@ -464,6 +529,8 @@
         let selectedFile = null;
         let downloadUrl = null;
         let transparencyReportUrl = null;
+        let reviewUrl = null;
+        const reviewLink = document.getElementById('reviewLink');
 
         const uploadZone = document.getElementById('uploadZone');
         const fileInput = document.getElementById('fileInput');
@@ -475,6 +542,7 @@
         const progressFill = document.getElementById('progressFill');
         const statusMessage = document.getElementById('statusMessage');
         const results = document.getElementById('results');
+        const sampleGrid = document.getElementById('sampleGrid');
         const resultsGrid = document.getElementById('resultsGrid');
         const downloadBtn = document.getElementById('downloadBtn');
         const transparencyBtn = document.getElementById('transparencyBtn');
@@ -601,6 +669,10 @@
                 displayResults(data);
                 downloadUrl = data.download_url;
                 transparencyReportUrl = data.transparency_report_url;
+                reviewUrl = data.review_url;
+                if (reviewUrl) {
+                    reviewLink.href = reviewUrl;
+                }
 
                 showStatus('success', '✓ Training package generated successfully!');
 
@@ -664,6 +736,108 @@
         function sleep(ms) {
             return new Promise(resolve => setTimeout(resolve, ms));
         }
+
+        // --- Sample SOP gallery ---------------------------------------
+        // Renders the catalog from GET /api/samples and posts to
+        // POST /api/samples/<id>/generate with the form's current settings,
+        // reusing exactly the same result/review UI as a real upload.
+
+        function escapeHtml(value) {
+            const div = document.createElement('div');
+            div.textContent = value === null || value === undefined ? '' : String(value);
+            return div.innerHTML;
+        }
+
+        async function loadSamples() {
+            try {
+                const response = await fetch('/api/samples');
+                if (!response.ok) return;
+                const data = await response.json();
+                renderSamples(Array.isArray(data.samples) ? data.samples : []);
+            } catch (error) {
+                // The sample gallery is a convenience; the upload flow works
+                // fine without it (e.g. before the route is wired in, or if
+                // the request fails for any reason).
+            }
+        }
+
+        function renderSamples(samples) {
+            if (!samples.length) {
+                sampleGrid.classList.add('empty');
+                sampleGrid.innerHTML = '';
+                return;
+            }
+            sampleGrid.classList.remove('empty');
+            sampleGrid.innerHTML = samples.map((sample) => `
+                <div class="sample-card">
+                    <div class="sample-regime">${escapeHtml(sample.regime)} &middot; ${escapeHtml(sample.standard)}</div>
+                    <div class="sample-title">${escapeHtml(sample.title)}</div>
+                    <div class="sample-desc">${escapeHtml(sample.description)}</div>
+                    <button type="button" class="btn sample-btn" data-sample-id="${escapeHtml(sample.id)}">Generate Training</button>
+                </div>
+            `).join('');
+
+            sampleGrid.querySelectorAll('.sample-btn').forEach((btn) => {
+                btn.addEventListener('click', () => generateFromSample(btn.dataset.sampleId, btn));
+            });
+        }
+
+        async function generateFromSample(sampleId, btn) {
+            const formData = new FormData();
+            formData.append('num_questions', document.getElementById('numQuestions').value);
+            formData.append('passing_score', document.getElementById('passingScore').value);
+            formData.append('scorm_version', document.getElementById('scormVersion').value);
+            formData.append('output_format', document.getElementById('outputFormat').value);
+
+            progressContainer.classList.add('show');
+            results.classList.remove('show');
+            statusMessage.classList.remove('show');
+            generateBtn.disabled = true;
+            btn.disabled = true;
+
+            setProgress(0, 'Loading sample...');
+            await sleep(200);
+            setProgress(50, 'Generating training content...');
+
+            try {
+                const response = await fetch(`/api/samples/${encodeURIComponent(sampleId)}/generate`, {
+                    method: 'POST',
+                    body: formData
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.error || 'Processing failed');
+                }
+
+                setProgress(100, 'Complete!');
+                await sleep(400);
+
+                // Same result/review UI as an upload.
+                displayResults(data);
+                downloadUrl = data.download_url;
+                transparencyReportUrl = data.transparency_report_url;
+                reviewUrl = data.review_url;
+                if (reviewUrl) {
+                    reviewLink.href = reviewUrl;
+                }
+
+                showStatus('success', '✓ Training package generated from the sample SOP!');
+
+            } catch (error) {
+                setProgress(0, '');
+                showStatus('error', `Error: ${error.message}`);
+            } finally {
+                btn.disabled = false;
+                generateBtn.disabled = !selectedFile;
+                setTimeout(() => {
+                    progressContainer.classList.remove('show');
+                }, 1000);
+            }
+        }
+
+        loadSamples();
     </script>
 </body>
 </html>

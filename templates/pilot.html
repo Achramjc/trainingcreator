@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pilot metrics</title>
+<style>
+    * { box-sizing: border-box; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        margin: 0;
+        background: #f0f2f5;
+        color: #222;
+        padding: 24px;
+    }
+    h1 { color: #2c3e50; margin-top: 0; }
+    h2 { color: #2c3e50; font-size: 1.1em; margin: 28px 0 10px; }
+    p.subtitle { color: #555; max-width: 70em; }
+    .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 12px;
+        margin: 16px 0 28px;
+    }
+    .stat-card {
+        background: white;
+        border-radius: 8px;
+        padding: 16px;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .stat-card .label { font-size: 0.8em; color: #777; text-transform: uppercase; letter-spacing: 0.03em; }
+    .stat-card .value { font-size: 1.6em; font-weight: 700; color: #2c3e50; margin-top: 4px; }
+    .stat-card.headline { border: 2px solid #667eea; }
+    .stat-card.headline .value.pass { color: #218838; }
+    .stat-card.headline .value.fail { color: #c62828; }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        background: white;
+        border-radius: 8px;
+        overflow: hidden;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        margin-bottom: 28px;
+    }
+    th, td {
+        text-align: left;
+        padding: 8px 12px;
+        border-bottom: 1px solid #eee;
+        font-size: 0.9em;
+    }
+    th { background: #2c3e50; color: white; font-weight: 600; }
+    tr:last-child td { border-bottom: none; }
+    .badge {
+        display: inline-block;
+        padding: 2px 10px;
+        border-radius: 10px;
+        font-size: 0.8em;
+        font-weight: 600;
+        text-transform: uppercase;
+    }
+    .badge.draft { background: #ffc107; color: #664d03; }
+    .badge.edited { background: #17a2b8; color: white; }
+    .badge.approved { background: #28a745; color: white; }
+    .badge.unknown { background: #ccc; color: #333; }
+    .badge.audit-ok { background: #28a745; color: white; }
+    .badge.audit-failed { background: #dc3545; color: white; }
+    .badge.audit-none { background: #ccc; color: #333; }
+    a { color: #1565c0; }
+    .empty { color: #999; font-style: italic; padding: 12px; }
+    .audit-alert {
+        background: #f8d7da;
+        color: #721c24;
+        border: 2px solid #dc3545;
+        border-radius: 8px;
+        padding: 16px;
+        margin-bottom: 24px;
+    }
+    .audit-alert h2 { margin: 0 0 8px; color: #721c24; }
+    .audit-alert ul { margin: 8px 0 0; padding-left: 20px; }
+    .audit-alert code { background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+{% if metrics.jobs_with_failed_audit %}
+<div class="audit-alert">
+    <h2>&#9888; {{ metrics.jobs_with_failed_audit }} job(s) failed audit-trail verification</h2>
+    <p>The audit trail for these jobs did not verify intact (see <code>docs/AUDIT_TRAIL.md</code>).
+    Investigate before treating their approval records as trustworthy.</p>
+    <ul>
+        {% for failed in metrics.failed_audit_jobs %}
+        <li><strong>{{ failed.job_id }}</strong>:
+            {% if failed.problems %}{{ failed.problems | join('; ') }}{% else %}(no detail){% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+{% endif %}
+
+<h1>Pilot metrics</h1>
+<p class="subtitle">
+    Instrumentation for GOAL.md's M1 exit criterion: SMEs accept generated content with
+    &lt;30% edits. "Edit rate" below is the weighted edit rate across every
+    <strong>approved</strong> job (edits made vs. the size of the reviewable content) &mdash;
+    see <code>src/pilot_metrics.py</code> for the exact definition.
+</p>
+
+<div class="stats">
+    <div class="stat-card headline">
+        <div class="label">Edit rate (approved jobs)</div>
+        <div class="value {% if metrics.edit_rate is not none %}{{ 'pass' if metrics.edit_rate < 0.30 else 'fail' }}{% endif %}">
+            {% if metrics.edit_rate is not none %}{{ '%.1f'|format(metrics.edit_rate * 100) }}%{% else %}n/a{% endif %}
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Total jobs</div>
+        <div class="value">{{ metrics.total_jobs }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Unreadable jobs</div>
+        <div class="value">{{ metrics.unreadable_jobs }}</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Approval rate</div>
+        <div class="value">
+            {% if metrics.approval_rate is not none %}{{ '%.1f'|format(metrics.approval_rate * 100) }}%{% else %}n/a{% endif %}
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Median edits / approved job</div>
+        <div class="value">
+            {{ metrics.median_edits_per_approved_job if metrics.median_edits_per_approved_job is not none else 'n/a' }}
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Mean edits / approved job</div>
+        <div class="value">
+            {% if metrics.mean_edits_per_approved_job is not none %}{{ '%.2f'|format(metrics.mean_edits_per_approved_job) }}{% else %}n/a{% endif %}
+        </div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Median time to approve</div>
+        <div class="value">
+            {% if metrics.median_time_to_approve_s is not none %}{{ '%.0f'|format(metrics.median_time_to_approve_s) }}s{% else %}n/a{% endif %}
+        </div>
+    </div>
+</div>
+
+<h2>Jobs by status</h2>
+<table>
+    <tr><th>Status</th><th>Count</th></tr>
+    {% for status, count in metrics.jobs_by_status.items() %}
+    <tr><td><span class="badge {{ status }}">{{ status }}</span></td><td>{{ count }}</td></tr>
+    {% else %}
+    <tr><td colspan="2" class="empty">No jobs yet.</td></tr>
+    {% endfor %}
+</table>
+
+<h2>Edits by category (approved jobs, summed)</h2>
+<table>
+    <tr>
+        {% for key in metrics.edits_by_category.keys() %}
+        <th>{{ key }}</th>
+        {% endfor %}
+    </tr>
+    <tr>
+        {% for value in metrics.edits_by_category.values() %}
+        <td>{{ value }}</td>
+        {% endfor %}
+    </tr>
+</table>
+
+<h2>By source document</h2>
+<table>
+    <tr>
+        <th>Source document</th>
+        <th>Jobs</th>
+        <th>Approved</th>
+        <th>Approval rate</th>
+        <th>Mean edit rate</th>
+    </tr>
+    {% for name, bucket in metrics.by_source_document.items() %}
+    <tr>
+        <td>{{ name }}</td>
+        <td>{{ bucket.jobs }}</td>
+        <td>{{ bucket.approved }}</td>
+        <td>{% if bucket.approval_rate is not none %}{{ '%.1f'|format(bucket.approval_rate * 100) }}%{% else %}n/a{% endif %}</td>
+        <td>{% if bucket.mean_edit_rate is not none %}{{ '%.1f'|format(bucket.mean_edit_rate * 100) }}%{% else %}n/a{% endif %}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="empty">No source documents yet.</td></tr>
+    {% endfor %}
+</table>
+
+<h2>Jobs</h2>
+<table>
+    <tr>
+        <th>Job</th>
+        <th>Source document</th>
+        <th>Status</th>
+        <th>Questions</th>
+        <th>Edits</th>
+        <th>Edit rate</th>
+        <th>Edit rounds</th>
+        <th>Audit trail</th>
+        <th>Review</th>
+    </tr>
+    {% for job in metrics.jobs %}
+    <tr>
+        <td>{{ job.job_id[:8] }}</td>
+        <td>{{ job.source_filename or '(unknown)' }}</td>
+        <td><span class="badge {{ job.status }}">{{ job.status }}</span></td>
+        <td>{{ job.num_questions }}</td>
+        <td>{{ job.edits_count }}</td>
+        <td>{% if job.edit_rate is not none %}{{ '%.1f'|format(job.edit_rate * 100) }}%{% else %}n/a{% endif %}</td>
+        <td>{{ job.edit_rounds }}</td>
+        <td>
+            {% if job.audit_verified is none %}
+            <span class="badge audit-none" title="No audit trail recorded for this job">no trail</span>
+            {% elif job.audit_verified %}
+            <span class="badge audit-ok">verified</span>
+            {% else %}
+            <span class="badge audit-failed" title="{{ job.audit_problems | join('; ') }}">failed</span>
+            {% endif %}
+        </td>
+        <td>
+            {% if review_urls.get(job.job_id) %}
+            <a href="{{ review_urls[job.job_id] }}">Open</a>
+            {% else %}
+            &mdash;
+            {% endif %}
+        </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="empty">No jobs yet.</td></tr>
+    {% endfor %}
+</table>
+
+</body>
+</html>
