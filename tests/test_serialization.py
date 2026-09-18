@@ -53,6 +53,17 @@ def test_assessment_round_trip(fixture_path, generator_cls):
     assert rebuilt.to_dict() == assessment.to_dict()
 
 
+def test_assessment_round_trip_restores_nonzero_leakage_count():
+    """A non-zero leakage_count must survive the review round-trip; a rebuild
+    that silently reset it to 0 would hide a residue the SME should see."""
+    sop = SOPParser().parse(str(FIXTURES[0]))
+    assessment = MedicalDeviceAssessmentGenerator().generate(sop, num_questions=8)
+    assessment.leakage_count = 3
+    rebuilt = assessment_from_dict(assessment.to_dict())
+    assert rebuilt.leakage_count == 3
+    assert rebuilt.to_dict() == assessment.to_dict()
+
+
 @pytest.mark.parametrize("fixture_path", FIXTURES)
 def test_assessment_round_trip_preserves_learner_payload(fixture_path):
     sop = SOPParser().parse(str(fixture_path))

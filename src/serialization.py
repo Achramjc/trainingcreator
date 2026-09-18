@@ -111,4 +111,5 @@ def assessment_from_dict(data: Optional[Dict]) -> Assessment:
     assessment.requested_questions = data.get(
         "requested_questions", len(assessment.questions))
     assessment.notes = list(data.get("notes") or [])
+    assessment.leakage_count = int(data.get("leakage_count", 0))
     return assessment
