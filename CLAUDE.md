@@ -26,7 +26,8 @@ src/injection_scan.py  deterministic scan of untrusted document text: instructio
 src/generator.py       TrainingGenerator → TrainingModule (sections as escaped HTML, objectives)
 src/assessments.py     AssessmentGenerator / MedicalDeviceAssessmentGenerator → Assessment
                        (deterministic, blueprint-selected, document-drawn distractors,
-                       joint answer-position search; min 5 questions)
+                       joint answer-position search; min 5 questions; register-matched
+                       purpose/scope options; no text answers two questions — `leakage_count`)
 src/answer_key.py      salted-hash learner keys + the client-side verifier JS (Python and JS
                        normalisers must stay identical — change both or neither)
 src/scorm_exporter.py  two distinct CAM bindings (1.2 / 2004 4th Ed), one API wrapper that finds
@@ -56,6 +57,10 @@ app.py                 Flask API: upload → generate → job.json → signed do
   `random.Random(seed)` instances only; never the `random` module functions.
 - **Document text is untrusted.** `html.escape` everything from the SOP before it enters HTML.
 - **Parser dict contracts are append-only.** Add keys; never rename or remove.
+- **No question gives another away.** Purpose/scope options all share the correct answer's
+  register (statement vs instruction); no correct answer is a distractor elsewhere; a statement
+  and its flip count as one piece of material. Residue is `Assessment.leakage_count` (0 on every
+  shipped document, n=5…12). `tests/test_assessments.py`.
 - **SME edits cannot bypass invariant 1.** `POST /api/review` re-runs the answer-position layout
   and rejects content a naive strategy would still pass. `tests/test_review.py`.
 - **Every generated sentence cites source lines.** Objectives, sections and questions carry
@@ -94,6 +99,7 @@ app.py                 Flask API: upload → generate → job.json → signed do
 | — | M2 — real application (accounts, DB, workers, server-side scoring) | on hold | owner chose to pilot M1 first |
 | 2026-09-17 | **M3 (partial) — audit trail** (owner's call: before M2) | **done** | 1378 tests collected (1373 pass, 5 opt-in/N.A. skips). Per-job hash-chained `audit.jsonl` (optional HMAC), a 9-entry lifecycle (7 distinct events) recorded from upload to download, approval recorded before it is written, package anchors the head hash, report/review page/pilot dashboard show verification. Independently verified: one altered character in an approver's name is caught at the right entry; export after an unapproved edit flags "package ≠ approved"; the on-disk report for an approved job says package-matches-approval (an independent code review caught that it previously could not, plus an approve-then-export-failure hole — both fixed and pinned). Limits: no external anchor (trailing-entry removal undetectable without one), server clock, unauthenticated actors pre-M2, not a Part 11 claim |
 | 2026-09-18 | **Security pass — real documents + prompt injection** | **done** | 107 real web-sourced procedures: 107/107 parsed and exported, 0 gameable, scanner 101 none / 6 low / 0 high. Document moved out of the system prompt; scanner + LLM gate + output filters; five adversarial fixtures; a control character in a title no longer breaks export. The checker's first probe found the scanner missed five obvious attacks — widened, re-measured, and `docs/SECURITY.md` records that a phrasing it misses should be assumed to exist |
+| 2026-09-18 | **Question quality — a human read of the output** | **done** | 1593 tests collected (1587 pass, 6 opt-in/N.A. skips). Three defects found by reading one gallery quiz: a purpose question whose answer was the only prose statement among step bodies; one altered warning driving two questions; step answers reused as other questions' distractors. Fixed by a register classifier, an answer-material ledger, and distractor repair that costs a question at most one option. Checker re-measured independently across 8 documents × 2 generators × n=5…12: 0 leaks, 0 shared material, 0 register tells; worst naive strategy unchanged at 62.5% vs 80. Cost: four-option items 74% of MC (was ~94%) on thin fixtures |
 | — | M3 — rest (Part 11 e-signature, revision-delta retraining, validation pack) | not started | |
 | — | M4 — market | not started | |
 
