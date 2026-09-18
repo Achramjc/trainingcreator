@@ -183,7 +183,7 @@ trainingcreator/
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.10+ (CI runs 3.10, 3.11 and 3.12)
 - See requirements.txt for dependencies
 
 ## License
