@@ -342,6 +342,21 @@ _TEXT_PATTERNS: Tuple[Tuple[str, "re.Pattern"], ...] = (
         r"(?:ignore|disregard|note|include|add|remember|output|write|say|do|"
         r"mark|state|make|set|use|read|follow|summaris\w+|summariz\w+)\b",
         re.IGNORECASE)),
+    # A leading vocative: a line that opens by naming its reader.  "Reviewer
+    # bot:", "Summarizer:", "AI:".  What follows the colon has to read as an
+    # instruction - a second person, a politeness marker, or an imperative verb -
+    # because "Model: 4500-B rev 3 pump assembly" and "Assistant: J. Doe" are an
+    # equipment header and a job title, and real SOPs carry both.
+    (KIND_AI_ADDRESSED, re.compile(
+        r"^\s*(?:reviewer|grader|summari[sz]er|summari[sz]ing\s+agent|assistant|"
+        r"model|bot|ai|a\.i\.|llm|claude|chatgpt|gpt|copilot|gemini)"
+        r"(?:\s+bot|\s+assistant|\s+model)?\s*:\s*"
+        r"(?=[^\n]{0,80}?\b(?:you|your|please|kindly)\b"
+        r"|\s*(?:ignore|disregard|include|add|insert|mark|make|set|force|ensure|"
+        r"keep|state|say|tell|write|output|generate|summaris\w+|summariz\w+|note|"
+        r"remember|use|approve|skip|do|don'?t|always|never|when|whenever|once|"
+        r"before|after|first|instead)\b)",
+        re.IGNORECASE)),
     # "as an AI", "you are an AI language model" - the self-reference an
     # injection uses to explain to the model what it supposedly is.
     (KIND_AI_ADDRESSED, re.compile(
@@ -416,6 +431,24 @@ _TEXT_PATTERNS: Tuple[Tuple[str, "re.Pattern"], ...] = (
     (KIND_GENERATION_DIRECTIVE, re.compile(
         r"\b(?:correct\s+answer|answer\s+key)\b[^.\n]{0,25}?"
         r"\b(?:always|every\s+question|for\s+all\s+questions)\b",
+        re.IGNORECASE)),
+    # "make every answer A", "ensure all options are B": the quiz-flattening
+    # shape, which says nothing about "correct" and so slipped the patterns
+    # above.
+    (KIND_GENERATION_DIRECTIVE, re.compile(
+        r"\b(?:make|set|force|ensure|keep|leave|mark|choose|pick|select)\s+"
+        r"(?:every|all|each)\s+"
+        r"(?:answer|option|choice|question|response)s?\s+"
+        r"(?:be\s+|is\s+|are\s+|=\s*|to\s+be\s+)?"
+        r"[\"'(\[]?[A-Da-d1-4][\"')\]]?\b",
+        re.IGNORECASE)),
+    # "when you build the quiz …", "once you generate the training …".
+    (KIND_GENERATION_DIRECTIVE, re.compile(
+        r"\b(?:when|whenever|once|after|before)\s+you\s+"
+        r"(?:build|make|create|generate|write|produce|prepare|draft|compile)\s+"
+        r"(?:the|a|an|this|these|any)\s+"
+        r"(?:quiz|test|assessment|question|questions|training|course|module|"
+        r"summary|summaries|objectives?|lesson)\b",
         re.IGNORECASE)),
     # "state that …" as an imperative opening a clause; "studies state that"
     # (a noun subject) is not an instruction to anybody.
