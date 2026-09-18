@@ -33,10 +33,14 @@ from src.assessments import (
     MAX_OPTION_CHARS,
     MAX_OPTIONS,
     MIN_ASSESSMENT_QUESTIONS,
+    MIN_REGISTER_DISTRACTORS,
     POINTS_CHOICE,
     POINTS_SAFETY_CHOICE,
     POINTS_SAFETY_TRUE_FALSE,
     POINTS_TRUE_FALSE,
+    REGISTER_IMPERATIVE,
+    REGISTER_ROLE,
+    REGISTER_STATEMENT,
     scale_points_for_options,
     AssessmentGenerator,
     MedicalDeviceAssessmentGenerator,
@@ -44,6 +48,9 @@ from src.assessments import (
     clip_option,
     pick_distractors,
     ordered_steps,
+    register_class,
+    related_texts,
+    same_register,
     step_sort_key,
 )
 from src.parser import SOPContent, SOPParser
@@ -994,3 +1001,328 @@ def test_generator_handles_an_empty_document():
     assert assessment.questions == []
     assert assessment.requested_questions == 5
     assert assessment.to_learner_dict()["questions"] == []
+
+
+# ---------------------------------------------------------------------------
+# Defect 7: the register tell on purpose / scope questions
+#
+# Found by a human reading the generated questions: "What is the primary purpose
+# of this procedure?" offered "This Standard Operating Procedure establishes ..."
+# against three step bodies ("Confirm the label reconciliation record ...").  The
+# correct answer was identifiable by *register* alone - no knowledge of the SOP
+# required.
+# ---------------------------------------------------------------------------
+_PROSE_KINDS = ("purpose", "scope")
+
+
+def test_register_class_separates_statements_from_instructions():
+    """The classifier the purpose/scope rule stands on, on real SOP sentences."""
+    assert register_class(
+        "This Standard Operating Procedure establishes the method for compiling, "
+        "reviewing, and approving the Device History Record (DHR) for each "
+        "production lot.") == REGISTER_STATEMENT
+    assert register_class(
+        "It does not cover component incoming inspection records, which are "
+        "governed by SOP-QA-006.") == REGISTER_STATEMENT
+    assert register_class(
+        "The compiled set of records containing the production history of a "
+        "specific finished device lot.") == REGISTER_STATEMENT
+    assert register_class(
+        "All operators must wear cut-resistant gloves when handling the trim "
+        "blade assembly.") == REGISTER_STATEMENT
+    assert register_class(
+        "Verification is the act of confirming a requirement has been "
+        "met.") == REGISTER_STATEMENT
+
+    assert register_class(
+        "Confirm the label reconciliation record shows the number of labels "
+        "printed equals the number used.") == REGISTER_IMPERATIVE
+    assert register_class(
+        "Do not bypass the light curtain for any reason.") == REGISTER_IMPERATIVE
+    assert register_class(
+        "Visually inspect the fitting for damage.") == REGISTER_IMPERATIVE
+    assert register_class(
+        "Cross-reference each component lot number recorded on the "
+        "traveler.") == REGISTER_IMPERATIVE
+    assert register_class(
+        "For each unit, record the reading on the shift log.") == REGISTER_IMPERATIVE
+
+    assert register_class(
+        "Quality Engineers: Verify test records and reconcile component lot "
+        "traceability") == REGISTER_ROLE
+
+    # Degenerate input must not raise or be classified as an instruction.
+    assert register_class("") == REGISTER_STATEMENT
+    assert register_class(None) == REGISTER_STATEMENT
+
+
+def test_same_register_rejects_the_defective_purpose_options():
+    """The exact option set a human flagged, rebuilt: step bodies are dropped."""
+    purpose = (
+        "This Standard Operating Procedure establishes the method for compiling, "
+        "reviewing, and approving the Device History Record (DHR) for each "
+        "production lot of the Model 220 Infusion Set prior to lot release.")
+    steps = [
+        "Confirm the label reconciliation record shows the number of labels "
+        "printed equals the number of labels used plus the number voided.",
+        "Pull the completed batch traveler for the lot from the production floor.",
+        "Complete the DHR compilation checklist, initialing each of the 14 line items.",
+    ]
+    prose = [
+        "This procedure applies to all finished-goods lots of the Model 220 "
+        "Infusion Set built at the Building 3 assembly line.",
+        "The compiled set of records containing the procedures and specifications "
+        "for a finished device.",
+    ]
+    assert same_register(purpose, steps) == []
+    assert same_register(purpose, steps + prose) == prose
+
+
+@pytest.mark.parametrize("generator_name", GENERATORS)
+@pytest.mark.parametrize("doc_name", DOCUMENTS)
+def test_purpose_and_scope_options_share_one_register(doc_name, generator_name):
+    """Every option of a purpose or scope question opens in the same form.
+
+    Guards the register tell directly: with the correct answer and all of its
+    distractors in one class, the learner has to compare content.
+    """
+    for num_questions in QUESTION_COUNTS:
+        assessment = get_assessment(doc_name, generator_name, num_questions)
+        for question in assessment.questions:
+            if question.source_ref.get("kind") not in _PROSE_KINDS:
+                continue
+            if question.type == "true_false":
+                continue
+            classes = {register_class(o) for o in question.options}
+            assert len(classes) == 1, (
+                "{0}/{1}/n={2}: {3} mixes registers {4}: {5}".format(
+                    doc_name, generator_name, num_questions, question.id,
+                    sorted(classes), question.options))
+            assert register_class(question.options[question.correct_answer]) == (
+                REGISTER_STATEMENT), question.id
+            # A purpose statement against a single wrong answer is a coin flip on
+            # top of a giveaway, so the question needs real same-register material.
+            assert len(question.options) >= MIN_REGISTER_DISTRACTORS + 1, (
+                question.id, question.options)
+
+
+def test_purpose_and_scope_questions_are_actually_being_produced():
+    """The register test above must not be passing vacuously."""
+    seen = 0
+    for doc_name in DOCUMENTS:
+        for generator_name in GENERATORS:
+            for num_questions in QUESTION_COUNTS:
+                assessment = get_assessment(doc_name, generator_name, num_questions)
+                seen += sum(1 for q in assessment.questions
+                            if q.source_ref.get("kind") in _PROSE_KINDS
+                            and q.type != "true_false")
+    assert seen >= 20, seen
+
+
+def test_purpose_question_is_dropped_when_the_register_cannot_be_matched():
+    """No same-register material -> no purpose question, and the SME is told why.
+
+    Dropping it is the honest outcome: the alternative is a question answerable
+    from the shape of the options.
+    """
+    sop = SOPContent()
+    sop.title = "Bare Purpose SOP"
+    sop.version = "1.0"
+    # A purpose with no scope, no responsibilities and no definitions to stand
+    # beside it, and one ``alter_statement`` cannot honestly negate either.
+    sop.purpose = "This procedure covers calibration of the widget press."
+    sop.scope = ""
+    sop.responsibilities = []
+    sop.definitions = {}
+    sop.safety_warnings = list(_WARNINGS[:3])
+    sop.procedures = make_sop("Steps Only SOP", "1.0", 6, 0, 0).procedures
+
+    assessment = AssessmentGenerator().generate(sop, num_questions=8)
+    multiple_choice = [q for q in assessment.questions
+                       if q.source_ref.get("kind") == "purpose"
+                       and q.type != "true_false"]
+    # The true/false form survives - it puts the purpose statement itself under
+    # test and offers no options to compare registers across.
+    assert not multiple_choice, [q.options for q in multiple_choice]
+    assert any("purpose question" in note for note in assessment.notes), assessment.notes
+    # The rest of the assessment is unaffected and still not gameable.
+    assert len(assessment.questions) >= MIN_ASSESSMENT_QUESTIONS
+    for name, picker in NAIVE_STRATEGIES.items():
+        assert naive_score(assessment, picker) < assessment.passing_score, name
+
+
+# ---------------------------------------------------------------------------
+# Defect 8: one question answered another
+#
+# The true/false safety item put altered warning W' under test while the "which
+# statement CONTRADICTS a safety warning?" item offered the same W' as its
+# correct answer, so answering either answered the other.  Defect 9 is the same
+# leak through distractors: Step 6's body was the correct answer to one question
+# and a wrong answer in another, so knowing one struck an option off the other.
+# ---------------------------------------------------------------------------
+def _answer_probe(question):
+    """What a learner who knows this question's answer has been told.
+
+    For multiple choice that is the correct option; for true/false it is the
+    statement under test, which the question text carries verbatim.
+    """
+    if question.type == "true_false":
+        return question.text
+    return question.options[question.correct_answer]
+
+
+def _shared_material(assessment):
+    """Texts that answer two of this assessment's questions."""
+    from src.answer_key import normalize_option_text
+
+    clashes = []
+    questions = assessment.questions
+    for index, first in enumerate(questions):
+        for second in questions[index + 1:]:
+            if first.type != "true_false" and second.type != "true_false":
+                shared = (related_texts(_answer_probe(first))
+                          & related_texts(_answer_probe(second)))
+                if shared:
+                    clashes.append((first.id, second.id, sorted(shared)[0][:40]))
+                continue
+            # One of the pair is a true/false item: its statement carries a
+            # "True or False: ..." wrapper, so compare by containment.
+            statement = second if second.type == "true_false" else first
+            other = first if statement is second else second
+            if other.type == "true_false":
+                continue
+            haystack = normalize_option_text(statement.text)
+            for text in related_texts(_answer_probe(other)):
+                if text and text in haystack:
+                    clashes.append((other.id, statement.id, text[:40]))
+    return clashes
+
+
+@pytest.mark.parametrize("generator_name", GENERATORS)
+@pytest.mark.parametrize("doc_name", DOCUMENTS)
+def test_no_text_answers_two_questions(doc_name, generator_name):
+    """No statement is the answer to, or under test in, two questions at once."""
+    for num_questions in QUESTION_COUNTS:
+        assessment = get_assessment(doc_name, generator_name, num_questions)
+        clashes = _shared_material(assessment)
+        assert not clashes, (
+            "{0}/{1}/n={2}: shared material between questions: {3}".format(
+                doc_name, generator_name, num_questions, clashes))
+
+
+@pytest.mark.parametrize("generator_name", GENERATORS)
+@pytest.mark.parametrize("doc_name", DOCUMENTS)
+def test_no_correct_answer_is_a_distractor_elsewhere(doc_name, generator_name):
+    """Cross-question elimination is removed, and any residue is counted.
+
+    A learner who knows Q2's answer must not be able to strike an option off Q3.
+    Where a document is too small to offer an alternative the generator may ship
+    the leak, but it has to say so in ``leakage_count`` - and none of the bundled
+    or gallery documents needs to.
+    """
+    from src.answer_key import normalize_option_text
+
+    for num_questions in QUESTION_COUNTS:
+        assessment = get_assessment(doc_name, generator_name, num_questions)
+        answers = {q.id: related_texts(_answer_probe(q))
+                   for q in assessment.questions}
+        statements = {q.id: normalize_option_text(q.text)
+                      for q in assessment.questions if q.type == "true_false"}
+
+        leaks = []
+        for question in assessment.questions:
+            if question.type == "true_false":
+                continue
+            for index, option in enumerate(question.options):
+                if index == question.correct_answer:
+                    continue
+                option_texts = related_texts(option)
+                for other_id, other_answer in answers.items():
+                    if other_id == question.id:
+                        continue
+                    if option_texts & other_answer:
+                        leaks.append((question.id, other_id, option[:40]))
+                for other_id, statement in statements.items():
+                    if any(text and text in statement for text in option_texts):
+                        leaks.append((question.id, other_id, option[:40]))
+
+        assert len(leaks) <= assessment.leakage_count, (
+            "{0}/{1}/n={2}: {3} unreported leak(s), leakage_count={4}: {5}".format(
+                doc_name, generator_name, num_questions, len(leaks),
+                assessment.leakage_count, leaks))
+        assert assessment.leakage_count == 0, (
+            "{0}/{1}/n={2}: leakage_count={3} ({4})".format(
+                doc_name, generator_name, num_questions,
+                assessment.leakage_count, leaks))
+
+
+def test_leakage_count_is_reported_to_the_sme():
+    """The measurement is part of the author-facing export, not a private field."""
+    assessment = get_assessment("md_device_history_record", "medical_device", 8)
+    data = assessment.to_dict()
+    assert data["leakage_count"] == 0
+    assert "leakage_count" not in assessment.to_learner_dict()
+
+
+def test_related_texts_pairs_a_statement_with_its_flip():
+    """Why the ledger catches the safety pair: W and W' are one piece of material."""
+    warning = ("Do not release a lot for shipment until every line of the DHR "
+               "checklist has been reviewed and initialed.")
+    altered = alter_statement(warning)
+    assert altered and altered != warning
+    assert related_texts(warning) & related_texts(altered)
+    assert not (related_texts(warning)
+                & related_texts("Calibration targets are sharp; handle with gloves."))
+
+
+def test_independence_repair_costs_a_question_at_most_one_option():
+    """Rebuilt distractor sets may narrow a question by one option, never more.
+
+    Two options is a coin flip, and a quiz of coin flips hands the marks to
+    "always click the longest option" - measured at 64.3% against a 70% pass mark
+    on the heading-only fixture while repair was allowed to shrink a question to
+    two options.  A question that cannot keep its width is dropped in favour of
+    another instead (``_repairable`` says no, the blueprint moves on).
+    """
+    from src.assessments import _Candidate
+
+    generator = AssessmentGenerator()
+    correct = _distinct_text(0, 120)
+    distractors = [_distinct_text(i, n) for i, n in
+                   enumerate((90, 110, 150), start=1)]
+    candidate = _Candidate.choice(
+        "step", 0, "step_mc_probe", "According to Step 1, what must be done?",
+        correct, distractors, "", sources=list(distractors))
+    assert candidate.min_distractors == 2
+
+    # One distractor spoken for by another question: rebuildable at 3 options.
+    assert generator._repairable(candidate, related_texts(distractors[0]), "key")
+    # Two spoken for, and the document offers nothing else: not askable here.
+    forbidden = related_texts(distractors[0]) | related_texts(distractors[1])
+    assert not generator._repairable(candidate, forbidden, "key")
+    # With replacement material the same question is fine again.
+    candidate.sources = list(distractors) + [_distinct_text(9, 130),
+                                             _distinct_text(10, 100)]
+    assert generator._repairable(candidate, forbidden, "key")
+
+
+def test_option_width_survives_on_documents_that_can_support_it():
+    """Independence must not quietly turn real SOPs into true/false quizzes.
+
+    Measured over the six gallery documents at n=5 and n=8: 84% of the
+    multiple-choice questions still offer four options (93% before the
+    cross-question rules, and the difference is questions a small document cannot
+    fill without repeating another answer).
+    """
+    widths = Counter()
+    for doc_name in GALLERY_SAMPLES:
+        for generator_name in GENERATORS:
+            for num_questions in (5, 8):
+                assessment = get_assessment(doc_name, generator_name, num_questions)
+                for question in assessment.questions:
+                    if question.type == "true_false":
+                        continue
+                    widths[len(question.options)] += 1
+    total = sum(widths.values())
+    assert total >= 100, total
+    assert 100.0 * widths[MAX_OPTIONS] / total >= 75.0, dict(widths)
