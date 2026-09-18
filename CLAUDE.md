@@ -18,7 +18,11 @@ Dependencies are in `requirements.txt` (pinned `~=`). CI: `.github/workflows/ci.
 
 ```
 src/parser.py          SOPParser → SOPContent (heading-driven sections; procedures carry
-                       title/body/content/substeps/source_lines)
+                       title/body/content/substeps/source_lines); runs the injection scan and
+                       exposes it as `injection_scan`
+src/injection_scan.py  deterministic scan of untrusted document text: instruction-to-AI phrasing,
+                       role markers, hidden/invisible characters, base64, markup; risk none/low/high;
+                       false positives measured on the shipped corpus and on 107 real documents
 src/generator.py       TrainingGenerator → TrainingModule (sections as escaped HTML, objectives)
 src/assessments.py     AssessmentGenerator / MedicalDeviceAssessmentGenerator → Assessment
                        (deterministic, blueprint-selected, document-drawn distractors,
@@ -33,7 +37,9 @@ src/audit.py           append-only hash-chained audit.jsonl per job (optional HM
                        verify_job checks the chain AND that the exported package is the approved content
 src/serialization.py   rebuild model objects from their to_dict() JSON (review round-trips)
 src/llm/               optional grounded LLM layer (config, provider, prompts, grounding, enhance);
-                       off by default, fake provider in tests, never raises into the pipeline
+                       off by default, fake provider in tests, never raises into the pipeline; the
+                       document travels in a delimited user-turn data block (never in `system`);
+                       gated off for `high`-risk documents; every model output passes output filters
 src/medical_device_config.py required compliance questions, integrity disclosure
 app.py                 Flask API: upload → generate → job.json → signed download / review
                        (GET /review, POST /api/review, POST /api/approve); src/cli.py the CLI
@@ -55,6 +61,9 @@ app.py                 Flask API: upload → generate → job.json → signed do
 - **Every generated sentence cites source lines.** Objectives, sections and questions carry
   `source_ref`; the transparency report measures coverage. LLM output that fails grounding is
   dropped in favour of the deterministic original. `tests/test_transparency.py`, `tests/test_llm.py`.
+- **A document the scanner rates `high` is never sent to a model**, and no shipped or corpus
+  document rates `high` (zero false positives is a hard requirement — widening a pattern means
+  re-measuring on the corpus). `tests/test_injection.py`; `tools/corpus_check.py`.
 - **SCORM packages are schema-valid and run against a fake LMS on both API surfaces.**
   `tests/conformance/` (manifests against ADL's vendored XSDs; runtime in Chromium, SCO two frames
   below the API window). No real LMS has been tested — say so.
@@ -84,6 +93,7 @@ app.py                 Flask API: upload → generate → job.json → signed do
 | 2026-09-17 | **Pilot hardening** (owner's call: pilot M1 before M2) | **done** | 1264 tests. `/pilot` metrics with the edit-rate definition; six-regime gallery in the invariant sweep (worst naive strategy 62.5% across 8 documents); SCORM harness found the "2004" package was a 1.2 manifest with a 1.2 runtime, an API-discovery loop that hung inside frames, re-launch overwriting a pass, and no `LMSFinish` — all fixed and pinned by tests. Per-question evidence written as `cmi.interactions` in both bindings (no `correct_responses`). Still open: no real-LMS import |
 | — | M2 — real application (accounts, DB, workers, server-side scoring) | on hold | owner chose to pilot M1 first |
 | 2026-09-17 | **M3 (partial) — audit trail** (owner's call: before M2) | **done** | 1378 tests collected (1373 pass, 5 opt-in/N.A. skips). Per-job hash-chained `audit.jsonl` (optional HMAC), a 9-entry lifecycle (7 distinct events) recorded from upload to download, approval recorded before it is written, package anchors the head hash, report/review page/pilot dashboard show verification. Independently verified: one altered character in an approver's name is caught at the right entry; export after an unapproved edit flags "package ≠ approved"; the on-disk report for an approved job says package-matches-approval (an independent code review caught that it previously could not, plus an approve-then-export-failure hole — both fixed and pinned). Limits: no external anchor (trailing-entry removal undetectable without one), server clock, unauthenticated actors pre-M2, not a Part 11 claim |
+| 2026-09-18 | **Security pass — real documents + prompt injection** | **done** | 107 real web-sourced procedures: 107/107 parsed and exported, 0 gameable, scanner 101 none / 6 low / 0 high. Document moved out of the system prompt; scanner + LLM gate + output filters; five adversarial fixtures; a control character in a title no longer breaks export. The checker's first probe found the scanner missed five obvious attacks — widened, re-measured, and `docs/SECURITY.md` records that a phrasing it misses should be assumed to exist |
 | — | M3 — rest (Part 11 e-signature, revision-delta retraining, validation pack) | not started | |
 | — | M4 — market | not started | |
 

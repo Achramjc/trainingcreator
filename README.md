@@ -105,6 +105,8 @@ a generated one. Approving records who approved, in what role, when, and how man
 made; the package's `metadata.json`, its pages (the DRAFT watermark becomes an approval banner)
 and the transparency report all carry that record. See USAGE_GUIDE.md.
 
+Security posture, threat model and what is *not* defended: `docs/SECURITY.md`.
+
 ## Optional grounded LLM layer (off by default)
 
 `TRAINING_CREATOR_LLM=anthropic` (plus `ANTHROPIC_API_KEY` and `pip install -r
